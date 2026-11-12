@@ -1,0 +1,97 @@
+{
+  "_ts": 0,
+  "days_remaining_to_trigger_upsell": 0,
+  "entry_number": 0,
+  "id": "active_store_entry",
+  "marketing": {
+    "lobby_poster_start_texture": "ui_menu_splash_screen_poster_a_shutdown_clr",
+    "lobby_poster_upsell_texture": "ui_menu_splash_screen_poster_a_shutdown_clr",
+    "menu_store_panel_start_texture": "ui_menu_splash_screen_poster_a_shutdown_clr",
+    "menu_store_panel_upsell_texture": "ui_menu_splash_screen_poster_a_shutdown_clr"
+  },
+  "store_slots": [
+    {
+      "bundle_allow_individual_item_purchases": false,
+      "bundle_description": null,
+      "bundle_icon": null,
+      "bundle_name": "SERIES 11",
+      "reward_items": [
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 0
+            },
+            "sku": "store_rwd_chassis_body_s11_a_bundled"
+          },
+          "reward_id": "rwd_chassis_body_s11_a"
+        },
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 0
+            },
+            "sku": "store_rwd_booster_default_bundled"
+          },
+          "reward_id": "rwd_booster_default"
+        }
+      ]
+    },
+    {
+      "bundle_allow_individual_item_purchases": false,
+      "bundle_description": null,
+      "bundle_icon": null,
+      "bundle_name": "SERIES 11 FLAMEY",
+      "reward_items": [
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 0
+            },
+            "sku": "store_rwd_chassis_s11_flame_a_bundled"
+          },
+          "reward_id": "rwd_chassis_s11_flame_a"
+        },
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 0
+            },
+            "sku": "store_rwd_booster_s11_s1_a_fire_bundled"
+          },
+          "reward_id": "rwd_booster_s11_s1_a_fire"
+        }
+      ]
+    },
+    {
+      "bundle_allow_individual_item_purchases": false,
+      "bundle_description": null,
+      "bundle_icon": null,
+      "bundle_name": "SERIES 11 RETRO",
+      "reward_items": [
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 0
+            },
+            "sku": "store_rwd_chassis_s11_retro_a_bundled"
+          },
+          "reward_id": "rwd_chassis_s11_retro_a"
+        },
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 0
+            },
+            "sku": "store_rwd_booster_s11_s1_a_retro_bundled"
+          },
+          "reward_id": "rwd_booster_s11_s1_a_retro"
+        }
+      ]
+    }
+  ],
+  "type": "active_store_entry",
+  "ui": {
+    "store_panel_header_start_text": "ITEM INFO",
+    "store_panel_header_upsell_text": "ITEM INFO | HERE FOREVER!"
+  }
+}

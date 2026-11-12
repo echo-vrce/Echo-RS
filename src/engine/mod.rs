@@ -1,0 +1,276 @@
+//! The game-server engine: an all-Rust Echo VR dedicated server.
+//!
+//! One [`Instance`] owns one UDP port and hosts one lobby or match at a time.
+//! It registers with a backend over the fleet protocol (protobuf `Envelope`
+//! over websocket: this process's hub, or the EchoRelay/nakama bridge), and
+//! runs a single task. While idle the task only waits on its socket and the
+//! backend connection, so an idle instance costs no CPU. While a session runs
+//! it wakes at 100 Hz for retransmits and at 20 Hz for the server frame.
+
+pub mod msg;
+pub mod session;
+pub mod transport;
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use nevr_proto::rtapi::v1 as pb;
+use nevr_proto::rtapi::v1::envelope::Message as Em;
+use prost::Message as _;
+use tokio::net::UdpSocket;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::Message as WsMsg;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use session::{Session, SessionInfo};
+
+#[derive(Clone, Copy, Debug)]
+pub struct EngineConfig {
+    /// Arena: players needed on EACH team before the pre-match countdown runs.
+    pub arena_min_per_team: usize,
+}
+
+pub struct Instance {
+    pub port: u16,
+    pub task: JoinHandle<()>,
+    stop: watch::Sender<bool>,
+}
+
+impl Instance {
+    pub async fn stop(self) {
+        self.stop.send_replace(true);
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+            task.abort();
+        }
+    }
+}
+
+pub fn start(idx: u32, socket: UdpSocket, fleet_url: String, cfg: EngineConfig) -> std::io::Result<Instance> {
+    let port = socket.local_addr()?.port();
+    let (stop, stop_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        run(idx, socket, fleet_url, stop_rx, cfg).await;
+    });
+    Ok(Instance { port, task, stop })
+}
+
+fn env(m: Em) -> pb::Envelope {
+    pb::Envelope { cid: Uuid::new_v4().to_string(), message: Some(m) }
+}
+
+fn session_event(lobby: Uuid, code: pb::lobby_session_event_message::Code) -> pb::Envelope {
+    env(Em::LobbySessionEvent(pb::LobbySessionEventMessage { lobby_session_id: lobby.to_string(), code: code as i32 }))
+}
+
+/// Mode and level from the backend's session settings.
+fn session_info(c: &pb::LobbySessionCreateMessage) -> SessionInfo {
+    let lobby = c.lobby_session_id.parse().unwrap_or_else(|_| Uuid::new_v4());
+    let settings: serde_json::Value = serde_json::from_str(&c.settings_json).unwrap_or_default();
+    let num = |k: &str| {
+        settings.get(k).and_then(|v| v.as_i64().map(|n| n as u64).or_else(|| v.as_u64()).or_else(|| v.as_str().map(crate::sns::symbol)))
+    };
+    let mode = num("gametype").filter(|m| *m != 0).unwrap_or(msg::SOCIAL_MODES[0]);
+    let arena_modes = ["echo_arena", "echo_arena_private", "echo_arena_tournament", "echo_arena_public_ai", "mpl_tutorial_arena"];
+    let level = num("level").filter(|l| *l != 0 && *l != u64::MAX).unwrap_or_else(|| {
+        if arena_modes.iter().any(|m| crate::sns::symbol(m) == mode) { msg::LEVEL_ARENA } else { msg::LEVEL_SOCIAL }
+    });
+    SessionInfo { lobby, mode, level }
+}
+
+async fn run(idx: u32, socket: UdpSocket, url: String, mut stop: watch::Receiver<bool>, cfg: EngineConfig) {
+    let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let ws = match tokio_tungstenite::connect_async(url.as_str()).await {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                debug!(instance = idx, error = %e, "backend not reachable; retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = stop.changed() => return,
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                continue;
+            }
+        };
+        backoff = Duration::from_millis(200);
+        let ended = serve(idx, port, &socket, ws, &mut stop, cfg).await;
+        if ended {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// One backend connection. Returns true when the instance should stop.
+async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch::Receiver<bool>, cfg: EngineConfig) -> bool {
+    let (mut tx, mut rx) = ws.split();
+    let reg = env(Em::GameServerRegistration(pb::GameServerRegistrationMessage {
+        server_id: u64::from(idx) << 16 | u64::from(port),
+        internal_ip_address: "127.0.0.1".into(),
+        port: u32::from(port),
+        time_step_usecs: 1_000_000 / 120,
+        version: env!("CARGO_PKG_VERSION").into(),
+        ..Default::default()
+    }));
+    if tx.send(WsMsg::Binary(reg.encode_to_vec())).await.is_err() {
+        return false;
+    }
+    let mut session: Option<Session> = None;
+    let mut buf = vec![0u8; 2048];
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticks: u64 = 0;
+    let mut outbox: Vec<pb::Envelope> = Vec::new();
+
+    let result = loop {
+        tokio::select! {
+            _ = stop.changed() => {
+                if let Some(mut s) = session.take() {
+                    s.close();
+                    send_udp(socket, &mut s).await;
+                    outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
+                }
+                for e in outbox.drain(..) {
+                    let _ = tx.send(WsMsg::Binary(e.encode_to_vec())).await;
+                }
+                let _ = tx.close().await;
+                break true;
+            }
+            m = rx.next() => {
+                let data = match m {
+                    Some(Ok(WsMsg::Binary(d))) => d,
+                    Some(Ok(WsMsg::Ping(p))) => { let _ = tx.send(WsMsg::Pong(p)).await; continue }
+                    Some(Ok(WsMsg::Close(_))) | None | Some(Err(_)) => break false,
+                    Some(Ok(_)) => continue,
+                };
+                let Ok(e) = pb::Envelope::decode(data.as_slice()) else { continue };
+                on_fleet(idx, port, e, &mut session, &mut outbox, cfg);
+            }
+            r = socket.recv_from(&mut buf) => {
+                let Ok((n, from)) = r else { continue };
+                handle_datagram(socket, &mut session, from, &buf[..n]).await;
+                // Drain whatever else is already queued, then answer in one go.
+                for _ in 0..256 {
+                    match socket.try_recv_from(&mut buf) {
+                        Ok((n, from)) => handle_datagram(socket, &mut session, from, &buf[..n]).await,
+                        Err(_) => break,
+                    }
+                }
+                if let Some(s) = session.as_mut() {
+                    s.flush();
+                    send_udp(socket, s).await;
+                    outbox.append(&mut s.fleet_out);
+                }
+            }
+            _ = tick.tick(), if session.is_some() => {
+                ticks += 1;
+                let s = session.as_mut().expect("guarded");
+                if ticks % 5 == 0 { s.server_frame() } else { s.service() }
+                send_udp(socket, s).await;
+                outbox.append(&mut s.fleet_out);
+                // Release the server once nobody is left.
+                let idle_for = s.last_activity.elapsed();
+                let limit = if s.ever_joined { Duration::from_secs(3) } else { Duration::from_secs(90) };
+                if s.peer_count() == 0 && idle_for > limit {
+                    info!(instance = idx, lobby = %s.info.lobby, "session empty; ending");
+                    outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
+                    session = None;
+                }
+            }
+        }
+        for e in outbox.drain(..) {
+            if tx.send(WsMsg::Binary(e.encode_to_vec())).await.is_err() {
+                break;
+            }
+        }
+    };
+    if let Some(mut s) = session.take() {
+        s.close();
+        send_udp(socket, &mut s).await;
+    }
+    result
+}
+
+async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, from: SocketAddr, d: &[u8]) {
+    if d.len() == 16 && u64::from_le_bytes(d[..8].try_into().expect("8")) == msg::RAW_PING_REQUEST {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&msg::RAW_PING_ACK.to_le_bytes());
+        out[8..].copy_from_slice(&d[8..]);
+        let _ = socket.send_to(&out, from).await;
+        return;
+    }
+    if let Some(s) = session.as_mut() {
+        s.on_packet(from, d);
+    }
+}
+
+async fn send_udp(socket: &UdpSocket, s: &mut Session) {
+    for (to, d) in s.udp_out.drain(..) {
+        if let Err(e) = socket.send_to(&d, to).await {
+            debug!(%to, error = %e, "udp send failed");
+        }
+    }
+}
+
+fn on_fleet(idx: u32, port: u16, e: pb::Envelope, session: &mut Option<Session>, out: &mut Vec<pb::Envelope>, cfg: EngineConfig) {
+    let Some(m) = e.message else { return };
+    match m {
+        Em::GameServerRegistrationSuccess(r) => {
+            debug!(instance = idx, port, server_id = r.server_id, external_ip = %r.external_ip_address, "registered");
+        }
+        Em::LobbySessionCreate(c) => {
+            if let Some(mut old) = session.take() {
+                old.close();
+            }
+            let info = session_info(&c);
+            info!(
+                instance = idx, port, lobby = %info.lobby,
+                mode = format_args!("{:#018x}", info.mode), level = format_args!("{:#018x}", info.level),
+                "session started"
+            );
+            let lobby = info.lobby;
+            *session = Some(Session::new(info, cfg.arena_min_per_team));
+            out.push(session_event(lobby, pb::lobby_session_event_message::Code::Started));
+        }
+        Em::LobbySessionSuccessV5(s) => match session.as_mut() {
+            Some(sess) => sess.add_keys(&s),
+            None => warn!(instance = idx, "entrant keys arrived without a session"),
+        },
+        Em::LobbyEntrantsAccept(a) => {
+            if let Some(s) = session.as_mut() {
+                s.on_accept(&a.entrant_ids, true);
+                out.append(&mut s.fleet_out);
+            }
+        }
+        Em::LobbyEntrantReject(r) => {
+            if let Some(s) = session.as_mut() {
+                s.on_accept(&r.entrant_ids, false);
+                out.append(&mut s.fleet_out);
+            }
+        }
+        Em::LobbyEntrantRemoved(r) => {
+            if let Some(s) = session.as_mut() {
+                s.kick(&r.entrant_id);
+                s.fleet_out.clear(); // the backend already knows
+            }
+        }
+        Em::LobbySessionEvent(ev) if ev.code == pb::lobby_session_event_message::Code::Ended as i32 => {
+            if let Some(mut s) = session.take() {
+                info!(instance = idx, lobby = %s.info.lobby, "backend ended the session");
+                s.close();
+                // Datagrams left in s.udp_out are best effort; the peers time out anyway.
+            }
+        }
+        _ => {}
+    }
+}

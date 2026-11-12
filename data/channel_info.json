@@ -1,0 +1,44 @@
+{
+  "group": [
+    {
+      "channeluuid": "90DD4DB5-B5DD-4655-839E-FDBE5F4BC0BF",
+      "name": "LOBBY A",
+      "description": "PLACEHOLDER LOBBY",
+      "rules": "",
+      "rules_version": 1,
+      "link": "https://en.wikipedia.org/wiki/Lone_Echo",
+      "priority": 0,
+      "_rad": true
+    },
+    {
+      "channeluuid": "DD9C48DF-C495-4EF3-B317-4FD6364F329D",
+      "name": "LOBBY B",
+      "description": "PLACEHOLDER LOBBY",
+      "rules": "",
+      "rules_version": 1,
+      "link": "https://en.wikipedia.org/wiki/Lone_Echo",
+      "priority": 1,
+      "_rad": true
+    },
+    {
+      "channeluuid": "937CE604-5DC7-431F-812B-C7C25B4B37B6",
+      "name": "LOBBY C",
+      "description": "PLACEHOLDER LOBBY",
+      "rules": "",
+      "rules_version": 1,
+      "link": "https://en.wikipedia.org/wiki/Lone_Echo",
+      "priority": 2,
+      "_rad": true
+    },
+    {
+      "channeluuid": "EF663D3F-D947-484A-BA7E-8C5ED7FED1A6",
+      "name": "LOBBY D",
+      "description": "PLACEHOLDER LOBBY",
+      "rules": "",
+      "rules_version": 1,
+      "link": "https://en.wikipedia.org/wiki/Lone_Echo",
+      "priority": 3,
+      "_rad": true
+    }
+  ]
+}

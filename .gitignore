@@ -1,0 +1,39 @@
+# Build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Runtime data: accounts (with their passwords), resource overrides, and the
+# generated client config (contains your LAN/public IP).
+/server-data/
+
+# Native-game recordings: pcaps, decrypted traffic and session keys. Large and
+# machine-specific; produce your own with tools/record_native.py.
+/captures/
+*.pcap
+*.pcapng
+
+# protox, installed locally by `cargo install protox --features bin --root tools`
+/tools/bin/
+/tools/.crates.toml
+/tools/.crates2.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local env files
+.env
+.env.*

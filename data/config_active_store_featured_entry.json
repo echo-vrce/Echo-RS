@@ -1,0 +1,54 @@
+{
+  "_ts": 0,
+  "days_remaining_to_trigger_upsell": 0,
+  "entry_number": 0,
+  "id": "active_store_featured_entry",
+  "marketing": {
+    "lobby_poster_start_texture": "ui_menu_splash_screen_poster_a_shutdown_clr",
+    "lobby_poster_upsell_texture": "ui_menu_splash_screen_poster_a_shutdown_clr",
+    "menu_store_panel_start_texture": "ui_menu_splash_screen_poster_a_shutdown_clr",
+    "menu_store_panel_upsell_texture": "ui_menu_splash_screen_poster_a_shutdown_clr"
+  },
+  "store_slots": [
+    {
+      "bundle_allow_individual_item_purchases": false,
+      "bundle_description": null,
+      "bundle_icon": "ui_menu_splash_screen_poster_a_shutdown_clr",
+      "bundle_name": "SEASON 3246",
+      "reward_items": [
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 999
+            },
+            "sku": "store_rwd_chassis_ranger_a_bundled"
+          },
+          "reward_id": "rwd_chassis_ranger_a"
+        },
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 999
+            },
+            "sku": "store_rwd_bracer_ranger_a_bundled"
+          },
+          "reward_id": "rwd_bracer_ranger_a"
+        },
+        {
+          "bundle": {
+            "price": {
+              "echopoints": 999
+            },
+            "sku": "store_rwd_booster_ranger_a_bundled"
+          },
+          "reward_id": "rwd_booster_ranger_a"
+        }
+      ]
+    }
+  ],
+  "type": "active_store_featured_entry",
+  "ui": {
+    "store_panel_header_start_text": "SEASON 3246",
+    "store_panel_header_upsell_text": "FEATURED ITEM INFO | HERE FOREVER!"
+  }
+}

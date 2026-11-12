@@ -1,0 +1,56 @@
+[package]
+name = "echo-rust-server"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone, all-Rust Echo VR server: login/config/matching services plus its own game-server engine. No Echo VR install needed."
+license = "MIT"
+
+[[bin]]
+name = "echo-rust-server"
+path = "src/main.rs"
+
+[dependencies]
+# Wire primitives only: packet crypto, the message codec and symbol hashes,
+# and the fleet protobuf schema. The game server itself is `src/engine`.
+nevr-crypto = { path = "../nevr-server-rs/nevr-crypto" }
+rad-protocol = { path = "../nevr-server-rs/rad-protocol" }
+nevr-proto = { path = "../nevr-server-rs/nevr-proto" }
+
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+prost = "0.13"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+zstd = "0.13"
+flate2 = "1"
+rand = "0.8"
+parking_lot = "0.12"
+dashmap = "6"
+bytes = "1"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 1
+
+# The ../nevr-server-rs crates above are used unmodified.

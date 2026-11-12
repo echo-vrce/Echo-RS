@@ -1,0 +1,10 @@
+decal_combat_flamingo_a
+decal_combat_logo_a
+emote_dizzy_eyes_a
+pattern_lightning_a
+rwd_booster_s10
+rwd_chassis_body_s10_a
+rwd_medal_s1_combat_bronze
+rwd_medal_s1_combat_gold
+rwd_medal_s1_combat_silver
+rwd_title_title_b

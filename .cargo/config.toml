@@ -1,0 +1,4 @@
+# prost-build (used by nevr-proto) needs a protoc. protox is a pure-Rust,
+# protoc-compatible compiler installed by `cargo install protox --features bin --root tools`.
+[env]
+PROTOC = { value = "tools/bin/protox.exe", relative = true }

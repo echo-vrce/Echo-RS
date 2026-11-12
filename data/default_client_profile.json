@@ -1,0 +1,69 @@
+{
+  "xplatformid": "",
+  "modifytime": 0,
+  "weapon": "assault",
+  "grenade": "det",
+  "weaponarm": 1,
+  "ability": "heal",
+  "legal": {
+    "points_policy_version": 1,
+    "eula_version": 1,
+    "game_admin_version": 1,
+    "splash_screen_version": 2
+  },
+  "mute": {
+    "users": null
+  },
+  "ghost": {
+    "users": null
+  },
+  "npe": {
+    "lobby": {
+      "completed": true
+    },
+    "firstmatch": {
+      "completed": true
+    },
+    "movement": {
+      "completed": true
+    },
+    "arenabasics": {
+      "completed": true
+    },
+    "social_tab_seen": {
+      "version": 1
+    },
+    "pointer": {
+      "version": 1
+    },
+    "blue_tint_tab_seen": {
+      "version": 1
+    },
+    "heraldry_tab_seen": {
+      "version": 1
+    },
+    "orange_tint_tab_seen": {
+      "version": 1
+    }
+  },
+  "customization": {
+    "battlepass_season_poi_version": 3246,
+    "new_unlocks_poi_version": 1,
+    "store_entry_poi_version": 1,
+    "clear_new_unlocks_version": 1
+  },
+  "social": {
+    "community_values_version": 1,
+    "setup_version": 1,
+    "group": "00000000-0000-0000-0000-000000000000"
+  },
+  "newunlocks": [],
+  "earlyquit": {
+    "penaltyts": 0,
+    "numearlyquits": 0,
+    "numsteadymatches": 0,
+    "numsteadyearlyquits": 0,
+    "penaltylevel": 0,
+    "steadyplayerlevel": 0
+  }
+}

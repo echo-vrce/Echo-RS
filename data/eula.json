@@ -1,0 +1,18 @@
+{
+  "type": "eula",
+  "lang": "en",
+  "version": 0,
+  "version_ga": 0,
+  "text": "Welcome to EchoVRCE!\nThis network, weaving\nthrough basements, is a work\nof fiction. Uptime\nguarantees are comically\noptimistic, so we advise\nagainst relying on this\nservice.",
+  "text_ga": "Welcome to EchoVRCE!\nThis network, weaving\nthrough basements, is a work\nof fiction. Uptime\nguarantees are comically\noptimistic, so we advise\nagainst relying on this\nservice.",
+  "mark_as_read_profile_key": "legal|eula_version",
+  "mark_as_read_profile_key_ga": "legal|game_admin_version",
+  "link_cc": "https://github.com/EchoTools",
+  "link_pp": "https://github.com/EchoTools",
+  "link_vr": "https://github.com/EchoTools",
+  "link_cp": "https://github.com/EchoTools",
+  "link_ec": "https://github.com/EchoTools",
+  "link_ea": "https://github.com/EchoTools",
+  "link_ga": "https://github.com/EchoTools",
+  "link_tc": "https://github.com/EchoTools"
+}
