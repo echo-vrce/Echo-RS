@@ -115,7 +115,7 @@ struct Args {
 
     /// Game frames per second (replication, the disc, match rules), 10 to
     /// 200. The client's own 120 Hz frame clock is separate and unchanged.
-    #[arg(long, env = "ERS_FRAME_HZ", default_value_t = 20, value_parser = clap::value_parser!(u64).range(10..=200))]
+    #[arg(long, env = "ERS_FRAME_HZ", default_value_t = 20, value_parser = clap::value_parser!(u64).range(10..=240))]
     frame_hz: u64,
 
     /// Host only these game modes (comma-separated game-type names, e.g.
@@ -174,6 +174,64 @@ struct Args {
 
 /// The outward-facing address of this host, found by asking the OS which
 /// interface routes to a public address (no packet is sent).
+/// The services listener. On the unspecified IPv4 address (the default) it
+/// is dual-stack `[::]`, so players can reach the hub over IPv6 (through the
+/// IPv6 bridge plugin); IPv4 alone where the system has no IPv6.
+fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let open = |domain: Domain, at: SocketAddr, dual: bool| -> std::io::Result<tokio::net::TcpListener> {
+        let s = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        if dual {
+            s.set_only_v6(false)?;
+        }
+        #[cfg(not(windows))]
+        s.set_reuse_address(true)?;
+        s.set_nonblocking(true)?;
+        s.bind(&at.into())?;
+        s.listen(1024)?;
+        tokio::net::TcpListener::from_std(s.into())
+    };
+    if addr.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+        let any6 = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), addr.port());
+        match open(Domain::IPV6, any6, true) {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Err(e),
+            Err(e) => tracing::debug!(%any6, error = %e, "no dual-stack listener; IPv4 only"),
+        }
+    }
+    open(Domain::for_address(addr), addr, false)
+}
+
+/// This host's public IPv4 as the internet sees it (behind CGNAT, the shared
+/// address the backend hands players), from api.ipify.org over IPv4.
+fn fetch_public_ipv4() -> Option<Ipv4Addr> {
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    let to = ("api.ipify.org", 80).to_socket_addrs().ok()?.find(SocketAddr::is_ipv4)?;
+    let mut s = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(5)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    s.write_all(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n").ok()?;
+    // Whatever arrived counts, even if the server keeps the connection open.
+    let mut r = Vec::new();
+    let _ = s.read_to_end(&mut r);
+    let r = String::from_utf8_lossy(&r);
+    let (head, body) = r.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return None;
+    }
+    body.trim().parse().ok()
+}
+
+/// This host's global IPv6 address (the one it would send from), if any.
+fn detect_ipv6() -> Option<std::net::Ipv6Addr> {
+    let s = std::net::UdpSocket::bind("[::]:0").ok()?;
+    s.connect("[2001:4860:4860::8888]:53").ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V6(ip) if (ip.segments()[0] & 0xe000) == 0x2000 => Some(ip),
+        _ => None,
+    }
+}
+
 fn detect_lan_ip() -> Option<Ipv4Addr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").ok()?;
@@ -232,6 +290,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     engine::session::set_frame_hz(args.frame_hz);
+    // The launcher changes the rate of a running server by writing
+    // `frame-hz N` lines to its stdin.
+    std::thread::spawn(|| {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else { break };
+            let mut w = line.split_whitespace();
+            if let (Some("frame-hz"), Some(n)) = (w.next(), w.next().and_then(|n| n.parse::<u64>().ok())) {
+                let hz = engine::session::set_frame_hz(n);
+                tracing::info!(frame_hz = hz, "frame rate set");
+            }
+        }
+    });
     engine::filter::set(&args.only_modes, &args.exclude_modes, &args.exclude_maps).context("mode/map filter")?;
 
     if let Some(dir) = &args.decode_capture {
@@ -268,8 +338,37 @@ async fn main() -> Result<()> {
     let login_url = upstreams.login_url.clone();
     let app = services::App { hub: hub.clone(), sessions: Arc::new(DashMap::new()), upstreams: upstreams.clone() };
 
-    let listener = tokio::net::TcpListener::bind(args.bind).await.with_context(|| format!("binding {}", args.bind))?;
+    let listener = bind_tcp(args.bind).with_context(|| format!("binding {}", args.bind))?;
     let hub_port = listener.local_addr()?.port();
+    // IPv6: players with the Ipv6Bridge plugin ask a game port which IPv4
+    // they were given for us, then reach us over IPv6 instead.
+    match detect_ipv6() {
+        Some(ip) => {
+            tracing::info!(%ip, "IPv6 reachable: players with the Ipv6Bridge plugin add this address to its hosts=");
+            match args.public_ip {
+                Some(v4) => engine::set_bridge_ipv4(v4),
+                None => {
+                    std::thread::spawn(|| {
+                        let mut last = None;
+                        loop {
+                            match fetch_public_ipv4() {
+                                Some(v4) => {
+                                    if last != Some(v4) {
+                                        tracing::info!(ipv4 = %v4, "public IPv4 for Ipv6Bridge players");
+                                        last = Some(v4);
+                                    }
+                                    engine::set_bridge_ipv4(v4);
+                                }
+                                None => tracing::warn!("public IPv4 lookup failed: Ipv6Bridge players can't find this host yet"),
+                            }
+                            std::thread::sleep(Duration::from_secs(600));
+                        }
+                    });
+                }
+            }
+        }
+        None => tracing::info!("no global IPv6 address: IPv4 players only"),
+    }
     let router = services::router(app).into_make_service_with_connect_info::<SocketAddr>();
     let http = tokio::spawn(async move { axum::serve(listener, router).await });
 
@@ -299,7 +398,7 @@ async fn main() -> Result<()> {
     }
     info!(
         bind = %args.bind, lan_ip = %lan_ip, public_ip = %public_ip, udp_ports = %format!("{}+", args.udp_port),
-        backend = ?args.backend, frame_hz = args.frame_hz,
+        backend = ?args.backend, frame_hz = engine::session::frame_hz(),
         only_modes = ?args.only_modes, exclude_modes = ?args.exclude_modes, exclude_maps = ?args.exclude_maps,
         "echo-rust-server running"
     );

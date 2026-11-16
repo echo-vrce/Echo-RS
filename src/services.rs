@@ -49,7 +49,7 @@ async fn status(State(app): State<App>) -> Json<crate::lobby::Stats> {
 }
 
 fn loopback_only(addr: &SocketAddr) -> Result<(), Response> {
-    if addr.ip().is_loopback() { Ok(()) } else { Err((StatusCode::FORBIDDEN, "admin endpoints are loopback-only").into_response()) }
+    if addr.ip().to_canonical().is_loopback() { Ok(()) } else { Err((StatusCode::FORBIDDEN, "admin endpoints are loopback-only").into_response()) }
 }
 
 async fn admin_kick(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketAddr>, Query(q): Query<HashMap<String, String>>) -> Response {
@@ -296,7 +296,7 @@ async fn fleet_ws(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketA
 }
 
 async fn fleet_socket(app: App, socket: WebSocket, addr: SocketAddr) {
-    let peer_ip = match addr.ip() {
+    let peer_ip = match addr.ip().to_canonical() {
         IpAddr::V4(v) => v,
         IpAddr::V6(v) => v.to_ipv4_mapped().unwrap_or(Ipv4Addr::LOCALHOST),
     };

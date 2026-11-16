@@ -360,6 +360,18 @@ impl Gear {
         self.inside.contains(&from)
     }
 
+    /// Whether this player may fight: in the combat area, or (from their
+    /// body's position) in the brawler room. Native lifts the lobby's cease
+    /// fire (`VAR_HOLD` 0) for them there; without it they cannot punch.
+    pub fn may_fight(&self, who: SocketAddr) -> bool {
+        self.inside.contains(&who) || self.bodies.get(&who).is_some_and(|(_, p)| in_brawler_room(*p))
+    }
+
+    /// The player's last body position, if known.
+    pub fn body_pos(&self, who: SocketAddr) -> Option<[f32; 3]> {
+        self.bodies.get(&who).map(|(_, p)| *p)
+    }
+
     /// Using gear means being in the area: covers an entry burst the server
     /// missed. Not right after walking out (the client's last shots).
     fn using_gear(&mut self, from: SocketAddr, now: Instant) {
@@ -947,6 +959,14 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 /// Position in a 64-byte physics update: three 19-bit millimetre fields from bit 267.
+/// The lobby's brawler room (`mpl_lobby_b2`), from a native recording
+/// (2026-11-16): native's cease-fire var dropped to 0 as the player passed
+/// (19.7, 0.5, 10.4) going in and rose to 1 at (22.0, 1.0, 9.7) coming out;
+/// the deepest point was (31.0, 0.2, 15.2). The combat area is at negative z.
+pub fn in_brawler_room(p: [f32; 3]) -> bool {
+    (19.5..=42.0).contains(&p[0]) && (-3.0..=5.0).contains(&p[1]) && (9.7..=26.0).contains(&p[2])
+}
+
 fn transform(d: &[u8]) -> [f32; 3] {
     let field = |bit: usize| {
         let mut v = 0u32;
@@ -1042,6 +1062,17 @@ mod tests {
     #[test]
     fn symbols_match_the_recording() {
         assert_eq!(TELEPORT_REQUEST, 0x0fba_c5d9_94dd_e2e8);
+    }
+
+    #[test]
+    fn brawler_room_matches_where_native_lifted_the_cease_fire() {
+        // Native lobby recording 2026-11-16: positions around the var's flips.
+        for p in [[19.65, 0.49, 10.36], [31.0, 0.16, 15.2], [26.3, 0.95, 11.9], [22.3, 0.98, 9.85]] {
+            assert!(in_brawler_room(p), "{p:?}");
+        }
+        for p in [[0.0, 2.0, 0.0], [19.09, 0.54, 10.11], [21.31, 0.98, 9.35], [37.0, 1.9, -22.0], [16.6, 1.3, 6.4]] {
+            assert!(!in_brawler_room(p), "{p:?}");
+        }
     }
 
     #[test]

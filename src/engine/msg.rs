@@ -86,13 +86,31 @@ pub const TEAM_STATS: [u64; 12] = [
     0x41d2_d73c_0930_020d, // Passes
 ];
 pub const TS_POSSESSION: usize = 4;
-/// TopAwards record constants (one MVP record in the native game).
+/// TopAwards: MVP (its own stat), then stat awards (native, two matches:
+/// four awards each, drawn from these and one unnamed stat).
 pub const AWARD_MVP_ID: u64 = 0xc8e8_d0b1_a89d_f4fa;
 pub const AWARD_MVP_STAT: u64 = 0xe32d_c7c9_da80_56b5;
+pub const AWARD_GOALS_ID: u64 = 0x4303_0e90_92f3_c421;
+pub const AWARD_PASSES_ID: u64 = 0x4fce_de87_b2b2_913b;
+pub const AWARD_CATCHES_ID: u64 = 0xdafa_9a46_0fe1_0167;
+pub const TOP_AWARDS_MAX: usize = 4;
+/// `SR15NetTierRewardMsg` `[stat u64][tier u64][slot u64][xp u64]`, to the
+/// player only (native: gold/silver/bronze in Goals, Assists, Saves).
+pub const TIER_REWARD: u64 = h("SR15NetTierRewardMsg");
+pub const TIER_GOLD: u64 = 0xc8c3_3e48_3d7c_12b4;
+pub const TIER_SILVER: u64 = 0x41d2_d434_1635_020c;
+pub const TIER_BRONZE: u64 = 0x41d2_c52f_152d_1d1b;
 
 /// Raw (unencrypted) 16-byte ping datagrams: `[symbol u64][token u64]`.
 pub const RAW_PING_REQUEST: u64 = 0x9972_79de_065a_03b0;
 pub const RAW_PING_ACK: u64 = 0x4f7a_e556_e0b7_7891;
+/// The Ipv6Bridge plugin's question, over IPv6 to a game port:
+/// `[BRIDGE_QUERY][token u64]`. The answer names the IPv4 address players
+/// are given for this host: `[BRIDGE_ANSWER][token u64][ipv4 4]`. With it the
+/// plugin sends the game's packets for that IPv4 to us over IPv6 (a host
+/// behind CGNAT has no reachable IPv4 port). Not game messages.
+pub const BRIDGE_QUERY: u64 = 0x7136_6267_6469_7262; // "brdigb6q"
+pub const BRIDGE_ANSWER: u64 = 0x6136_6267_6469_7262; // "brdigb6a"
 
 // ── Levels and modes ───────────────────────────────────────────────────────
 pub const LEVEL_SOCIAL: u64 = 0xd09a_fd15_b1c7_5c04; // mpl_lobby_b2
@@ -184,7 +202,10 @@ pub const EV_TELEPORT_CELEBRATION: u64 = 0xe9df_6ad8_e934_f69c;
 pub const EV_PERSONAL_STATS: u64 = 0x28c4_e143_bd2a_895f;
 pub const EV_RETURN_TO_LOBBY: u64 = 0x6574_2a42_0357_6093;
 /// Sent (filter 13, twice) with every goal, just before game_score.
+/// First goal event: blue's goal (native, every blue goal in two matches).
 pub const EV_GOAL_A: u64 = 0xe145_49f2_f4c4_0266;
+/// Its orange counterpart (every orange goal): the celebration's team.
+pub const EV_GOAL_A_ORANGE: u64 = 0xf7b1_de94_6009_b29e;
 pub const EV_GOAL_B: u64 = 0xfa94_15c1_1a6a_3b6c;
 /// Announcer goal calls (filter 13): native sent the first for a 2-point
 /// goal and the second for a 3-point goal.

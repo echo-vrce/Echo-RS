@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -196,6 +196,8 @@ impl Setup {
 
 struct Running {
     child: Child,
+    /// The server reads commands here (`frame-hz N`).
+    stdin: Option<ChildStdin>,
     exited: Option<String>,
 }
 
@@ -461,7 +463,7 @@ impl App {
             // Debug lines (disc and touch decisions, pings, packet summaries)
             // only when asked for: they cost the server more than anything else.
             .env("ERS_LOG", std::env::var("ERS_LOG").unwrap_or_else(|_| if self.setup.debug_log { "info,echo_rust_server::engine::session=debug".into() } else { "info".into() }))
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(windows)]
@@ -477,10 +479,24 @@ impl App {
                 if let Some(e) = child.stderr.take() {
                     pump(e, self.log.clone(), self.ctx.clone());
                 }
-                self.running = Some(Running { child, exited: None });
+                let stdin = child.stdin.take();
+                self.running = Some(Running { child, stdin, exited: None });
                 self.status = "Running.".into();
             }
             Err(e) => self.status = format!("Could not start: {e}"),
+        }
+    }
+
+    /// Tells a running server the new frame rate (its games switch at once).
+    fn send_frame_hz(&mut self, hz: u32) {
+        use std::io::Write;
+        if let Some(r) = &mut self.running
+            && r.exited.is_none()
+            && let Some(w) = &mut r.stdin
+        {
+            if writeln!(w, "frame-hz {hz}").and_then(|_| w.flush()).is_err() {
+                r.stdin = None;
+            }
         }
     }
 
@@ -704,10 +720,11 @@ impl App {
         });
     }
 
-    fn games(&mut self, ui: &mut egui::Ui) {
+    fn games(&mut self, ui: &mut egui::Ui, live: bool) {
+        let hz_before = self.setup.frame_hz;
         let s = &mut self.setup;
         card(ui, "Game servers", |ui| {
-            egui::Grid::new("games").num_columns(2).spacing([24.0, 12.0]).min_col_width(170.0).show(ui, |ui| {
+            ui.add_enabled_ui(!live, |ui| egui::Grid::new("games").num_columns(2).spacing([24.0, 12.0]).min_col_width(170.0).show(ui, |ui| {
                 field_label(ui, "Max at once", "Most game servers running together");
                 ui.add(egui::DragValue::new(&mut s.max_games).range(1..=128));
                 ui.end_row();
@@ -715,7 +732,7 @@ impl App {
                 let max = s.max_games;
                 ui.add(egui::DragValue::new(&mut s.keep_running).range(0..=max));
                 ui.end_row();
-            });
+            }));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Frame rate").strong());
@@ -723,17 +740,19 @@ impl App {
                     ui.label(RichText::new(format!("{} Hz", s.frame_hz)).size(20.0).strong().color(ACCENT));
                 });
             });
-            ui.add(egui::Slider::new(&mut s.frame_hz, 10..=200).show_value(false));
-            hint(ui, "How often each game updates the disc, players and rules. 20 Hz is the default; higher is smoother but costs more CPU and bandwidth.");
+            ui.add(egui::Slider::new(&mut s.frame_hz, 10..=240).show_value(false));
+            hint(ui, "How often each game updates the disc, players and rules. 20 Hz is the default; native public servers run 120, comp servers 180. Higher is smoother but costs more CPU and bandwidth. Changes apply to running games at once.");
             ui.add_space(8.0);
-            ui.checkbox(&mut s.echocombat, RichText::new("EchoCombat").strong());
-            hint(ui, "Answers the EchoCombat mod. Off, players with the mod get stock Combat: its new gear is hidden.");
-            ui.add_space(8.0);
-            ui.checkbox(&mut s.debug_log, RichText::new("Debug logging").strong());
-            hint(ui, "Logs every grab, ping and packet summary. Only for tracking down a problem: it is the heaviest work the server does and fills the log fast. Takes effect at the next start.");
+            ui.add_enabled_ui(!live, |ui| {
+                ui.checkbox(&mut s.echocombat, RichText::new("EchoCombat").strong());
+                hint(ui, "Answers the EchoCombat mod. Off, players with the mod get stock Combat: its new gear is hidden.");
+                ui.add_space(8.0);
+                ui.checkbox(&mut s.debug_log, RichText::new("Debug logging").strong());
+                hint(ui, "Logs every grab, ping and packet summary. Only for tracking down a problem: it is the heaviest work the server does and fills the log fast. Takes effect at the next start.");
+            });
         });
         ui.add_space(12.0);
-        card(ui, "Game modes", |ui| {
+        ui.add_enabled_ui(!live, |ui| card(ui, "Game modes", |ui| {
             segmented(ui, &mut s.mode_choice, &[(ModeChoice::All, "All"), (ModeChoice::OnlyOne, "Only one"), (ModeChoice::Exclude, "Exclude")]);
             match s.mode_choice {
                 ModeChoice::All => hint(ui, "Every mode can be hosted."),
@@ -751,7 +770,11 @@ impl App {
             ui.label(RichText::new("Maps").strong());
             chips(ui, MAPS, &mut s.excluded_maps);
             hint(ui, "Click a map to exclude it.");
-        });
+        }));
+        // A running server switches its games to the new rate at once.
+        if self.setup.frame_hz != hz_before {
+            self.send_frame_hz(self.setup.frame_hz);
+        }
     }
 
     fn header(&mut self, ui: &mut egui::Ui, live: bool, problems: &[String]) {
@@ -878,20 +901,20 @@ impl eframe::App for App {
             // Each page keeps its own scroll position.
             let scroll = if self.page == Page::Settings { "settings-scroll" } else { "server-scroll" };
             egui::ScrollArea::vertical().id_salt(scroll).auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_enabled_ui(!live, |ui| {
-                    if self.page == Page::Settings {
-                        settings::page(ui, &mut self.settings, &mut self.setup.balance);
-                    } else if ui.available_width() >= 860.0 {
-                        ui.columns(2, |c| {
-                            self.connection(&mut c[0]);
-                            self.games(&mut c[1]);
-                        });
-                    } else {
-                        self.connection(ui);
-                        ui.add_space(12.0);
-                        self.games(ui);
-                    }
-                });
+                // Locked while the server runs, except the frame rate (it
+                // changes running games at once).
+                if self.page == Page::Settings {
+                    ui.add_enabled_ui(!live, |ui| settings::page(ui, &mut self.settings, &mut self.setup.balance));
+                } else if ui.available_width() >= 860.0 {
+                    ui.columns(2, |c| {
+                        c[0].add_enabled_ui(!live, |ui| self.connection(ui));
+                        self.games(&mut c[1], live);
+                    });
+                } else {
+                    ui.add_enabled_ui(!live, |ui| self.connection(ui));
+                    ui.add_space(12.0);
+                    self.games(ui, live);
+                }
             });
         });
 

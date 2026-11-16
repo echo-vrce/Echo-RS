@@ -135,7 +135,7 @@ impl Upstreams {
 }
 
 pub async fn upstream_ws(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketAddr>, Path(idx): Path<u32>, ws: WebSocketUpgrade) -> Response {
-    if !addr.ip().is_loopback() {
+    if !addr.ip().to_canonical().is_loopback() {
         return (axum::http::StatusCode::FORBIDDEN, "local game servers only").into_response();
     }
     let up = app.upstreams.clone();

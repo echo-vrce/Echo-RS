@@ -19,7 +19,8 @@ pub mod stats;
 pub mod transport;
 pub mod veilnet;
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -196,6 +197,12 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
                 outbox.append(&mut s.fleet_out);
             }
             _ = tick.tick(), if session.is_some() => {
+                // `frame-hz N` on stdin changes the rate while games run.
+                let want = Duration::from_micros(1_000_000 / session::frame_hz());
+                if frames.period() != want {
+                    frames = tokio::time::interval(want);
+                    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                }
                 let s = session.as_mut().expect("guarded");
                 let mut veil_out = veilnet::Out::new();
                 veil.tick(Instant::now(), &mut veil_out);
@@ -226,7 +233,31 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
     result
 }
 
+/// This host's public IPv4 (what players are given), for the Ipv6Bridge
+/// plugin's question; 0 until known.
+static BRIDGE_IPV4: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_bridge_ipv4(ip: Ipv4Addr) {
+    BRIDGE_IPV4.store(u32::from(ip), Ordering::Relaxed);
+}
+
+/// A dual-stack socket reports IPv4 players as `::ffff:a.b.c.d`: the rest
+/// of the server sees them as plain IPv4, as on an IPv4-only socket.
+fn canonical(a: SocketAddr) -> SocketAddr {
+    SocketAddr::new(a.ip().to_canonical(), a.port())
+}
+
+/// Sends to `to`, mapping an IPv4 player into IPv6 form on a dual-stack socket.
+async fn send_to(socket: &UdpSocket, v6: bool, d: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+    let to = match to {
+        SocketAddr::V4(v) if v6 => SocketAddr::new(v.ip().to_ipv6_mapped().into(), v.port()),
+        _ => to,
+    };
+    socket.send_to(d, to).await
+}
+
 async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil: &mut veilnet::VeilNet, from: SocketAddr, d: &[u8]) {
+    let from = canonical(from);
     // EchoCombat's own packets, on the game's socket (never game traffic).
     if let Some((kind, id)) = veilnet::parse(d) {
         veil.sync_session(session.as_ref().map(|s| (s.info.lobby, s.info.mode, s.info.level)));
@@ -239,7 +270,19 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil
         let mut out = [0u8; 16];
         out[..8].copy_from_slice(&msg::RAW_PING_ACK.to_le_bytes());
         out[8..].copy_from_slice(&d[8..]);
-        let _ = socket.send_to(&out, from).await;
+        let _ = send_to(socket, is_v6(socket), &out, from).await;
+        return;
+    }
+    if d.len() == 16 && u64::from_le_bytes(d[..8].try_into().expect("8")) == msg::BRIDGE_QUERY {
+        let ip = BRIDGE_IPV4.load(Ordering::Relaxed);
+        if ip != 0 {
+            let mut out = [0u8; 20];
+            out[..8].copy_from_slice(&msg::BRIDGE_ANSWER.to_le_bytes());
+            out[8..16].copy_from_slice(&d[8..]);
+            out[16..].copy_from_slice(&Ipv4Addr::from(ip).octets());
+            let _ = send_to(socket, is_v6(socket), &out, from).await;
+            debug!(%from, ipv4 = %Ipv4Addr::from(ip), "ipv6 bridge query answered");
+        }
         return;
     }
     if let Some(s) = session.as_mut() {
@@ -247,17 +290,23 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil
     }
 }
 
+fn is_v6(socket: &UdpSocket) -> bool {
+    socket.local_addr().is_ok_and(|l| l.is_ipv6())
+}
+
 async fn send_veil(socket: &UdpSocket, out: veilnet::Out) {
+    let v6 = is_v6(socket);
     for (to, d) in out {
-        if let Err(e) = socket.send_to(&d, to).await {
+        if let Err(e) = send_to(socket, v6, &d, to).await {
             debug!(%to, error = %e, "udp send failed");
         }
     }
 }
 
 async fn send_udp(socket: &UdpSocket, s: &mut Session) {
+    let v6 = is_v6(socket);
     for (to, d) in s.udp_out.drain(..) {
-        if let Err(e) = socket.send_to(&d, to).await {
+        if let Err(e) = send_to(socket, v6, &d, to).await {
             debug!(%to, error = %e, "udp send failed");
         }
     }

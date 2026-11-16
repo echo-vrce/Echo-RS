@@ -417,3 +417,53 @@ The user's order: **Combat lobby first** (`mpl_lobby_b_combat`, symbol
 - Spectator + player on one PC with the SAME account (both OVR-ORG-6032896500068788): when the player joins
   after the spectator, the spectator repeats the player-join sound all match. Not a server message (every
   join message once, same as earlier joins); retest with two accounts before chasing it.
+- Frame rate (public 4v4 on a host's `--frame-hz 200`, 2026-11-16): goal pin 33 s, launch 26 s, announcer and
+  respawns ~1.7x slow. `server_frame` returned until the next 120 Hz wire frame, so rules stepped <=120/s while
+  every timing converted with 200. Now: the wire clock ticks at max(120, frame_hz) (native comp runs 180),
+  continuous across rate changes and started on a 240 Hz uptime scale (never lower after a restart); rules
+  frames run on real time with catch-up (`run_rules`); range 10..=240. `frame-hz N` on stdin changes the rate
+  of a running server (launcher slider sends it); running games rescale their rules tick, schedule and
+  possession (`rescale_rules`). Countdown light/fx events held to native's 60/s.
+- Goal celebration team: native's first goal event is blue `0xe14549f2f4c40266` / orange `0xf7b1de946009b29e`
+  (both hoster matches, every goal); ours always sent blue's.
+- TopAwards (native, both matches): count 4, then arrays: ids, stats, values (u64), slots (u64), handles (u32),
+  teams (u16), names (32 B), u16 each. Awards seen: MVP (value 655/558, not top points; formula unknown), Goals,
+  Passes, Catches, and award 0x3ae29a1016fe966b / stat 0x41d2c4311f22150d (unnamed). Ours sent only the MVP.
+  TierRewardMsg `[stat][tier][slot u64][xp u64]` to the player only: 6 per match, gold 150 / silver 100 / bronze
+  50 in Goals, Assists, Saves (which runners-up get silver/bronze not derived; ours: top 3 of each).
+- Join lock: public match sends LobbySessionEvent Locked at 1:00 left and at match over (Unlocked if a match
+  starts again); we never did, so the matchmaker backfilled into ended matches.
+
+## Brawler room punching (2026-11-16)
+
+- The lobby's cease fire is `VAR_HOLD` (`098aa551580b0386`, the same var arena sets during goal celebrations
+  and match end), on the lobby object `d09afd15b1c75c04`. Baseline 1 = no punching/blocking. Native drops it
+  to 0 for a player ~0.5 s after they enter the combat area (`c064...` event) and raises it with the station
+  free ~3.5 s after they leave; in the brawler room (no client message at all) it follows the body position:
+  0 at (19.7, 0.5, 10.4) going in, 1 at (22.0, 1.0, 9.7) coming out (lobby1 capture 71.70 / 76.53 s).
+  We never changed it, so nobody could punch in the brawler room. Now per player in `replicate`:
+  `Gear::may_fight` (combat area, or `in_brawler_room` box x 19.5..42, y -3..5, z 9.7..26), sent on change and
+  every second; logged as "lobby cease fire lifted/on" with the position. The box is fitted to one native
+  walk: if punching fails in part of the room, the log's position shows where.
+- Whether native's value is per player or lobby-wide is unknown (one-player captures); we send it per player.
+- The `c064` / `c164` events are named `nevt_to_server_holstered_next_target_0/1` in SymbolNames.txt but are
+  the combat-area edge in every capture. `nevt_to_all_*` / `nevt_to_peers_*` script events are not relayed by us.
+
+## IPv6 (2026-11-16)
+
+- Game ports bind dual-stack `[::]` (IPV6_V6ONLY off, `pool::bind_udp`) when `bind_ip` is 0.0.0.0, IPv4 only if
+  that fails. Received addresses go through `to_canonical()` (IPv4 players stay plain IPv4 everywhere); sends map
+  IPv4 back to `::ffff:` on a v6 socket (`engine::send_to`). Checked: raw ping answered on 127.0.0.1 and ::1.
+- The game itself is IPv4-only (LobbySessionSuccess and broadcaster connect events carry 4-byte IPs), so a client
+  reaches a server over IPv6 only through a client plugin.
+- Plugin: EchoBits&Bobs `plugin/ipv6bridge.cpp` -> `Ipv6Bridge.dll` + `Ipv6Bridge.ini` (`hosts=` IPv6 addresses
+  or AAAA names, `port=` first game port). Works with any backend (EchoVRCE untouched). It hooks ws2_32
+  sendto/recvfrom/closesocket (Detours; the game imports plain sendto/recvfrom for UDP). It asks each host over
+  IPv6 `[BRIDGE_QUERY][token]` on the game port; the server answers `[BRIDGE_ANSWER][token][public ipv4]`
+  (`engine::set_bridge_ipv4`, from --public-ip or api.ipify.org over IPv4, refreshed every 10 min). Then every
+  game packet to that IPv4 (EchoVRCE's server pings included) goes over IPv6 to the same port, and answers are
+  injected into the game socket over loopback with a 6-byte [ipv4][port] header the recvfrom hook strips, so
+  the game sees them from the IPv4. Tested in Python with the DLL loaded (its sockets hooked): a raw ping to
+  203.0.113.7 (server --public-ip) answered over this PC's IPv6, none without the plugin. Not tested: the real
+  game, a remote player, the Starlink router passing inbound IPv6.
+- The hub listener is dual-stack too (`main::bind_tcp`), unrelated to the plugin.

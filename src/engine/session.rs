@@ -22,18 +22,72 @@ use super::stats::{DiscTracker, Stat, Stats};
 use super::transport::{SessionCrypto, Transport, mac_matches, reliable_batch};
 
 pub const MAX_SLOTS: usize = 16;
-/// Server frames per second (frame message, replication, rules), set once
-/// at startup (`--frame-hz`). Every timing in the rules is in seconds and
-/// converted with this, so any rate in 10..=120 runs the same match.
+/// Server frames per second (frame message, replication, rules): `--frame-hz`
+/// at startup, `frame-hz N` on stdin while running. Every timing in the rules
+/// is in seconds and converted with this, so any rate runs the same match.
 static FRAME_HZ_V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(20);
 
 pub fn frame_hz() -> u64 {
     FRAME_HZ_V.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn set_frame_hz(hz: u64) {
-    FRAME_HZ_V.store(hz.clamp(10, 200), std::sync::atomic::Ordering::Relaxed);
+pub const MIN_FRAME_HZ: u64 = 10;
+pub const MAX_FRAME_HZ: u64 = 240;
+/// Native public servers' wire rate; comp servers run 180. Below this the
+/// wire clock still ticks at 120 Hz (every frame message is sent).
+pub const BASE_WIRE_HZ: u64 = 120;
+
+/// The wire clock: (frame at the last rate change, its server µs, µs per
+/// frame). Frames count on from there at the current rate, so a change in
+/// a running process never repeats or skips a frame number.
+static WIRE: std::sync::Mutex<Option<(u64, u64, u64)>> = std::sync::Mutex::new(None);
+
+fn wire_tick_for(hz: u64) -> u64 {
+    1_000_000 / hz.max(BASE_WIRE_HZ)
 }
+
+/// Sets the rate (clamped to 10..=240); safe while games run. Returns the
+/// rate in force.
+pub fn set_frame_hz(hz: u64) -> u64 {
+    let hz = hz.clamp(MIN_FRAME_HZ, MAX_FRAME_HZ);
+    FRAME_HZ_V.store(hz, std::sync::atomic::Ordering::Relaxed);
+    let tick = wire_tick_for(hz);
+    let mut w = WIRE.lock().expect("wire clock");
+    let now = clock_us();
+    *w = Some(match *w {
+        // Start on a 240 Hz scale of uptime: whatever rate an earlier run of
+        // this machine used, its frames stayed below that, so a restart at a
+        // lower rate never goes backwards for a client that remembers them.
+        None => (now * MAX_FRAME_HZ / 1_000_000, now, tick),
+        Some(c) if c.2 == tick => c,
+        Some((f0, t0, old)) => {
+            let f = f0 + now.saturating_sub(t0) / old;
+            (f + 1, t0 + (f + 1 - f0) * old, tick)
+        }
+    });
+    hz
+}
+
+fn wire_state() -> (u64, u64, u64) {
+    let w = *WIRE.lock().expect("wire clock");
+    w.unwrap_or_else(|| {
+        set_frame_hz(frame_hz());
+        WIRE.lock().expect("wire clock").expect("set")
+    })
+}
+
+/// Server µs of wire frame `n`.
+fn wire_time(n: u64) -> u64 {
+    let (f0, t0, tick) = wire_state();
+    if n >= f0 { t0 + (n - f0) * tick } else { t0.saturating_sub((f0 - n) * tick) }
+}
+
+/// µs per wire frame now.
+pub fn wire_tick_us() -> u64 {
+    wire_state().2
+}
+/// Public arena: no new players in the last minute of the match.
+const JOIN_LOCK_SECS: f32 = 60.0;
 const PEER_TIMEOUT: Duration = Duration::from_secs(12);
 /// The arena disc's reset count (low nibble of its state word, and the touch
 /// grant's generation) runs 0..=0xe and wraps to 0: native, public match
@@ -102,6 +156,8 @@ struct Peer {
     stats: Stats,
     /// When this peer last sent a stun (one credit per stun burst).
     last_stun: Option<Instant>,
+    /// Lobby: the cease fire last sent to this player (true = lifted).
+    fight_sent: Option<bool>,
 }
 
 impl Peer {
@@ -137,6 +193,7 @@ impl Peer {
             ping_token: 0,
             stats: Stats::default(),
             last_stun: None,
+            fight_sent: None,
             ping_dirty: false,
             echo_ages: VecDeque::with_capacity(ECHO_SAMPLES),
             echo_logged: Instant::now(),
@@ -187,14 +244,12 @@ struct TouchEntry {
     held: bool,
 }
 
-/// The server clock every session publishes, built like native's: the frame
-/// word counts 120 Hz ticks and `server_us` is exactly frame × 8333 µs, both
-/// measured from machine uptime. That keeps them small (native's are ~4e6
-/// frames) and still never going backwards when this process restarts, which
-/// matters because the client drops any frame not above the last one it saw
-/// and keeps that memory from one server to the next. The client's own match
-/// timers (the tube countdown, the doors) run on this clock.
-pub const TICK_US: u64 = 8333;
+// The server clock every session publishes (`wire_clock`), built like
+// native's from machine uptime: small numbers (native's are ~4e6 frames)
+// that never go backwards when this process restarts, which matters because
+// the client drops any frame not above the last one it saw. The frame word
+// ticks at the frame rate (at least 120 Hz) and the client's own match timers
+// (the tube countdown, the doors) run on this clock.
 /// Echo ages kept per player for the ping estimate (native keeps 450).
 const ECHO_SAMPLES: usize = 450;
 
@@ -230,10 +285,11 @@ fn system_uptime_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// Current wire frame word (120 Hz ticks) and its server time.
+/// Current wire frame word and its server time.
 fn wire_clock() -> (u64, u64) {
-    let frame = clock_us() / TICK_US;
-    (frame, frame * TICK_US)
+    let (f0, t0, tick) = wire_state();
+    let frame = f0 + clock_us().saturating_sub(t0) / tick;
+    (frame, t0 + (frame - f0) * tick)
 }
 
 /// Goal-cycle graph states the fresh round start reuses (names from nevr's
@@ -631,8 +687,11 @@ impl Arena {
         } else {
             self.red += points;
         }
+        // Native: the first event names the scoring team (it picks the
+        // celebration); ours always sent blue's, so orange got blue's.
+        let goal_a = if blue_scored { EV_GOAL_A } else { EV_GOAL_A_ORANGE };
         for _ in 0..2 {
-            self.at(g, ev13(EV_GOAL_A, MOD_MATCH));
+            self.at(g, ev13(goal_a, MOD_MATCH));
             self.at(g, ev13(EV_GOAL_B, MOD_MATCH));
         }
         self.at(g, ev(EV_GAME_SCORE));
@@ -842,6 +901,16 @@ pub struct Session {
     frame: u64,
     /// Last wire frame word published (120 Hz ticks of the server clock).
     wire_frame: u64,
+    /// Rules frames on real time: the rate they were counted at, when that
+    /// count started, the frames due at that start, and the frames run.
+    /// A server loop that falls behind (Windows timers) runs the missing
+    /// rules frames next time instead of slowing the match.
+    rules_hz: u64,
+    rules_t0: Option<Instant>,
+    rules_base: u64,
+    rules_done: u64,
+    /// The matchmaker was told this public match takes no more players.
+    join_locked: bool,
     started: Instant,
     arena: Arena,
     /// Touch (ownership) state per (object, entry): entry ids are numbered
@@ -942,6 +1011,11 @@ impl Session {
             slot_addr: [None; MAX_SLOTS],
             frame: 0,
             wire_frame: 0,
+            rules_hz: frame_hz(),
+            rules_t0: None,
+            rules_base: 0,
+            rules_done: 0,
+            join_locked: false,
             started: Instant::now(),
             arena,
             touch: HashMap::new(),
@@ -1301,7 +1375,7 @@ impl Session {
             if p.echo_ages.len() >= ECHO_SAMPLES {
                 p.echo_ages.pop_front();
             }
-            p.echo_ages.push_back((frames * TICK_US) as u32);
+            p.echo_ages.push_back((frames * wire_tick_us()) as u32);
         }
         p.ping_token = token;
         p.ping_dirty = true;
@@ -2046,7 +2120,7 @@ impl Session {
             for n in first..frame {
                 let mut sf = [0u8; 16];
                 sf[..8].copy_from_slice(&n.to_le_bytes());
-                sf[8..].copy_from_slice(&(n * TICK_US).to_le_bytes());
+                sf[8..].copy_from_slice(&wire_time(n).to_le_bytes());
                 p.t.queue_mailbox(SERVER_FRAME, key_server_frame(n), &sf);
             }
             p.t.queue_mailbox(SERVER_FRAME, key_server_frame(frame), &sf);
@@ -2109,7 +2183,7 @@ impl Session {
         }
 
         if self.arena_level {
-            self.arena_rules();
+            self.run_rules();
         }
         self.replicate();
         // The lobby objects nobody owns, ten times a second (native: 45; they
@@ -2138,6 +2212,66 @@ impl Session {
             TEAM_ORANGE => (b, o + 1),
             _ => (b, o),
         })
+    }
+
+    /// The rules frames due by the clock since the last call (at most a
+    /// second's worth after a stall).
+    fn run_rules(&mut self) {
+        let hz = frame_hz();
+        if hz != self.rules_hz {
+            self.rescale_rules(self.rules_hz, hz);
+        }
+        let now = Instant::now();
+        let t0 = *self.rules_t0.get_or_insert(now);
+        let due = self.rules_base + now.duration_since(t0).as_micros() as u64 * hz / 1_000_000;
+        if due.saturating_sub(self.rules_done) > hz {
+            self.rules_done = due - hz;
+        }
+        while self.rules_done < due {
+            self.rules_done += 1;
+            self.arena_rules();
+        }
+        self.update_join_lock();
+    }
+
+    /// A public match stops taking players (no backfill) with a minute left
+    /// and once it is over: the server tells the matchmaker with a lobby
+    /// session event, Locked, and Unlocked if a new match starts after all.
+    fn update_join_lock(&mut self) {
+        if self.arena.private {
+            return;
+        }
+        let a = &self.arena;
+        let lock = a.phase == Phase::Over || (matches!(a.phase, Phase::Playing | Phase::Goal) && a.clock <= JOIN_LOCK_SECS);
+        if lock != self.join_locked {
+            self.join_locked = lock;
+            let code = if lock { pb::lobby_session_event_message::Code::Locked } else { pb::lobby_session_event_message::Code::Unlocked };
+            info!(clock = a.clock, phase = ?a.phase, locked = lock, "join lock");
+            self.fleet_out.push(env(Em::LobbySessionEvent(pb::LobbySessionEventMessage { lobby_session_id: self.info.lobby.to_string(), code: code as i32 })));
+        }
+    }
+
+    /// The rate changed mid-game: everything counted in rules frames (the
+    /// rules clock, its schedule, possession) moves to the new rate, so a
+    /// countdown or pin keeps its remaining seconds.
+    fn rescale_rules(&mut self, old: u64, new: u64) {
+        let scale = |v: u64| v * new / old.max(1);
+        let a = &mut self.arena;
+        let tick = a.tick;
+        let new_tick = scale(tick);
+        for (at, _) in &mut a.schedule {
+            *at = if *at >= tick { new_tick + scale(*at - tick) } else { scale(*at) };
+        }
+        a.tick = new_tick;
+        for p in self.peers.values_mut() {
+            let v = &mut p.stats.v[Stat::PossessionTime as usize];
+            *v = (u64::from(*v) * new / old.max(1)) as u32;
+        }
+        self.rules_hz = new;
+        self.rules_t0 = Some(Instant::now());
+        self.rules_base = 0;
+        self.rules_done = 0;
+        info!(lobby = %self.info.lobby, from = old, to = new, "frame rate changed");
     }
 
     fn arena_rules(&mut self) {
@@ -2253,7 +2387,10 @@ impl Session {
                 }
             }
         }
-        if let Some((light, fx)) = self.arena.launch_fx {
+        // Native sends these every other 120 Hz frame (60/s); at 180 or 200 Hz
+        // one per rules frame would be 3x that.
+        let fx_due = (f * 60 / frame_hz()) != (f.saturating_sub(1) * 60 / frame_hz());
+        if let Some((light, fx)) = self.arena.launch_fx.filter(|_| fx_due) {
             for (sym, module) in [(EV_RESTART_DISC, MOD_MATCH), (light, MOD_DISC_FX), (fx, MOD_DISC_FX)] {
                 let ev = component_event(sym, module, handles.for_module(module), FILTER_ALL);
                 for a in &joined {
@@ -2452,34 +2589,100 @@ impl Session {
         }
     }
 
-    /// Native, at match over: `SR15NetTopAwardsMsg` = `[count u8]` + 72-byte
-    /// records `[award u64][stat u64][value u64][14 zero bytes][name 30]
-    /// [f32]`. The end-of-match board reads it (the MVP).
+    /// Native, at match over: `SR15NetTopAwardsMsg` = `[count u8]`, then
+    /// arrays of `count`: award ids, stat hashes, values (u64 each), slots
+    /// (u64), handles (u32), teams (u16), names (32 bytes), and a u16 each.
+    /// Native sends four (MVP and three stat awards); ours sent only the MVP
+    /// and the end-of-match board showed only that. Then the tier rewards.
     fn send_top_awards(&mut self) {
-        let best = self
+        struct Pick {
+            id: u64,
+            stat: u64,
+            value: u64,
+            slot: usize,
+            handle: u32,
+            team: u16,
+            name: Vec<u8>,
+        }
+        let players: Vec<(usize, u32, u16, Vec<u8>, Stats)> = self
             .peers
             .values()
-            .filter(|p| p.slot.is_some())
-            .max_by_key(|p| (p.stats.get(Stat::Points), p.stats.get(Stat::PossessionTime)));
-        let Some(best) = best else { return };
-        let name = best
-            .entrant_header
-            .as_deref()
-            .and_then(|h| h.get(60..96))
-            .map(|n| n.split(|&b| b == 0).next().unwrap_or(&[]).to_vec())
-            .unwrap_or_default();
-        let mut rec = [0u8; 72];
-        rec[0..8].copy_from_slice(&AWARD_MVP_ID.to_le_bytes());
-        rec[8..16].copy_from_slice(&AWARD_MVP_STAT.to_le_bytes());
-        rec[16..24].copy_from_slice(&u64::from(best.stats.get(Stat::Points).max(1)).to_le_bytes());
-        let n = name.len().min(29);
-        rec[38..38 + n].copy_from_slice(&name[..n]);
-        rec[68..72].copy_from_slice(&(best.stats.get(Stat::PossessionTime) as f32 / frame_hz() as f32).to_le_bytes());
-        let mut m = vec![1u8];
-        m.extend_from_slice(&rec);
-        info!(mvp = %String::from_utf8_lossy(&name), points = best.stats.get(Stat::Points), "top awards");
+            .filter(|p| matches!(p.team, TEAM_BLUE | TEAM_ORANGE))
+            .filter_map(|p| {
+                let slot = p.slot?;
+                let name = p
+                    .entrant_header
+                    .as_deref()
+                    .and_then(|h| h.get(60..96))
+                    .map(|n| n.split(|&b| b == 0).next().unwrap_or(&[]).to_vec())
+                    .unwrap_or_default();
+                let handle = (u32::from(p.generation.unwrap_or(0)) << 16) | slot as u32;
+                Some((slot, handle, u16::from(p.team == TEAM_ORANGE), name, p.stats))
+            })
+            .collect();
+        let best = |s: Stat| players.iter().filter(|p| p.4.get(s) > 0).max_by_key(|p| (p.4.get(s), p.4.get(Stat::Points)));
+        let mut picks = Vec::new();
+        if let Some(p) = players.iter().max_by_key(|p| (p.4.get(Stat::Points), p.4.get(Stat::PossessionTime))) {
+            picks.push(Pick { id: AWARD_MVP_ID, stat: AWARD_MVP_STAT, value: u64::from(p.4.get(Stat::Points).max(1)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
+        }
+        for (id, s) in [(AWARD_GOALS_ID, Stat::Goals), (AWARD_PASSES_ID, Stat::Passes), (AWARD_CATCHES_ID, Stat::Catches)] {
+            if let Some(p) = best(s) {
+                picks.push(Pick { id, stat: TEAM_STATS[s as usize], value: u64::from(p.4.get(s)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
+            }
+        }
+        picks.truncate(TOP_AWARDS_MAX);
+        if picks.is_empty() {
+            return;
+        }
+        let mut m = vec![picks.len() as u8];
+        for p in &picks {
+            m.extend_from_slice(&p.id.to_le_bytes());
+        }
+        for p in &picks {
+            m.extend_from_slice(&p.stat.to_le_bytes());
+        }
+        for p in &picks {
+            m.extend_from_slice(&p.value.to_le_bytes());
+        }
+        for p in &picks {
+            m.extend_from_slice(&(p.slot as u64).to_le_bytes());
+        }
+        for p in &picks {
+            m.extend_from_slice(&p.handle.to_le_bytes());
+        }
+        for p in &picks {
+            m.extend_from_slice(&p.team.to_le_bytes());
+        }
+        for p in &picks {
+            let mut n = [0u8; 32];
+            let k = p.name.len().min(31);
+            n[..k].copy_from_slice(&p.name[..k]);
+            m.extend_from_slice(&n);
+        }
+        m.extend(std::iter::repeat_n(0u8, 2 * picks.len()));
+        info!(mvp = %String::from_utf8_lossy(&picks[0].name), awards = picks.len(), "top awards");
         for a in self.joined() {
             self.reliable_to(a, TOP_AWARDS, &m);
+        }
+        // Tier rewards: gold, silver, bronze (150/100/50 XP) for the top three
+        // in Goals, Assists and Saves, each to its player.
+        let mut tiers = Vec::new();
+        for s in [Stat::Goals, Stat::Assists, Stat::Saves] {
+            let mut ranked: Vec<_> = players.iter().filter(|p| p.4.get(s) > 0).collect();
+            ranked.sort_by_key(|p| std::cmp::Reverse((p.4.get(s), p.4.get(Stat::Points))));
+            for (p, (tier, xp)) in ranked.iter().zip([(TIER_GOLD, 150u64), (TIER_SILVER, 100), (TIER_BRONZE, 50)]) {
+                let mut b = [0u8; 32];
+                b[0..8].copy_from_slice(&TEAM_STATS[s as usize].to_le_bytes());
+                b[8..16].copy_from_slice(&tier.to_le_bytes());
+                b[16..24].copy_from_slice(&(p.0 as u64).to_le_bytes());
+                b[24..32].copy_from_slice(&xp.to_le_bytes());
+                tiers.push((p.0, b));
+            }
+        }
+        for (slot, b) in tiers {
+            if let Some(a) = self.slot_addr.get(slot).copied().flatten() {
+                self.reliable_to(a, TIER_REWARD, &b);
+            }
         }
     }
 
@@ -2597,7 +2800,13 @@ impl Session {
             }
         };
         let fulls: Vec<Vec<u8>> = base.iter().enumerate().map(|(i, b)| fresh(b, i)).collect();
-        for p in self.peers.values_mut() {
+        // The lobby's cease fire (`VAR_HOLD`), per player: native lifts it
+        // (0) for a player in the brawler room or the combat area, and the
+        // client lets them punch and block only then.
+        let hold_hi = var_raw(&base[0], VAR_HOLD).unwrap_or(1) & !0xffff_ffff;
+        let gear = &self.gear;
+        let second = server_frame % frame_hz() == 0;
+        for (addr, p) in self.peers.iter_mut() {
             if p.stage != Stage::Joined || !p.rep_ready {
                 continue;
             }
@@ -2611,6 +2820,8 @@ impl Session {
                 }
                 p.rep_sent = true;
                 p.rep_seq += 1;
+                // The baseline has the cease fire on: send ours again next frame.
+                p.fight_sent = None;
             } else if arena {
                 // Every frame: the clock/countdown plus all tracked vars (tiny).
                 let mut body = delta(&base[0], &tracked);
@@ -2622,11 +2833,21 @@ impl Session {
                     p.t.queue_mailbox(REPLICATED_VARS, key_replicated(1, frame, slot), &body);
                 }
                 p.rep_seq += 1;
-            } else if lobby_due {
-                let mut body = delta(&base[0], &lobby_vars);
-                stamp(&mut body, p.rep_seq);
-                p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
-                p.rep_seq += 1;
+            } else if self.social {
+                let fight = gear.may_fight(*addr);
+                let changed = p.fight_sent != Some(fight);
+                if changed {
+                    info!(%addr, fight, pos = ?gear.body_pos(*addr), "lobby cease fire {}", if fight { "lifted" } else { "on" });
+                }
+                if lobby_due || changed || second {
+                    let mut vars = lobby_vars.clone();
+                    vars.push((VAR_HOLD, hold_hi | u64::from(!fight)));
+                    let mut body = delta(&base[0], &vars);
+                    stamp(&mut body, p.rep_seq);
+                    p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
+                    p.rep_seq += 1;
+                    p.fight_sent = Some(fight);
+                }
             }
         }
     }

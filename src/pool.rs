@@ -141,7 +141,7 @@ impl Pool {
             }
             let Some(port) = self.cfg.first_udp_port.checked_add(idx as u16) else { break };
             let addr = SocketAddr::new(self.cfg.bind_ip, port);
-            let socket = match tokio::net::UdpSocket::bind(addr).await {
+            let socket = match bind_udp(addr) {
                 Ok(s) => {
                     disable_udp_connreset(&s);
                     s
@@ -180,6 +180,31 @@ impl Pool {
         let all: Vec<Slot> = std::mem::take(&mut *self.instances.lock()).into_values().collect();
         futures_util::future::join_all(all.into_iter().map(|s| s.inst.stop())).await;
     }
+}
+
+/// Binds a game port. On the unspecified IPv4 address (the default) it is a
+/// dual-stack `[::]` socket, so players can reach it over IPv6 too (hosts
+/// behind CGNAT have no public IPv4); IPv4 alone where the system has no IPv6.
+fn bind_udp(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let open = |domain: Domain, at: SocketAddr, dual: bool| -> std::io::Result<tokio::net::UdpSocket> {
+        let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        if dual {
+            s.set_only_v6(false)?;
+        }
+        s.set_nonblocking(true)?;
+        s.bind(&at.into())?;
+        tokio::net::UdpSocket::from_std(s.into())
+    };
+    if addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) {
+        let any6 = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), addr.port());
+        match open(Domain::IPV6, any6, true) {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Err(e),
+            Err(e) => debug!(%any6, error = %e, "no dual-stack socket; IPv4 only"),
+        }
+    }
+    open(Domain::for_address(addr), addr, false)
 }
 
 /// Windows turns an ICMP "port unreachable" (a player whose client already
