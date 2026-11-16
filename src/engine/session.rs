@@ -323,6 +323,11 @@ struct Arena {
     client_resets: Option<u32>,
     /// The last player the server granted the disc to (handle).
     granted: u32,
+    /// The holder's last forwarded disc state (64 bytes, still moving).
+    holder_state: Option<Vec<u8>>,
+    /// Frames left in which the server publishes `holder_state` (owner
+    /// none, new count) instead of the pinned disc, right after a goal.
+    goal_flight: u32,
     goals_armed: bool,
     schedule: Vec<(u64, Act)>,
     min_per_team: usize,
@@ -391,6 +396,8 @@ impl Arena {
             awards_due: false,
             disc_resets: 0,
             granted: u32::MAX,
+            holder_state: None,
+            goal_flight: 0,
             client_resets: None,
             goals_armed: false,
             schedule: Vec::new(),
@@ -1193,7 +1200,9 @@ impl Session {
                 self.relay_reliable(from, ty, d, false);
             }
             ACTOR_CREATE if reliable => {
-                self.relay_reliable(from, ty, d, true);
+                // Native (public match + lobby, 2026-11-16): the create goes to
+                // everyone but its sender, the destroy to everyone.
+                self.relay_reliable(from, ty, d, false);
                 if let Some(body) = d.get(POOLED_DESTROY_WINDOW).map(<[u8]>::to_vec) {
                     self.relay_reliable(from, ACTOR_DESTROY, &body, true);
                 }
@@ -1253,6 +1262,7 @@ impl Session {
                         let mut f = d.to_vec();
                         f[24] = (f[24] & 0xf0) | (self.arena.disc_resets & 0xf) as u8;
                         self.relay_mailbox(from, ty, key, &f);
+                        self.arena.holder_state = Some(f);
                     }
                     return;
                 }
@@ -1602,6 +1612,17 @@ impl Session {
             };
             if self.arena_level && !release {
                 self.arena.granted = new_owner;
+                // Native (headbutt of the parked disc, 2026-11-16): the server
+                // stops sending its own disc at the grant; the next disc state
+                // the others get is the grantee's, under the new count. Ours
+                // kept sending the parked disc, now with the new count, until
+                // the grantee's state caught up: the others took that as the
+                // current disc and ignored the grantee's (same count), so a
+                // headbutted disc never moved for them until the next grab.
+                if self.arena.server_disc && self.arena.frozen.is_none() {
+                    self.arena.server_disc = false;
+                    info!(handle = new_owner, resets = self.arena.disc_resets, "disc granted: server stops publishing it");
+                }
             }
             let ent = self.touch.get_mut(&key).expect("inserted");
             ent.owner = new_owner;
@@ -1755,6 +1776,12 @@ impl Session {
         self.arena.frozen = Some((hit[0], hit[1], hit[2]));
         self.arena.bump_resets();
         self.arena.server_disc = true;
+        // Native (hoster match, goal at 324.257 s): the server's first disc
+        // state after the goal is still the flying disc (the scorer's last
+        // state, owner none, the new count, high nibble 0); the pinned one
+        // follows ~25 ms later. The spectator HUD's disc speed reads that
+        // first state: ours sent the pinned disc at once and it showed 0 m/s.
+        self.arena.goal_flight = if self.arena.holder_state.is_some() { (frame_hz() / 40).max(1) as u32 } else { 0 };
         self.arena.disc_live = false;
         self.arena.last_disc = None;
         // Native bumps the touch generation once per goal (grants 2 -> 4
@@ -2347,6 +2374,18 @@ impl Session {
                 }
             };
             msg::write_disc_transform(&mut d, x, y, depth);
+            if self.arena.goal_flight > 0 {
+                self.arena.goal_flight -= 1;
+                if let Some(h) = self.arena.holder_state.as_deref().filter(|h| h.len() == d.len()) {
+                    d.copy_from_slice(h);
+                    d[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                    d[8..16].copy_from_slice(&self.arena.disc_us.to_le_bytes());
+                    d[24..28].copy_from_slice(&(self.arena.disc_resets & 0xf).to_le_bytes());
+                }
+                if self.arena.goal_flight == 0 {
+                    self.arena.holder_state = None;
+                }
+            }
             let key = key_world_physics(wf, 0x10);
             for a in &joined {
                 if let Some(p) = self.peers.get_mut(a) {
@@ -2680,6 +2719,10 @@ impl Session {
         let sym = u64::from_le_bytes(d[0..8].try_into().expect("8"));
         let module = u64::from_le_bytes(d[8..16].try_into().expect("8"));
         if self.social {
+            // Walking into / out of the brawler room.
+            for o in self.gear.area_event(from, sym, Instant::now()) {
+                self.send_gear(from, o);
+            }
             // The lobby's toys: the Fury controller's trigger.
             self.props.on_event(from, sym);
             return;

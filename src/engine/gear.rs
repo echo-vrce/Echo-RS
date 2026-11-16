@@ -45,6 +45,11 @@ pub const TELEPORT: u64 = h("SR15NetGameplayTeleportPlayer");
 pub const BITFIELD_REQUEST: u64 = h("SR15NetBitFieldRequest");
 pub const BITFIELD_RESPONSE: u64 = h("SR15NetBitFieldResponse");
 pub const SET_BITS: u64 = h("SR15NetSetBits");
+/// `SR15NetComponentEvent` symbols the client sends crossing the combat area's edge.
+pub const AREA_ENTER_EVENT: u64 = 0x635d_09de_ff71_64c0;
+pub const AREA_LEAVE_EVENT: u64 = 0x635d_09de_ff71_64c1;
+/// Native freed a leaver's stations 3.3, 3.6 and 4.7 s after its leave event.
+const LEAVE_DELAY: Duration = Duration::from_millis(3500);
 pub const SET_OWNER: u64 = h("SR15NetSetOwner");
 pub const FIRE_GUN: u64 = h("SR15NetGameFireGun");
 pub const BULLET_COLLISION: u64 = h("SR15NetDamageableBulletCollision");
@@ -299,6 +304,9 @@ pub struct Gear {
     inside: Vec<SocketAddr>,
     /// When each player last walked out of it.
     left: HashMap<SocketAddr, Instant>,
+    /// Walked out (the client's area-leave event): stations freed at this time
+    /// unless the player walks back in first.
+    leaving: HashMap<SocketAddr, Instant>,
 }
 
 fn arr8(d: &[u8], o: usize) -> [u8; 8] {
@@ -343,6 +351,7 @@ impl Gear {
             drains: Vec::new(),
             inside: Vec::new(),
             left: HashMap::new(),
+            leaving: HashMap::new(),
         }
     }
 
@@ -392,6 +401,7 @@ impl Gear {
         self.drains.retain(|d| d.who != who);
         self.inside.retain(|a| *a != who);
         self.left.remove(&who);
+        self.leaving.remove(&who);
         // The leaver itself is gone: these go to the others.
         outs.into_iter().map(|o| Out { to: To::Others, ..o }).collect()
     }
@@ -498,6 +508,31 @@ impl Gear {
         v
     }
 
+    /// The client's combat-area trigger events (`SR15NetComponentEvent`, module
+    /// `c4b6bab2ee99ea6a`). Native (lobby recordings 2026-11-15/16): entering
+    /// sends `c06471ffde095d63`, and native answers it with the full health
+    /// broadcast and the player's heal bubble params; leaving sends
+    /// `c16471ffde095d63`, and native frees the gear stations 3.3-4.7 s later.
+    /// Older clients also sent `LoadoutNumberNotification` + `SetOwner`
+    /// around these, newer ones did not: a player who walked out stayed in
+    /// combat mode (stun, block and gear outside the brawler room).
+    pub fn area_event(&mut self, from: SocketAddr, sym: u64, now: Instant) -> Vec<Out> {
+        match sym {
+            AREA_ENTER_EVENT => {
+                self.leaving.remove(&from);
+                if self.inside.contains(&from) { Vec::new() } else { self.reset(from) }
+            }
+            AREA_LEAVE_EVENT => {
+                if self.inside.contains(&from) {
+                    info!(%from, "combat area leave event: stations freed in {LEAVE_DELAY:?}");
+                    self.leaving.insert(from, now + LEAVE_DELAY);
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// A player walked out of the combat area (the client then sends its loadout
     /// number and entrant state). Native frees the eight gear stations
     /// (`SetBits` `fcffffff` at indices 0, 15, ... 105), which takes the client
@@ -507,6 +542,7 @@ impl Gear {
             return Vec::new();
         }
         self.inside.retain(|a| *a != from);
+        self.leaving.remove(&from);
         self.left.insert(from, Instant::now());
         self.drains.retain(|d| d.who != from);
         info!(%from, still_inside = self.inside.len(), "combat area left: gear stations freed");
@@ -733,6 +769,12 @@ impl Gear {
     /// Replies whose time has come, with the client each `To` is relative to.
     pub fn due(&mut self, now: Instant) -> Vec<(SocketAddr, Out)> {
         let mut ready = Vec::new();
+        let gone: Vec<SocketAddr> = self.leaving.iter().filter(|(_, t)| **t <= now).map(|(a, _)| *a).collect();
+        for a in gone {
+            for o in self.left_area(a) {
+                ready.push((a, o));
+            }
+        }
         if !self.drains.is_empty() {
             let w = weapons();
             let lethal = w.pointer("/ability_properties/buff/self_damage_lethal").and_then(Value::as_bool).unwrap_or(false);
@@ -951,6 +993,50 @@ mod tests {
 
     fn addr() -> SocketAddr {
         "127.0.0.1:6794".parse().expect("addr")
+    }
+
+    #[test]
+    fn entry_health_broadcast_matches_native() {
+        // Native lobby recording 2026-11-16, answer to the area-enter event (slot 0).
+        let mut g = Gear::new();
+        g.on_message(addr(), HEAL_BUBBLE_PARAMS, &unhex("8ec21d00d315993f41e35b49673283b9f234d5099974113f00000000000080bf0000803f0000404000004040000020418401404100000000"), Instant::now());
+        let outs = g.area_event(addr(), AREA_ENTER_EVENT, Instant::now());
+        let h = outs.iter().find(|o| o.ty == HEALTH_BROADCAST).expect("health broadcast");
+        assert_eq!(h.body, unhex("8ec21d00d315993f000000000000e0420000e0400000000000000000ffffffff000000000000000000000000000000000000000000000000ffffffffffffffff"));
+    }
+
+    #[test]
+    fn dummy_hit_markers_match_native() {
+        // Native lobby recording 2026-11-16: BulletCollision -> LocallyTrackedDamage (part 4, part 5).
+        for (hit, marker) in [
+            ("be4d8ed1d9c72de371b7514227238cc0132ce7c1662d2f4207a6963fff02cbc1170000000100000026452bfc0000e0400400000000000000f234d5099974113f",
+             "26452bfcf77799cbbe4d8ed1d9c72de30000e040662d2f4207a6963fff02cbc11700000001000000"),
+            ("be4d8ed1d9c72de3e2ff524223c0d8bf454bebc120332f429d41b23f42a6cac1170000000100000026452bfc0000e0400500000000000000f234d5099974113f",
+             "26452bfcf77799cbbe4d8ed1d9c72de30000e04020332f429d41b23f42a6cac11700000001000000"),
+        ] {
+            assert_eq!(tracked_damage(&unhex(hit)), unhex(marker));
+        }
+    }
+
+    #[test]
+    fn area_events_enter_and_free_the_stations_after_a_delay() {
+        // Native lobby recording 2026-11-16: no SetOwner, no LoadoutNumberNotification.
+        let mut g = Gear::new();
+        let t0 = Instant::now();
+        assert_eq!(AREA_ENTER_EVENT.to_le_bytes(), [0xc0, 0x64, 0x71, 0xff, 0xde, 0x09, 0x5d, 0x63]);
+        g.area_event(addr(), AREA_ENTER_EVENT, t0);
+        assert!(g.inside.contains(&addr()));
+        assert!(g.area_event(addr(), AREA_LEAVE_EVENT, t0).is_empty());
+        assert!(g.due(t0 + Duration::from_secs(1)).iter().all(|(_, o)| o.ty != SET_BITS));
+        let freed: Vec<_> = g.due(t0 + Duration::from_secs(5)).into_iter().filter(|(_, o)| o.ty == SET_BITS).collect();
+        assert_eq!(freed.len(), 8);
+        assert!(!g.inside.contains(&addr()));
+        // Walking back in before the delay keeps the stations.
+        g.area_event(addr(), AREA_ENTER_EVENT, t0);
+        g.area_event(addr(), AREA_LEAVE_EVENT, t0);
+        g.area_event(addr(), AREA_ENTER_EVENT, t0 + Duration::from_secs(1));
+        assert!(g.due(t0 + Duration::from_secs(9)).iter().all(|(_, o)| o.ty != SET_BITS));
+        assert!(g.inside.contains(&addr()));
     }
 
     #[test]

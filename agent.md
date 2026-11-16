@@ -390,3 +390,30 @@ The user's order: **Combat lobby first** (`mpl_lobby_b_combat`, symbol
   grant) are dropped. Ours forwarded them with the new reset count. Fixed: `arena.granted` gates observe and
   forward; cleared when the server takes the disc. StunPlayerMsg: relayed unchanged to all but the sender;
   ForcePushPlayer: to all including the sender (both as ours).
+- Lobby recording (NetRecorder 1.1, one player: brawler room in/out, gun, ordnance, quarter-court goal):
+  the client crossing the combat area's edge sends `ComponentEvent` `c06471ffde095d63` (enter) /
+  `c16471ffde095d63` (leave), module `c4b6bab2ee99ea6a`. Native answers enter with the full health
+  broadcast + the player's heal bubble params (as `Gear::reset`), and frees the 8 stations 3.3-4.7 s
+  after leave. This client sent no `SetOwner` and no `LoadoutNumberNotification` (older captures did), so
+  we never saw it leave. `Gear::area_event` + `leaving` (3.5 s). Client `SetBits feffffff` at its station
+  indices on entry. Hit markers and the entry health broadcast match native byte for byte (tests).
+- `PooledActorCreate` (160 B): native relays to everyone but the sender (we echoed it back); destroy to all.
+- Quarter-court goal: native sends `PostScoreUpdate` to all (`[team u16][points u16][type u16][scorer]
+  [assister][u16 0][speed][distance][f32]`), nothing else; server-side detection. Disc crossed between
+  (-53.2, 1.85, -30.35) and (-53.7, 1.78, -30.7). Not done: needs the goal boxes (more goals recorded).
+- Headbutt of the parked disc (our server, player + spectator NetRecorder captures, 2026-11-16): the hit
+  request was granted (flags 0x11) and the headbutter's states (count 1, state 04) reached the spectator,
+  but our server had already sent its own parked disc with count 1 at the grant, so the spectator kept that
+  one and ignored the headbutter's until the next grab moved the count on. Native stops sending its disc at
+  the grant (hoster2 127.1 s: last server state count 0, then only the forwarded holder's). Fixed in
+  `on_touch`: a grant clears `server_disc`.
+- Native goal types seen: 1 slam dunk (speed 0, distance 0.17), 2 inside, 3 long, 5 and 7 (3 points, 12 m and
+  11 m: bounce shots?). Ours sends 1 for any goal without a throw (a headbutt goal too), and the HUD then
+  shows 0 m/s. Native type for a headbutt goal unknown (no recording).
+- Goal: native's first server disc state after the score message is still the flying disc (the scorer's
+  last state, owner ffff, the new count, high nibble 0); the pinned one (velocity zeroed) follows ~25 ms
+  later. The spectator HUD's DISC SPEED reads it: ours pinned at once and showed 0 m/s (the in-world goal
+  panel uses PostScoreUpdate and was right). `arena.holder_state` + `goal_flight` (frame_hz/40 frames).
+- Spectator + player on one PC with the SAME account (both OVR-ORG-6032896500068788): when the player joins
+  after the spectator, the spectator repeats the player-join sound all match. Not a server message (every
+  join message once, same as earlier joins); retest with two accounts before chasing it.
