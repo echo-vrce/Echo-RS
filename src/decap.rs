@@ -168,3 +168,72 @@ pub fn run(dir: &Path, out: &Path) -> Result<()> {
     println!("{rows} messages -> {}; undecoded packets c2s={} s2c={}", out.display(), undecoded[0], undecoded[1]);
     Ok(())
 }
+
+/// A NetRecorder folder: every `part_NNN.bin` in order, as one CSV. In a
+/// server's recording received messages are `c2s`, sent ones `s2c`; in a
+/// client's (`role client` in info.txt, NetRecorder 1.1) the other way round; `peer` is the recorder's peer index
+/// (`-1` local); `channel` is `rel` for a mailbox key of -1, else `mb`. A
+/// record marked "same as before" repeats the previous payload of its
+/// direction; one with no payload (voice) is written with an empty `hex`.
+pub fn netrec(dir: &Path, out: &Path) -> Result<()> {
+    let mut parts: Vec<_> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("part_") && n.ends_with(".bin")))
+        .collect();
+    parts.sort();
+    if parts.is_empty() {
+        bail!("no part_*.bin in {}", dir.display());
+    }
+    let mut w = BufWriter::new(fs::File::create(out)?);
+    writeln!(w, "dir,t,channel,type,name,mailbox_key,len,hex,peer")?;
+    let mut rows = 0u64;
+    const HEAD: usize = 8 + 1 + 1 + 2 + 4 + 8 + 8 + 4;
+    let client = fs::read_to_string(dir.join("info.txt")).is_ok_and(|s| s.lines().any(|l| l.trim() == "role client"));
+    let labels = if client { ["s2c", "c2s"] } else { ["c2s", "s2c"] };
+    for part in &parts {
+        let raw = fs::read(part)?;
+        if raw.len() < 16 || &raw[..8] != b"ERSNETR1" {
+            bail!("{} is not a NetRecorder part", part.display());
+        }
+        let mut last: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        let mut i = 16;
+        while i + HEAD <= raw.len() {
+            let r = &raw[i..];
+            let t = u64::from_le_bytes(r[0..8].try_into()?);
+            let dir_c = (r[8] & 1) as usize;
+            let flags = r[9];
+            let peer = u32::from_le_bytes(r[12..16].try_into()?);
+            let ty = u64::from_le_bytes(r[16..24].try_into()?);
+            let key = i64::from_le_bytes(r[24..32].try_into()?);
+            let len = u32::from_le_bytes(r[32..36].try_into()?) as usize;
+            let stored = flags == 0;
+            if stored && i + HEAD + len > raw.len() {
+                break; // the part was cut off mid-record (the server stopped)
+            }
+            let data: &[u8] = if stored {
+                last[dir_c] = r[HEAD..HEAD + len].to_vec();
+                &last[dir_c]
+            } else if flags & 2 != 0 {
+                &last[dir_c]
+            } else {
+                &[]
+            };
+            i += HEAD + if stored { len } else { 0 };
+            let name = rad_protocol::message_registry::lookup_message_name(ty).unwrap_or("");
+            let ch = if dir_c == 0 { "rx" } else if key == -1 { "rel" } else { "mb" };
+            let peer = if peer == u32::MAX { -1 } else { i64::from(peer) };
+            writeln!(
+                w,
+                "{},{:.4},{ch},{ty:#018x},{name},{:#018x},{len},{},{peer}",
+                labels[dir_c],
+                t as f64 / 1e6,
+                key as u64,
+                hex(data)
+            )?;
+            rows += 1;
+        }
+    }
+    w.flush()?;
+    println!("{rows} messages from {} parts -> {}", parts.len(), out.display());
+    Ok(())
+}

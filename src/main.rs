@@ -146,6 +146,11 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     decode_capture: Option<std::path::PathBuf>,
 
+    /// Turn a NetRecorder folder (`part_*.bin`, recorded inside a native
+    /// server by EchoBits&Bobs' NetRecorder.dll) into `<DIR>/msgs.csv` and exit.
+    #[arg(long, value_name = "DIR")]
+    decode_netrec: Option<std::path::PathBuf>,
+
     /// Probe: number of concurrent clients.
     #[arg(long, default_value_t = 1)]
     probe_clients: usize,
@@ -231,6 +236,9 @@ async fn main() -> Result<()> {
 
     if let Some(dir) = &args.decode_capture {
         return decap::run(dir, &dir.join("msgs.csv"));
+    }
+    if let Some(dir) = &args.decode_netrec {
+        return decap::netrec(dir, &dir.join("msgs.csv"));
     }
 
     if let Some(base) = args.probe.clone() {

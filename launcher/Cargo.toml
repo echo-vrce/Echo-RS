@@ -1,6 +1,6 @@
 [package]
 name = "echo-server-launcher"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Desktop launcher for echo-rust-server: pick servers, ports, frame rate, modes and maps, then start and watch them."
 license = "MIT"

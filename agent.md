@@ -365,3 +365,28 @@ The user's order: **Combat lobby first** (`mpl_lobby_b_combat`, symbol
   them as a delta on change and every second.
 - Stun: native's server (0x140d53da0) relays unless the victim is a spectator (`IsPlayerInPunchState` is really
   that check). The combat-area filter is gone: it blocked every punch in the brawler room (no SetOwner there).
+
+## Tenth pass (native public match via NetRecorder)
+
+- NetRecorder (EchoBits&Bobs `plugin/netrecorder.cpp`) records a native server's sends (CBroadcaster::Send
+  0xF89AF0) and, from 1.1, received game messages through a listener tap beside every game listener
+  (CBroadcaster::Listen 0xF80ED0, as EchoReplay's wiretap). 1.0's Raise hook saw only connection messages.
+  Decode: `echo-rust-server --decode-netrec <dir>`.
+- Hoster match 2026-11-16 (11 players, 13 min): disc reset count / grant generation runs 0..=0xe and wraps
+  to 0 (no 0xf in 260k disc states). Fixed: `DISC_COUNTS` (was `& 0xf`). Every disc owner change came with
+  a grant (headbutts too: grant flags 0x10, disc state byte 25 = 04, then 00 free / 02 held). Contested
+  grabs: first request wins, the loser is declined ~80-160 ms later. Grants/declines have 0 at 0x1c (we
+  now send 0, not the request's acked). Grant flag bits 5..15 are sometimes noise in native.
+- After a goal native pins the disc where it went in (owner ffff, count +1 over the scorer's) for ~19.6 s,
+  then moves it to (0, 4536, +-27500) on the conceding side; matches `goal()`.
+- StunPlayerMsg is relayed to everyone but its sender, as ours.
+- Second hoster match (NetRecorder 1.1, client messages too): touch request = TransferReliable and
+  TransferMailbox, same 48 bytes: `+0` object low, `+4` seq, `+6` acked, `+8` sender, `+0xc` new owner,
+  `+0x10` believed owner, `+0x14` entry, `+0x20` u32 stamp = the timestamp (bytes 8..12) of the holder's
+  disc state the requester last saw, `+0x28` 1 = hit (headbutt/punch; grant bit 0x10, disc state 04).
+  Native grants iff believed == current owner (or the owner's own request; owner reset to none on a goal):
+  62/63 decisions. Grant flag bits above 0x1f are noise.
+- Native forwards only the current grantee's disc states: the old holder's (sent for ~150-200 ms after the
+  grant) are dropped. Ours forwarded them with the new reset count. Fixed: `arena.granted` gates observe and
+  forward; cleared when the server takes the disc. StunPlayerMsg: relayed unchanged to all but the sender;
+  ForcePushPlayer: to all including the sender (both as ours).

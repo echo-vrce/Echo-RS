@@ -35,6 +35,11 @@ pub fn set_frame_hz(hz: u64) {
     FRAME_HZ_V.store(hz.clamp(10, 200), std::sync::atomic::Ordering::Relaxed);
 }
 const PEER_TIMEOUT: Duration = Duration::from_secs(12);
+/// The arena disc's reset count (low nibble of its state word, and the touch
+/// grant's generation) runs 0..=0xe and wraps to 0: native, public match
+/// 2026-11-16, never sent 0xf in 260k disc states or 70 grants. At 0xf the
+/// clients, which wrap at 0xe themselves, no longer matched the server.
+const DISC_COUNTS: u32 = 15;
 const ENTRANT_HEADER: usize = 0x68;
 
 const TEAM_BLUE: u8 = 0;
@@ -540,7 +545,7 @@ impl Arena {
         self.disc_resets = match self.client_resets.take() {
             Some(c) => c + 1,
             None => self.disc_resets + 3,
-        } & 0xf;
+        } % DISC_COUNTS;
     }
 
     fn clock_runs(&self) -> bool {
@@ -1223,6 +1228,18 @@ impl Session {
                 self.props.observe(from, d);
             }
             if ty == PHYSICS && self.arena_level {
+                // Native (public match, 2026-11-16): once the disc is granted to
+                // someone, the previous holder's states (it keeps sending them
+                // for 150-200 ms, more on high ping, until the grant reaches it)
+                // are neither used nor forwarded. Forwarded with the new reset
+                // count, they told every client the stale disc was the current
+                // one: a caught or headbutted disc snapped back.
+                if msg::disc_transform(d).is_some() && self.arena.granted != u32::MAX {
+                    let handle = self.peers.get(&from).map(|p| (u32::from(p.generation.unwrap_or(0)) << 16) | p.slot.unwrap_or(usize::MAX) as u32);
+                    if handle != Some(self.arena.granted) {
+                        return;
+                    }
+                }
                 self.observe_disc(from, d);
                 if let Some((owner, ..)) = msg::disc_transform(d) {
                     // Native forwards the holder's disc under the holder's own
@@ -1501,7 +1518,7 @@ impl Session {
         let entry_id = u32_at(0x14);
         let actor = &d[0x18..0x20];
         let stamp = u64::from_le_bytes(d[0x20..0x28].try_into().expect("8 bytes"));
-        debug!(%from, seq, sender, new_owner, believed, entry_id, "touch request");
+        debug!(%from, seq, acked, sender, new_owner, believed, entry_id, "touch request");
         let exclusive = d[0x28] & 1 != 0;
         let idx = (sender & 0xffff) as usize;
         if idx >= MAX_SLOTS || (sender >> 16) == 0xffff {
@@ -1577,7 +1594,7 @@ impl Session {
             let prev_owner = e.owner;
             let ent = self.touch.get_mut(&key).expect("inserted");
             ent.generation = if self.arena_level {
-                let g = ((e.generation + 1) & 0xf) as u8;
+                let g = ((u32::from(e.generation) + 1) % DISC_COUNTS) as u8;
                 self.arena.disc_resets = u32::from(g);
                 g
             } else {
@@ -1597,7 +1614,8 @@ impl Session {
             let regrab = !release && prev_owner == new_owner;
             let flags = (u16::from(exclusive) << 4) | (u16::from(regrab) << 5) | u16::from(ent.generation & 0xf);
             reply[0x18..0x1a].copy_from_slice(&flags.to_le_bytes());
-            reply[0x1c..0x20].copy_from_slice(&u32::from(acked).to_le_bytes());
+            // 0x1c..0x20 stays 0: native's 77 grants and declines in a public
+            // match (2026-11-16 recording) all had 0 there.
             // Native (two-client capture): only the requester gets the
             // grant; the others learn from the holder's forwarded disc,
             // whose reset count the server moves on.
@@ -1649,7 +1667,7 @@ impl Session {
         let client_count = u32::from(d[24]) & 0xf;
         // A client that has not yet caught up to the server's reset count
         // still shows its old disc: it can't take the server's over.
-        if self.arena.server_disc && client_count.wrapping_sub(self.arena.disc_resets) & 0xf >= 8 {
+        if self.arena.server_disc && (client_count % DISC_COUNTS + DISC_COUNTS - self.arena.disc_resets % DISC_COUNTS) % DISC_COUNTS >= 8 {
             return;
         }
         let handle = (u32::from(owner_gen) << 16) | u32::from(owner);
@@ -1657,7 +1675,7 @@ impl Session {
         // now simulates it, but the reset count has not moved, so the others
         // would ignore that player's disc: move it past the player's own.
         if self.arena.phase == Phase::Playing && !self.arena.server_disc && handle != self.arena.disc_owner && handle != self.arena.granted {
-            self.arena.disc_resets = (client_count + 1) & 0xf;
+            self.arena.disc_resets = (client_count + 1) % DISC_COUNTS;
             self.arena.granted = handle;
             info!(slot = owner, resets = self.arena.disc_resets, "disc taken without a grab (headbutt?): others snap to it");
         }
@@ -2299,6 +2317,8 @@ impl Session {
             for e in self.touch.values_mut() {
                 e.owner = u32::MAX;
             }
+            // Nobody holds it now: the next grant names the next holder.
+            self.arena.granted = u32::MAX;
         }
         self.server_disc_was = self.arena.server_disc;
         if self.arena.server_disc {
