@@ -97,7 +97,12 @@ impl Modes {
         match self.kind(mode) {
             ModeKind::Social => self.level_social,
             ModeKind::Arena => self.level_arena,
-            ModeKind::Combat => self.combat_levels[rand::random::<usize>() % self.combat_levels.len()],
+            ModeKind::Combat => {
+                // A random combat map this server hosts (any, if none is).
+                let ok: Vec<u64> = self.combat_levels.iter().copied().filter(|&l| crate::engine::filter::allows(mode, l)).collect();
+                let from = if ok.is_empty() { self.combat_levels.to_vec() } else { ok };
+                from[rand::random::<usize>() % from.len()]
+            }
         }
     }
     pub fn name(&self, mode: u64) -> &'static str {
@@ -575,6 +580,14 @@ impl Hub {
         let lobby_id = match target {
             Some(id) => id,
             None => {
+                let level_wanted = if req.level == 0 || req.level == u64::MAX {
+                    if req.settings.level > 0 { req.settings.level as u64 } else { self.modes.default_level(mode) }
+                } else {
+                    req.level
+                };
+                if !crate::engine::filter::allows(mode, level_wanted) {
+                    return Placement::Fail(fail::SERVER_FIND_FAILED, "This server does not host that mode or map");
+                }
                 // Allocate a free server (embedded instances first: lowest latency).
                 let Some(server_id) = s.servers.values().filter(|g| g.lobby.is_none()).max_by_key(|g| g.embedded).map(|g| g.id) else {
                     return Placement::NeedServer;

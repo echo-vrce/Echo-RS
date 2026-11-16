@@ -1,0 +1,56 @@
+{
+ "handicapping": {
+  "handicapping_disc_respawn_left_offset": 0.0,
+  "handicapping_disc_respawn_up_offset": 4.536,
+  "handicapping_disc_respawn_towards_offset": 27.5
+ },
+ "team_neutral_color": {
+  "r": 128,
+  "b": 128,
+  "g": 128
+ },
+ "zone_1_point_value": 3,
+ "mercy_win_point_spread": 12,
+ "zone_2_point_value": 3,
+ "mercy_win_point_spread_private": 20,
+ "mercy_rule_private_enabled": true,
+ "team_only_voice": true,
+ "zone_0_point_value": 2,
+ "team_0_color_active": {
+  "r": 0,
+  "b": 255,
+  "g": 0
+ },
+ "team_1_color_active": {
+  "r": 255,
+  "b": 0,
+  "g": 0
+ },
+ "self_goaling_public": false,
+ "self_goaling_private": true,
+ "goalie_ping_window": 150.0,
+ "round_rules": {
+  "round_time": 300.0,
+  "sudden_death_round_over_time": 5.0,
+  "rounds_played": 1,
+  "round_count": 1,
+  "team_room_wait_time": 0.0,
+  "post_round_over_time": 3.0,
+  "round_count_private": 3,
+  "round_time_private": 600.0,
+  "rounds_played_private": 1,
+  "pre_match_wait_time": 45.0,
+  "team_room_wait_time_private": 59.0,
+  "wait_for_launch_time": 15.0,
+  "wait_for_launch_time_private": 12.0,
+  "point_score_celebration_time_private": 3.0,
+  "sudden_death_round_time": 120.0,
+  "point_score_celebration_time": 15.0,
+  "point_score_replay_time": 0.0,
+  "round_over_time": 15.0,
+  "celebration_time": 10.0,
+  "enable_sudden_death": true,
+  "celebration_personal_stats_time": 15.0,
+  "sudden_death_regulation_over_time": 0.0
+ }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "echo-server-launcher"
+version = "0.1.1"
+edition = "2024"
+description = "Desktop launcher for echo-rust-server: pick servers, ports, frame rate, modes and maps, then start and watch them."
+license = "MIT"
+
+[[bin]]
+name = "echo-server-launcher"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Updates from GitHub releases: https download + unzip.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+[target.'cfg(windows)'.dependencies]
+# DirectX/Vulkan, for PCs where OpenGL can't start (basic or remote-desktop drivers).
+eframe = { version = "0.31.1", default-features = false, features = ["wgpu"] }
+# eframe leaves wgpu without any Windows backend; DX12 also brings WARP,
+# Windows' software renderer, for PCs with no usable GPU driver.
+wgpu = { version = "24", default-features = false, features = ["dx12", "wgsl"] }
+tray-icon = { version = "0.26", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }

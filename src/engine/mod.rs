@@ -7,12 +7,20 @@
 //! backend connection, so an idle instance costs no CPU. While a session runs
 //! it wakes at 100 Hz for retransmits and at 20 Hz for the server frame.
 
+pub mod balance;
+pub mod gear;
+pub mod filter;
+pub mod goal;
 pub mod msg;
+pub mod props;
+pub mod rules;
 pub mod session;
+pub mod stats;
 pub mod transport;
+pub mod veilnet;
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use nevr_proto::rtapi::v1 as pb;
@@ -31,6 +39,10 @@ use session::{Session, SessionInfo};
 pub struct EngineConfig {
     /// Arena: players needed on EACH team before the pre-match countdown runs.
     pub arena_min_per_team: usize,
+    /// Answer EchoCombat's VeilNet packets.
+    pub veilnet: bool,
+    /// EchoCombat's MEDIGUN is allowed (only from `echocombat.ini`).
+    pub medigun: bool,
 }
 
 pub struct Instance {
@@ -126,10 +138,15 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
         return false;
     }
     let mut session: Option<Session> = None;
+    // Players' keys that came just before their session (nakama sends them early).
+    let mut early_keys: Vec<pb::SnsLobbySessionSuccessV5Message> = Vec::new();
+    let mut veil = veilnet::VeilNet::new(cfg.veilnet, cfg.medigun);
     let mut buf = vec![0u8; 2048];
+    // Service (flush) every 10 ms; game frames at `--frame-hz`.
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut ticks: u64 = 0;
+    let mut frames = tokio::time::interval(Duration::from_micros(1_000_000 / session::frame_hz()));
+    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut outbox: Vec<pb::Envelope> = Vec::new();
 
     let result = loop {
@@ -154,28 +171,36 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
                     Some(Ok(_)) => continue,
                 };
                 let Ok(e) = pb::Envelope::decode(data.as_slice()) else { continue };
-                on_fleet(idx, port, e, &mut session, &mut outbox, cfg);
+                on_fleet(idx, port, e, &mut session, &mut early_keys, &mut outbox, cfg);
             }
             r = socket.recv_from(&mut buf) => {
                 let Ok((n, from)) = r else { continue };
-                handle_datagram(socket, &mut session, from, &buf[..n]).await;
+                handle_datagram(socket, &mut session, &mut veil, from, &buf[..n]).await;
                 // Drain whatever else is already queued, then answer in one go.
                 for _ in 0..256 {
                     match socket.try_recv_from(&mut buf) {
-                        Ok((n, from)) => handle_datagram(socket, &mut session, from, &buf[..n]).await,
+                        Ok((n, from)) => handle_datagram(socket, &mut session, &mut veil, from, &buf[..n]).await,
                         Err(_) => break,
                     }
                 }
                 if let Some(s) = session.as_mut() {
-                    s.flush();
+                    s.flush_reliable();
                     send_udp(socket, s).await;
                     outbox.append(&mut s.fleet_out);
                 }
             }
-            _ = tick.tick(), if session.is_some() => {
-                ticks += 1;
+            _ = frames.tick(), if session.is_some() => {
                 let s = session.as_mut().expect("guarded");
-                if ticks % 5 == 0 { s.server_frame() } else { s.service() }
+                s.server_frame();
+                send_udp(socket, s).await;
+                outbox.append(&mut s.fleet_out);
+            }
+            _ = tick.tick(), if session.is_some() => {
+                let s = session.as_mut().expect("guarded");
+                let mut veil_out = veilnet::Out::new();
+                veil.tick(Instant::now(), &mut veil_out);
+                send_veil(socket, veil_out).await;
+                s.service();
                 send_udp(socket, s).await;
                 outbox.append(&mut s.fleet_out);
                 // Release the server once nobody is left.
@@ -201,7 +226,15 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
     result
 }
 
-async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, from: SocketAddr, d: &[u8]) {
+async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil: &mut veilnet::VeilNet, from: SocketAddr, d: &[u8]) {
+    // EchoCombat's own packets, on the game's socket (never game traffic).
+    if let Some((kind, id)) = veilnet::parse(d) {
+        veil.sync_session(session.as_ref().map(|s| (s.info.lobby, s.info.mode, s.info.level)));
+        let mut out = veilnet::Out::new();
+        veil.handle(from, kind, id, Instant::now(), &mut out);
+        send_veil(socket, out).await;
+        return;
+    }
     if d.len() == 16 && u64::from_le_bytes(d[..8].try_into().expect("8")) == msg::RAW_PING_REQUEST {
         let mut out = [0u8; 16];
         out[..8].copy_from_slice(&msg::RAW_PING_ACK.to_le_bytes());
@@ -214,6 +247,14 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, from
     }
 }
 
+async fn send_veil(socket: &UdpSocket, out: veilnet::Out) {
+    for (to, d) in out {
+        if let Err(e) = socket.send_to(&d, to).await {
+            debug!(%to, error = %e, "udp send failed");
+        }
+    }
+}
+
 async fn send_udp(socket: &UdpSocket, s: &mut Session) {
     for (to, d) in s.udp_out.drain(..) {
         if let Err(e) = socket.send_to(&d, to).await {
@@ -222,7 +263,15 @@ async fn send_udp(socket: &UdpSocket, s: &mut Session) {
     }
 }
 
-fn on_fleet(idx: u32, port: u16, e: pb::Envelope, session: &mut Option<Session>, out: &mut Vec<pb::Envelope>, cfg: EngineConfig) {
+fn on_fleet(
+    idx: u32,
+    port: u16,
+    e: pb::Envelope,
+    session: &mut Option<Session>,
+    early_keys: &mut Vec<pb::SnsLobbySessionSuccessV5Message>,
+    out: &mut Vec<pb::Envelope>,
+    cfg: EngineConfig,
+) {
     let Some(m) = e.message else { return };
     match m {
         Em::GameServerRegistrationSuccess(r) => {
@@ -233,18 +282,39 @@ fn on_fleet(idx: u32, port: u16, e: pb::Envelope, session: &mut Option<Session>,
                 old.close();
             }
             let info = session_info(&c);
+            if !filter::allows(info.mode, info.level) {
+                warn!(
+                    instance = idx, port, lobby = %info.lobby,
+                    mode = %filter::mode_name(info.mode), level = %filter::level_name(info.level),
+                    "session refused: mode or map not hosted here"
+                );
+                out.push(session_event(info.lobby, pb::lobby_session_event_message::Code::Ended));
+                return;
+            }
             info!(
                 instance = idx, port, lobby = %info.lobby,
                 mode = format_args!("{:#018x}", info.mode), level = format_args!("{:#018x}", info.level),
                 "session started"
             );
             let lobby = info.lobby;
-            *session = Some(Session::new(info, cfg.arena_min_per_team));
+            let mut sess = Session::new(info, cfg.arena_min_per_team);
+            for k in early_keys.drain(..) {
+                if k.lobby_id.parse::<Uuid>().map_or(true, |l| l == lobby || l.is_nil()) {
+                    sess.add_keys(&k);
+                }
+            }
+            *session = Some(sess);
             out.push(session_event(lobby, pb::lobby_session_event_message::Code::Started));
         }
         Em::LobbySessionSuccessV5(s) => match session.as_mut() {
             Some(sess) => sess.add_keys(&s),
-            None => warn!(instance = idx, "entrant keys arrived without a session"),
+            None => {
+                // Kept for the session that is about to start.
+                if early_keys.len() < 64 {
+                    early_keys.push(s);
+                }
+                debug!(instance = idx, "entrant keys arrived before the session; holding them");
+            }
         },
         Em::LobbyEntrantsAccept(a) => {
             if let Some(s) = session.as_mut() {

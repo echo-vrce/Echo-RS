@@ -1,0 +1,36 @@
+{
+ "battery": {
+  "max_power": 100.0,
+  "recharge_delay": 0.25,
+  "recharge_rate": 33.3
+ },
+ "big_chin": {
+  "in_bounce": true,
+  "in_raise": false
+ },
+ "boost": {
+  "accel": 10.0,
+  "max_vel": 4.5,
+  "power_cost": 0.0,
+  "recharge_time": 1.25,
+  "time": 0.2
+ },
+ "brake": {
+  "force_accel_percentage": 0.985,
+  "min_force_accel": 7.0
+ },
+ "iron_man": {
+  "accel": 1.25,
+  "single_hand_max_vel": 0.8,
+  "two_hands_max_vel": 1.5
+ },
+ "push_max_speed": 4.0,
+ "rotation": {
+  "discrete_rotate_pitch_amt": 15.0,
+  "discrete_rotate_time": 0.25,
+  "discrete_rotate_yaw_amt": 30.0
+ },
+ "slow_down": {
+  "slow_down_speed": 4.65
+ }
+}

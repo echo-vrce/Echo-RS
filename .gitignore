@@ -37,3 +37,9 @@ desktop.ini
 # Local env files
 .env
 .env.*
+
+# Launcher build output, packaged builds, and saved launcher settings (they
+# hold the pasted config, which can contain passwords and API keys).
+/launcher/target/
+/dist/
+launcher-setup.json

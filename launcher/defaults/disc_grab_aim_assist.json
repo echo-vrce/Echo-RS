@@ -1,0 +1,18 @@
+{
+ "possesion_time": 5.0,
+ "use_grab_bubble": true,
+ "interception_min_distance": 5.0,
+ "grab_range": 0.25,
+ "clear_throw_distance": 30.0,
+ "clear_distance_from_home_goal": 15.0,
+ "aim_assist": {
+  "max_angle": 45.0,
+  "enable": true,
+  "max_angle_strength": 0.3,
+  "min_angle": 10.0,
+  "target_choice_half_angle": 22.5,
+  "passive_percent": 1.0,
+  "active_percent": 1.0,
+  "min_angle_strength": 1.0
+ }
+}

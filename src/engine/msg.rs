@@ -27,6 +27,10 @@ pub const HOST_STATE: u64 = h("SNSLobbyHostState");
 pub const ENTRANT_STATE: u64 = M::SNS_LOBBY_ENTRANT_STATE_V2.data();
 pub const ENTRANT_REMOVED: u64 = M::SNS_LOBBY_ENTRANT_REMOVED.data();
 pub const UPDATE_PINGS: u64 = h("SNSLobbyUpdatePings");
+/// Client -> server on each cosmetic equip: `[slot u64][instance][slot type][item]`.
+pub const ITEM_EQUIPPED: u64 = h("SR15NetItemEquippedNotification");
+/// Client -> server after an equip (4 bytes); native sends nothing back.
+pub const SAVE_LOADOUT_REQUEST: u64 = h("SR15NetSaveLoadoutRequest");
 pub const REFRESH_PROFILE: u64 = M::SNS_REFRESH_PROFILE_FROM_SERVER.data();
 
 pub const SERVER_INFO: u64 = M::SR15_NET_SERVER_INFO.data();
@@ -64,26 +68,24 @@ pub const TEAM_STAT_UPDATE: u64 = h("SR15NetReliableTeamStatUpdate");
 pub const TOP_AWARDS: u64 = h("SR15NetTopAwardsMsg");
 
 // ── Match stats (layouts from a recorded native game) ─────────────────────
-/// Team stat record hashes, in native's order. Each record is
+/// Team stat record hashes, in native's order: the arena screen-stat list
+/// (`stats::STAT_NAMES`). Each record is
 /// `[hash u64][mantissa i32][exponent i32][count u32]`, value = m * 2^e.
 pub const TEAM_STATS: [u64; 12] = [
     0x41d2_d732_132d_130d, // Points
-    0x2fd6_9c8c_5767_4399,
-    0xe32d_c7c9_d899_41a3,
-    0xe32d_c7c9_cd9a_4aa3,
+    0x2fd6_9c8c_5767_4399, // Assists
+    0xe32d_c7c9_d899_41a3, // Saves
+    0xe32d_c7c9_cd9a_4aa3, // Stuns
     0xea7c_6201_ea1d_29f5, // PossessionTime (2^-6 s)
-    0x41d2_d429_1f22_0b0d,
+    0x41d2_d429_1f22_0b0d, // Steals
     0x2afc_a8a0_4d9e_f31c, // ShotsOnGoal
-    0x4dd2_9d01_fecc_667b,
+    0x4dd2_9d01_fecc_667b, // Interceptions
     0xe32d_c7dd_d68e_48a3, // Goals
-    0x41d2_c531_1520_0c0d,
-    0x2fd4_8e8b_5d7c_5299,
-    0x41d2_d73c_0930_020d,
+    0x41d2_c531_1520_0c0d, // Blocks
+    0x2fd4_8e8b_5d7c_5299, // Catches
+    0x41d2_d73c_0930_020d, // Passes
 ];
-pub const TS_POINTS: usize = 0;
 pub const TS_POSSESSION: usize = 4;
-pub const TS_SHOTS: usize = 6;
-pub const TS_GOALS: usize = 8;
 /// TopAwards record constants (one MVP record in the native game).
 pub const AWARD_MVP_ID: u64 = 0xc8e8_d0b1_a89d_f4fa;
 pub const AWARD_MVP_STAT: u64 = 0xe32d_c7c9_da80_56b5;
@@ -174,7 +176,6 @@ pub const EV_FX_WHITE: u64 = 0x440e_7479_9f15_2d2b;
 pub const EV_DISABLE_LOCAL_DISC: u64 = 0x7cff_6e8b_60cd_61d7;
 pub const EV_ROUND_START: u64 = 0x8fea_3716_c99b_8122;
 pub const EV_NEW_ROUND_STARTED: u64 = 0x07fd_afd6_80ee_3a56;
-pub const EV_ANNOUNCER_ROUND_START: u64 = 0xba47_472b_3f67_118e;
 pub const EV_GAME_SCORE: u64 = 0x92a7_734b_005d_e071;
 pub const EV_ROUND_RESTART: u64 = 0x6f88_4020_dc2e_8d0c;
 pub const EV_REALLY_RESTART: u64 = 0xcd87_4f73_cab7_5974;
@@ -194,25 +195,140 @@ pub const EV_ANNOUNCER_GOAL_3: u64 = 0x6cfb_6cd1_5bd1_90a7;
 pub const EV_LIGHT_ORANGE: u64 = 0x54cd_84e5_4d95_66f2;
 pub const EV_FX_ORANGE: u64 = 0x52ae_1390_2597_cf66;
 
-/// `SR15NetComponentEvent`: symbol, module, handle, filter, origin.
-/// Net component handle an event is routed to. The arena IdsResponse we send
-/// (native's, byte for byte) hands the client these handles: generation 10,
-/// match graph index 45, disc-FX component index 27, the same ones native
-/// addresses. The 0x0fff sentinel only reaches generic listeners and skips the
-/// node graph, which is what runs the round start (opening the tunnels).
-fn component_handle(module: u64) -> u16 {
-    match module {
-        MOD_MATCH | MOD_ANNOUNCER => 0xa02d,
-        MOD_DISC_FX => 0xa01b,
-        _ => 0x0fff,
+// ── Private match (echo_arena_private) ─────────────────────────────────────
+pub const MODE_ARENA_PRIVATE: u64 = 0x0999_0965_f4db_8c03;
+/// Module of the private-match terminal panels (rules, start/pause, restart).
+pub const MOD_RULES_PANEL: u64 = 0x6aea_99ee_b2ba_b6c4;
+pub const UI_INC_SETTING: u64 = h("SR15NetUIIncSettingMsg");
+pub const UI_DEC_SETTING: u64 = h("SR15NetUIDecSettingMsg");
+pub const UI_CHANGED_SETTINGS: u64 = h("SR15NetUIUserChangedSettings");
+pub const ASSIGN_TEAM_REQUEST: u64 = h("SR15NetUserAssignTeamRequest");
+pub const ASSIGN_TEAM_RESPONSE: u64 = h("SR15NetUserAssignTeamResponse");
+pub const ENTRANT_TEAM_CHANGED: u64 = h("SNSLobbyEntrantTeamChanged");
+/// Terminal buttons (c2s component events on MOD_RULES_PANEL).
+/// Team ready buttons (each team's terminal): orange's pressed by an
+/// orange player in the capture, blue's by a blue player live.
+pub const BTN_READY_ORANGE: u64 = 0x1d10_8d26_ada8_c1dd;
+pub const BTN_READY_BLUE: u64 = 0x70f8_cfcd_41c4_de99;
+/// `nevt_pause_game_orange` / `nevt_pause_game_blue` (toggle).
+pub const BTN_PAUSE: u64 = 0x0137_90bf_f1ab_f487;
+pub const BTN_PAUSE_BLUE: u64 = 0xe292_0479_4d3d_c819;
+/// End-of-match terminal: `nevt_match_restart_request` (Rematch) and
+/// `nevt_return_to_lobby_request` (Lobby).
+pub const BTN_REMATCH: u64 = 0x8ef2_3f7c_6f2d_03e6;
+pub const BTN_LOBBY: u64 = 0xc778_b098_5921_1cea;
+/// Sent by the client by itself (twice) as post_match_celebration_update
+/// begins; not a button. Name unknown.
+pub const EV_CLIENT_AT_CELEBRATION: u64 = 0x184d_b492_6b1d_09de;
+/// Rules set through the client's HTTP API (type name unknown):
+/// `[u32 0][u32 1][level u64]` + JSON `{"<RULE NAME>":<value>}` + NUL.
+pub const API_SET_RULE: u64 = 0xd69f_b582_0373_ee18;
+/// Announcer lines are the symbol of the dialogue scene's name.
+pub const EV_ANNOUNCER_LAUNCHERS_CLEARED: u64 = 0x4fe2_738a_eb34_b29c; // MP_ANNOUNCER_0050F_ROUND_START
+pub const EV_ANNOUNCER_ROUND_OVER: u64 = 0xfc6c_2c91_b40d_c994; // MP_ANNOUNCER_0120F_ROUND_OVER
+pub const EV_ANNOUNCER_BLUE_WINS: u64 = 0xcb64_87d9_f71b_9145; // MP_ANNOUNCER_0080A_BLUE_TEAM_WINS
+/// `nevt_round_over`: a round of a multi-round private match ended.
+pub const EV_ROUND_OVER: u64 = 0x2734_410e_d952_8b14;
+/// `is_mercy_win` (bool): the round ended on the mercy rule.
+pub const VAR_MERCY_WIN: u64 = 0x2060_26b9_2d9c_8244;
+/// Restart request buttons: a blue player pressed the first in the
+/// capture (it set `blue_team_restart_request`), an orange one the second.
+pub const BTN_RESTART_BLUE: u64 = 0xf289_24a0_9729_c910;
+pub const BTN_RESTART_ORANGE: u64 = 0x9f27_d43c_604d_c4e8;
+/// Sent on MOD_MATCH for every rules press.
+pub const EV_SETTING_CHANGED: u64 = 0x565a_200a_f9a1_1f49;
+/// Sent to the rules panel (IdsResponse entry 19) for a page 1 row 2 press.
+pub const EV_RULES_PANEL_1_2: u64 = 0x38fb_0207_b7d5_b358;
+pub const EV_START_LAUNCH: u64 = 0xa25c_369c_8347_706f;
+pub const EV_PAUSED: u64 = 0x068d_263e_bc3c_07e4;
+pub const EV_RESTART_A: u64 = 0x449e_f6be_2f77_41e2;
+pub const EV_RESTART_B: u64 = 0xc481_cb71_b0ea_0671;
+pub const EV_RESTART_C: u64 = 0xc35b_4c6c_3ffd_3a2a;
+// Names below are the game's own (their symbol hashes match).
+/// `red_team_ready` / `blue_team_ready` (bool).
+pub const VAR_ORANGE_READY: u64 = 0x77c6_f68a_7ded_4ff7;
+pub const VAR_BLUE_READY: u64 = 0x1795_439c_46cf_fedd;
+/// Set (raw 1) when the start launch begins, 4 s after Start.
+pub const VAR_START_LAUNCHED: u64 = 0xf761_6479_3f93_932f;
+/// `blue_team_restart_request` / `red_team_restart_request` (bool).
+pub const VAR_BLUE_RESTART_REQUEST: u64 = 0xef31_e81d_7ccf_9310;
+pub const VAR_ORANGE_RESTART_REQUEST: u64 = 0x0b64_c6bf_815b_9764;
+/// Team symbol of who paused / who unpaused.
+pub const VAR_PAUSED_BY: u64 = 0xe713_95ce_7a46_1593;
+pub const VAR_UNPAUSED_BY: u64 = 0x80ed_f387_7b6a_e9c9;
+/// Pause state symbol (`unpaused` / `paused`; a third unnamed value for one
+/// frame while pausing).
+pub const VAR_PAUSE_STATE: u64 = 0x02fe_0aa4_f263_7309;
+/// f32: seconds paused, counting up.
+pub const VAR_PAUSE_TIME: u64 = 0x70d8_6d49_e454_1bb0;
+/// f32: 14.5 at pause, counts to 0 after unpause, then play resumes.
+pub const VAR_RESUME_COUNT: u64 = 0x9946_59a6_5cfa_75d3;
+pub const SYM_ORANGE: u64 = 0x41d2_c82f_1b2d_001b;
+pub const SYM_BLUE: u64 = 0xc8c3_3e48_387f_0bb5;
+pub const SYM_NONE: u64 = 0xc8c3_3e48_347c_10b5;
+pub const SYM_PAUSED: u64 = 0x41d2_d73c_0f30_021a;
+pub const SYM_UNPAUSED: u64 = 0x23e3_8416_3cec_8162;
+pub const SYM_PAUSING: u64 = 0xb24c_4239_e89e_103e;
+pub const ST_RESTART_A: u64 = 0x6c19_a962_2753_9fac;
+pub const ST_RESTART_B: u64 = 0x3979_ba68_6488_ba64;
+
+/// A replicated value relative to the baseline's: the high bits (type tag)
+/// come from the baseline, the low part from here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Val {
+    Raw(u64),
+    Lo32(u32),
+    Lo8(u8),
+    F32(f32),
+}
+
+impl Val {
+    pub fn resolve(self, old: u64) -> u64 {
+        match self {
+            Val::Raw(v) => v,
+            Val::Lo32(v) => (old & 0xffff_ffff_0000_0000) | u64::from(v),
+            Val::Lo8(v) => (old & !0xff) | u64::from(v),
+            Val::F32(v) => with_f32(old, v),
+        }
     }
 }
 
-pub fn component_event(symbol: u64, module: u64, filter: u16) -> [u8; 24] {
+/// Net component handles the client got from the IdsResponse we sent:
+/// u16 entries from offset 176. Entry 20 is the match graph (public 0xa02d,
+/// private 0x002f), entry 0 the disc FX, entry 19 the rules panel.
+#[derive(Clone, Copy, Debug)]
+pub struct Handles {
+    pub match_graph: u16,
+    pub disc_fx: u16,
+    pub rules_panel: u16,
+}
+
+impl Handles {
+    pub const PUBLIC_ARENA: Handles = Handles { match_graph: 0xa02d, disc_fx: 0xa01b, rules_panel: 0xa02e };
+
+    pub fn from_ids(ids: &[u8]) -> Option<Self> {
+        let e = |i: usize| ids.get(176 + 2 * i..178 + 2 * i).map(|b| u16::from_le_bytes([b[0], b[1]]));
+        Some(Self { match_graph: e(20)?, disc_fx: e(0)?, rules_panel: e(19)? })
+    }
+
+    /// The 0x0fff sentinel only reaches generic listeners and skips the node
+    /// graph, which is what runs the round start (opening the tunnels).
+    pub fn for_module(&self, module: u64) -> u16 {
+        match module {
+            MOD_MATCH | MOD_ANNOUNCER => self.match_graph,
+            MOD_DISC_FX => self.disc_fx,
+            MOD_RULES_PANEL => self.rules_panel,
+            _ => 0x0fff,
+        }
+    }
+}
+
+/// `SR15NetComponentEvent`: symbol, module, handle, filter, origin.
+pub fn component_event(symbol: u64, module: u64, handle: u16, filter: u16) -> [u8; 24] {
     let mut b = [0u8; 24];
     b[0..8].copy_from_slice(&symbol.to_le_bytes());
     b[8..16].copy_from_slice(&module.to_le_bytes());
-    b[16..18].copy_from_slice(&component_handle(module).to_le_bytes());
+    b[16..18].copy_from_slice(&handle.to_le_bytes());
     b[18..20].copy_from_slice(&filter.to_le_bytes());
     b[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
     b
@@ -246,6 +362,8 @@ pub struct Captured {
     pub ids: Vec<(u64, Vec<u8>)>,
     pub balance: Vec<(u64, Vec<u8>)>,
     pub baselines: Vec<(u64, Vec<Vec<u8>>)>,
+    pub private_ids: Vec<u8>,
+    pub private_baseline: Vec<Vec<u8>>,
     pub new_unlocks: Vec<u8>,
     pub refresh_profile: Vec<u8>,
     pub disc_physics: [u8; 64],
@@ -261,9 +379,10 @@ pub fn captured() -> &'static Captured {
             (0x6daa_00a6_d33d_44b7, hex(include_str!("data/ids_response_b744.hex"))),
             (0xcb99_77f7_fc2b_4526, hex(include_str!("data/ids_response_2645.hex"))),
         ],
+        // Clients play with these values; the host's changes are merged in.
         balance: vec![
-            (LEVEL_SOCIAL, hex(include_str!("data/balance_settings_mass_update.hex"))),
-            (LEVEL_ARENA, hex(include_str!("data/balance_settings_arena_4bbc.hex"))),
+            (LEVEL_SOCIAL, super::balance::apply(hex(include_str!("data/balance_settings_mass_update.hex")))),
+            (LEVEL_ARENA, super::balance::apply(hex(include_str!("data/balance_settings_arena_4bbc.hex")))),
         ],
         baselines: vec![
             (LEVEL_SOCIAL, vec![hex(include_str!("data/replicated_delta_unreliable_vars_045c.hex"))]),
@@ -274,6 +393,11 @@ pub fn captured() -> &'static Captured {
                     hex(include_str!("data/replicated_delta_arena_4bbc_s1.hex")),
                 ],
             ),
+        ],
+        private_ids: hex(include_str!("data/ids_response_arena_private.hex")),
+        private_baseline: vec![
+            hex(include_str!("data/replicated_delta_arena_private_s0.hex")),
+            hex(include_str!("data/replicated_delta_arena_private_s1.hex")),
         ],
         new_unlocks: hex(include_str!("data/new_unlocks.hex")),
         refresh_profile: hex(include_str!("data/refresh_profile_from_server.hex")),
@@ -286,8 +410,38 @@ pub fn captured() -> &'static Captured {
     })
 }
 
-pub fn baseline(level: u64) -> Option<&'static [Vec<u8>]> {
+/// The public arena timings and rules, from the `mp_arena_rules` clients get.
+pub fn arena_public() -> super::balance::ArenaPublic {
+    static A: std::sync::OnceLock<super::balance::ArenaPublic> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        captured()
+            .balance
+            .iter()
+            .find(|(l, _)| *l == LEVEL_ARENA)
+            .and_then(|(_, b)| super::balance::document(b, "mp_arena_rules"))
+            .map(|r| super::balance::ArenaPublic::from_rules(&r))
+            .unwrap_or_default()
+    })
+}
+
+fn private_arena(level: u64, mode: u64) -> bool {
+    level == LEVEL_ARENA && mode == MODE_ARENA_PRIVATE
+}
+
+/// Replicated baseline for a session (private arena has its own).
+pub fn baseline(level: u64, mode: u64) -> Option<&'static [Vec<u8>]> {
+    if private_arena(level, mode) {
+        return Some(captured().private_baseline.as_slice());
+    }
     captured().baselines.iter().find(|(l, _)| *l == level).map(|(_, b)| b.as_slice())
+}
+
+/// IdsResponse body for a level; the session's own level gets its mode's.
+pub fn ids_response(level: u64, session_level: u64, mode: u64) -> Option<&'static [u8]> {
+    if level == session_level && private_arena(level, mode) {
+        return Some(captured().private_ids.as_slice());
+    }
+    captured().ids.iter().find(|(l, _)| *l == level).map(|(_, b)| b.as_slice())
 }
 
 /// Look up a variable's raw value in a replicated-vars payload.
@@ -349,4 +503,70 @@ pub fn write_disc_transform(p: &mut [u8; 64], x: i32, y: i32, depth: i32) {
     write_field(p, DISC_BIT, x);
     write_field(p, DISC_BIT + DISC_WIDTH, y);
     write_field(p, DISC_BIT + 2 * DISC_WIDTH, depth);
+}
+
+/// A `SR15NetCurrentLoadoutResponse` (452 bytes) as the instance it carries:
+/// its name (`unified`) at 0x44, the item count at 0x74 and (slot, item)
+/// symbol pairs from 0x84.
+pub fn parse_loadout(d: &[u8]) -> Option<nevr_proto::rtapi::v1::LoadoutInstance> {
+    let q = |o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().expect("8")));
+    let name = q(0x44)?;
+    let count = d.get(0x74..0x78).map(|b| u32::from_le_bytes(b.try_into().expect("4")))? as usize;
+    let fits = d.len().saturating_sub(0x84) / 16;
+    if name == 0 || count == 0 || count > fits {
+        return None;
+    }
+    let items = (0..count)
+        .filter_map(|i| {
+            let o = 0x84 + i * 16;
+            let (slot_type, equipped_item) = (q(o)?, q(o + 8)?);
+            (slot_type != 0 && equipped_item != 0).then_some(nevr_proto::rtapi::v1::LoadoutItem { slot_type, equipped_item })
+        })
+        .collect();
+    Some(nevr_proto::rtapi::v1::LoadoutInstance { instance_name: name, items })
+}
+
+/// Put `item` in `slot_type` of a `SR15NetCurrentLoadoutResponse`, if that
+/// slot is in it. Returns whether the loadout changed.
+pub fn equip_in_loadout(d: &mut [u8], slot_type: u64, item: u64) -> bool {
+    let count = d.get(0x74..0x78).map_or(0, |b| u32::from_le_bytes(b.try_into().expect("4")) as usize);
+    for i in 0..count.min(d.len().saturating_sub(0x84) / 16) {
+        let o = 0x84 + i * 16;
+        if u64::from_le_bytes(d[o..o + 8].try_into().expect("8")) == slot_type {
+            let cur = &mut d[o + 8..o + 16];
+            let new = item.to_le_bytes();
+            let changed = *cur != new;
+            cur.copy_from_slice(&new);
+            return changed;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod loadout_tests {
+    use super::*;
+
+    #[test]
+    fn equip_symbols_match_the_capture() {
+        // Symbols seen in a native lobby recording.
+        assert_eq!(ITEM_EQUIPPED, 0xed0f_ba84_9bad_c7bf);
+        assert_eq!(SAVE_LOADOUT_REQUEST, 0xa374_9626_d6d2_0ef7);
+    }
+
+    #[test]
+    fn equip_replaces_the_slot_item() {
+        let mut d = vec![0u8; 452];
+        d[0x44..0x4c].copy_from_slice(&0x2fc2_8196_587d_528e_u64.to_le_bytes());
+        d[0x74..0x78].copy_from_slice(&2u32.to_le_bytes());
+        d[0x84..0x8c].copy_from_slice(&11u64.to_le_bytes());
+        d[0x8c..0x94].copy_from_slice(&12u64.to_le_bytes());
+        d[0x94..0x9c].copy_from_slice(&21u64.to_le_bytes());
+        d[0x9c..0xa4].copy_from_slice(&22u64.to_le_bytes());
+        assert!(equip_in_loadout(&mut d, 21, 99));
+        assert!(!equip_in_loadout(&mut d, 21, 99));
+        let inst = parse_loadout(&d).expect("parses");
+        assert_eq!(inst.items[1].equipped_item, 99);
+        assert_eq!(inst.items[0].equipped_item, 12);
+    }
 }

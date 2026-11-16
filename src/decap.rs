@@ -1,4 +1,5 @@
-//! Offline decoder for captures made by `tools/record_native.py`.
+//! Offline decoder for captures made by `tools/record_native.py` and
+//! `tools/record_client.py` (keys from its `sessions.jsonl`).
 //!
 //! Reads `ws.jsonl` (EchoRelay ↔ server, which carries SessionSuccess v5 and
 //! so the packet keys) and `udp.bin` (every datagram both ways), decrypts the
@@ -33,7 +34,21 @@ fn key32(v: &[u8]) -> [u8; 32] {
     k
 }
 
-fn find_keys(dir: &Path) -> Result<nevr_proto::rtapi::v1::SnsLobbySessionSuccessV5Message> {
+/// Every SessionSuccess v5 EchoRelay handed the server: one per client.
+fn find_keys(dir: &Path) -> Result<Vec<nevr_proto::rtapi::v1::SnsLobbySessionSuccessV5Message>> {
+    let mut all = Vec::new();
+    // `tools/record_client.py`: each SessionSuccess v5 body the client got.
+    if let Ok(text) = fs::read_to_string(dir.join("sessions.jsonl")) {
+        for line in text.lines() {
+            let j: serde_json::Value = serde_json::from_str(line)?;
+            if let Some(h) = j["payload"].as_str() {
+                all.push(sns::decode_session_success_v5(&unhex(h)?)?.to_proto());
+            }
+        }
+        if !all.is_empty() {
+            return Ok(all);
+        }
+    }
     for line in fs::read_to_string(dir.join("ws.jsonl"))?.lines() {
         let j: serde_json::Value = serde_json::from_str(line)?;
         if j["dir"] != "r2s" {
@@ -47,16 +62,19 @@ fn find_keys(dir: &Path) -> Result<nevr_proto::rtapi::v1::SnsLobbySessionSuccess
             let n = u64::from_le_bytes(data[i + 16..i + 24].try_into()?) as usize;
             let body = data.get(i + 24..i + 24 + n).context("truncated frame")?;
             if sym == sns::sym::SESSION_SUCCESS_V5 {
-                return Ok(sns::decode_session_success_v5(body)?.to_proto());
+                all.push(sns::decode_session_success_v5(body)?.to_proto());
             }
             i += 24 + n;
         }
     }
-    bail!("no SessionSuccess v5 in ws.jsonl")
+    if all.is_empty() {
+        bail!("no SessionSuccess v5 in ws.jsonl");
+    }
+    Ok(all)
 }
 
-pub fn run(dir: &Path, out: &Path) -> Result<()> {
-    let s = find_keys(dir)?;
+/// (client -> server, server -> client) transports for one key set.
+fn transports(s: &nevr_proto::rtapi::v1::SnsLobbySessionSuccessV5Message) -> (Transport, Transport) {
     let server = SessionCrypto {
         out_flags: s.server_encoder_flags,
         out_aes: key32(&s.server_enc_key),
@@ -82,23 +100,58 @@ pub fn run(dir: &Path, out: &Path) -> Result<()> {
         in_rnd: server.out_rnd,
         in_seq: server.out_seq,
     };
-    let mut c2s = Transport::new(&server);
-    let mut s2c = Transport::new(&client);
+    (Transport::new(&server), Transport::new(&client))
+}
+
+pub fn run(dir: &Path, out: &Path) -> Result<()> {
+    let keys = find_keys(dir)?;
+    let mut used = vec![false; keys.len()];
+    // Per client address: its transports, matched to a key set by the first
+    // packet that one of them decrypts.
+    let mut peers: std::collections::HashMap<(u32, u16), (Transport, Transport)> = std::collections::HashMap::new();
 
     let raw = fs::read(dir.join("udp.bin"))?;
     let mut w = BufWriter::new(fs::File::create(out)?);
-    writeln!(w, "dir,t,channel,type,name,mailbox_key,len,hex")?;
+    writeln!(w, "dir,t,channel,type,name,mailbox_key,len,hex,peer")?;
     let (mut i, mut t0, mut undecoded, mut rows) = (0usize, None, [0u32; 2], 0u64);
     const HDR: usize = 8 + 1 + 4 + 2 + 4;
     while i + HDR <= raw.len() {
         let t = f64::from_le_bytes(raw[i..i + 8].try_into()?);
         let dir_c = raw[i + 8];
+        let ip = u32::from_be_bytes(raw[i + 9..i + 13].try_into()?);
+        let port = u16::from_le_bytes(raw[i + 13..i + 15].try_into()?);
         let n = u32::from_le_bytes(raw[i + 15..i + 19].try_into()?) as usize;
         let data = &raw[i + HDR..i + HDR + n];
         i += HDR + n;
         let t0 = *t0.get_or_insert(t);
-        let (tp, name) = if dir_c == 0 { (&mut c2s, "c2s") } else { (&mut s2c, "s2c") };
-        let Some(r) = tp.receive(data) else {
+        let name = if dir_c == 0 { "c2s" } else { "s2c" };
+        let known = peers.get_mut(&(ip, port)).and_then(|pair| {
+            let tp = if dir_c == 0 { &mut pair.0 } else { &mut pair.1 };
+            tp.receive(data)
+        });
+        // Nothing yet, or a later session from the same address (new keys):
+        // try each unused key set on this packet.
+        let r = if known.is_some() {
+            known
+        } else {
+            // Unmatched client: try each unused key set on this packet.
+            let mut got = None;
+            for (k, s) in keys.iter().enumerate() {
+                if used[k] {
+                    continue;
+                }
+                let mut pair = transports(s);
+                let tp = if dir_c == 0 { &mut pair.0 } else { &mut pair.1 };
+                if let Some(r) = tp.receive(data) {
+                    used[k] = true;
+                    peers.insert((ip, port), pair);
+                    got = Some(r);
+                    break;
+                }
+            }
+            got
+        };
+        let Some(r) = r else {
             undecoded[usize::from(dir_c)] += 1;
             continue;
         };
@@ -106,7 +159,7 @@ pub fn run(dir: &Path, out: &Path) -> Result<()> {
         for (ch, list) in [("rel", &r.reliable), ("mb", &r.mailbox)] {
             for m in list {
                 let mname = rad_protocol::message_registry::lookup_message_name(m.type_).unwrap_or("");
-                writeln!(w, "{name},{rel:.4},{ch},{:#018x},{mname},{:#018x},{},{}", m.type_, m.mailbox, m.data.len(), hex(&m.data))?;
+                writeln!(w, "{name},{rel:.4},{ch},{:#018x},{mname},{:#018x},{},{},{port}", m.type_, m.mailbox, m.data.len(), hex(&m.data))?;
                 rows += 1;
             }
         }

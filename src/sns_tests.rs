@@ -193,3 +193,16 @@ fn xpid_tokens() {
     assert_eq!(XpId::parse("OVR_ORG-123412341234"), Some(XP));
     assert_eq!(XpId::parse("DMO-5"), Some(XpId { platform: 7, account: 5 }));
 }
+
+#[test]
+fn private_match_symbols() {
+    use crate::engine::msg::*;
+    assert_eq!(symbol("paused"), SYM_PAUSED);
+    assert_eq!(symbol("unpaused"), SYM_UNPAUSED);
+    assert_eq!(symbol("orange"), SYM_ORANGE);
+    assert_eq!(symbol("blue"), SYM_BLUE);
+    assert_eq!(symbol("none"), SYM_NONE);
+}
+
+
+

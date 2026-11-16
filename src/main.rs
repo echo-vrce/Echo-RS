@@ -82,6 +82,16 @@ struct Args {
     #[arg(long, env = "ERS_ARENA_MIN_PER_TEAM", default_value_t = 0)]
     arena_min_per_team: usize,
 
+    /// Don't answer EchoCombat's VeilNet packets: players' clients then treat
+    /// this as a stock server and hide the mod's new gear.
+    #[arg(long, env = "ERS_NO_VEILNET")]
+    no_veilnet: bool,
+
+    /// Balance changes (the launcher's Settings page): JSON `{"<balance file
+    /// name>": {partial values}}`, merged into the settings sent to players.
+    #[arg(long, env = "ERS_BALANCE")]
+    balance: Option<std::path::PathBuf>,
+
     /// Who the embedded game servers serve.
     #[arg(long, env = "ERS_BACKEND", value_enum, default_value_t = BackendKind::Builtin)]
     backend: BackendKind,
@@ -90,6 +100,11 @@ struct Args {
     #[arg(long, env = "ERS_UPSTREAM")]
     upstream: Option<String>,
 
+    /// EchoRelay login service (`loginservice_host`), where players' loadout
+    /// changes are saved. Default: the ServerDB host's `/login`.
+    #[arg(long, env = "ERS_LOGIN_URL")]
+    login_url: Option<String>,
+
     /// Region symbol announced to EchoRelay.
     #[arg(long, env = "ERS_REGION", default_value = "default")]
     region: String,
@@ -97,6 +112,29 @@ struct Args {
     /// Give every account only the default cosmetics instead of all of them.
     #[arg(long, env = "ERS_NO_UNLOCK_ALL")]
     no_unlock_all: bool,
+
+    /// Game frames per second (replication, the disc, match rules), 10 to
+    /// 200. The client's own 120 Hz frame clock is separate and unchanged.
+    #[arg(long, env = "ERS_FRAME_HZ", default_value_t = 20, value_parser = clap::value_parser!(u64).range(10..=200))]
+    frame_hz: u64,
+
+    /// Host only these game modes (comma-separated game-type names, e.g.
+    /// echo_arena,echo_arena_private). Empty: every mode.
+    #[arg(long, env = "ERS_ONLY_MODES", value_delimiter = ',')]
+    only_modes: Vec<String>,
+
+    /// Never host these game modes (comma-separated game-type names).
+    #[arg(long, env = "ERS_EXCLUDE_MODES", value_delimiter = ',')]
+    exclude_modes: Vec<String>,
+
+    /// Never host these maps (comma-separated level names, e.g.
+    /// mpl_combat_gauss).
+    #[arg(long, env = "ERS_EXCLUDE_MAPS", value_delimiter = ',')]
+    exclude_maps: Vec<String>,
+
+    /// Print the known game-mode and map names (for the filters) and exit.
+    #[arg(long)]
+    list_modes: bool,
 
     /// Run the headless test client against a service base URL (e.g.
     /// ws://127.0.0.1:7777) instead of starting a server.
@@ -154,11 +192,42 @@ fn client_config(host: Ipv4Addr, port: u16) -> serde_json::Value {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Windows timers tick every 15.6 ms unless asked otherwise: the 120 Hz
+    // server frame then ran in uneven bursts whenever few packets came in.
+    #[cfg(windows)]
+    {
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            fn timeBeginPeriod(period: u32) -> u32;
+        }
+        // SAFETY: plain Win32 call, no pointers; the period lasts for the process.
+        unsafe { timeBeginPeriod(1) };
+    }
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log)))
         .with_target(false)
         .init();
+    engine::balance::set_base(engine::balance::Base { echocombat: !args.no_veilnet, medigun: engine::veilnet::medigun_from_file() });
+    if let Some(path) = &args.balance
+        && let Err(e) = engine::balance::load(path)
+    {
+        tracing::warn!(error = %e, "balance changes not loaded; using the stock settings");
+    }
+
+    if args.list_modes {
+        println!("modes:");
+        for (n, label) in engine::filter::MODES {
+            println!("  {n:<24} {label}");
+        }
+        println!("maps:");
+        for (n, label) in engine::filter::MAPS {
+            println!("  {n:<24} {label}");
+        }
+        return Ok(());
+    }
+    engine::session::set_frame_hz(args.frame_hz);
+    engine::filter::set(&args.only_modes, &args.exclude_modes, &args.exclude_maps).context("mode/map filter")?;
 
     if let Some(dir) = &args.decode_capture {
         return decap::run(dir, &dir.join("msgs.csv"));
@@ -187,7 +256,8 @@ async fn main() -> Result<()> {
 
     let store = store::Store::open(&args.data_dir, !args.no_unlock_all).context("opening data directory")?;
     let hub = lobby::Hub::new(store, lobby::Advertise { lan_ip, public_ip });
-    let upstreams = upstream::Upstreams::new(backend.clone(), lan_ip, &args.region);
+    let upstreams = upstream::Upstreams::new(backend.clone(), lan_ip, &args.region, args.login_url.clone());
+    let login_url = upstreams.login_url.clone();
     let app = services::App { hub: hub.clone(), sessions: Arc::new(DashMap::new()), upstreams: upstreams.clone() };
 
     let listener = tokio::net::TcpListener::bind(args.bind).await.with_context(|| format!("binding {}", args.bind))?;
@@ -202,7 +272,7 @@ async fn main() -> Result<()> {
             min_idle: args.min_idle,
             max_instances: args.max_instances.max(args.min_idle),
             idle_retire: Duration::from_secs(args.idle_retire_secs),
-            engine: engine::EngineConfig { arena_min_per_team: args.arena_min_per_team },
+            engine: engine::EngineConfig { arena_min_per_team: args.arena_min_per_team, veilnet: !args.no_veilnet, medigun: engine::veilnet::medigun_from_file() },
             hub_port,
         },
         hub.clone(),
@@ -221,14 +291,20 @@ async fn main() -> Result<()> {
     }
     info!(
         bind = %args.bind, lan_ip = %lan_ip, public_ip = %public_ip, udp_ports = %format!("{}+", args.udp_port),
-        backend = ?args.backend, "echo-rust-server running"
+        backend = ?args.backend, frame_hz = args.frame_hz,
+        only_modes = ?args.only_modes, exclude_modes = ?args.exclude_modes, exclude_maps = ?args.exclude_maps,
+        "echo-rust-server running"
     );
     match &backend {
         upstream::Backend::Builtin => info!(
             "client config (save as ready-at-dawn-echo-arena\\_local\\config.json; also written to {}):\n{cfg_text}",
             cfg_path.display()
         ),
-        other => info!(?other, "game servers will register with the external backend"),
+        upstream::Backend::EchoRelay { url } | upstream::Backend::Nakama { url } => {
+            // The query holds credentials; log where, not how.
+            let host = url.split('?').next().unwrap_or(url);
+            info!(serverdb = host, login = login_url.as_deref().map(|u| u.split('?').next().unwrap_or(u)), "game servers will register with the external backend");
+        }
     }
 
     tokio::select! {

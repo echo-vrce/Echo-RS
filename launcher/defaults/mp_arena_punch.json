@@ -1,0 +1,52 @@
+{
+ "stun_length": 2.0,
+ "punch_scheme_idx": 0,
+ "stun_timing_window": 0.25,
+ "speed_threshold": 1.0,
+ "punch_hit_offset": {
+  "x": 0.0,
+  "y": -0.04,
+  "z": 0
+ },
+ "timing_window": 0.0,
+ "left_hand_radius": 0.06,
+ "right_hand_radius": 0.06,
+ "new_force_settings": {
+  "punch_vel_contributes_x_percent": 0.8,
+  "clamp_max_vel": 20.0,
+  "clamp_max_punch_speed": 5.0,
+  "force_piecewise_linear_curve": [
+   1.0,
+   2.0,
+   3.0,
+   4.0,
+   5.0,
+   6.0,
+   7.0,
+   8.0,
+   9.0,
+   10.0,
+   11.0,
+   12.0,
+   13.0,
+   14.0,
+   15.0,
+   16.0,
+   17.0,
+   18.0,
+   19.0,
+   20.0
+  ]
+ },
+ "head_hit_radius": 0.15,
+ "punch_blocking": {
+  "sphere_blocking_radius": 0.2,
+  "max_block_head_dist": 0.4,
+  "max_block_hand_height": 0.25,
+  "block_cooldown_time": 1.25,
+  "min_block_hand_height": -0.25,
+  "block_punch_cooldown_time": 0.0,
+  "maximum_block_time": 4.5,
+  "blocked_punch_cooldown_time": 1.0
+ }
+}

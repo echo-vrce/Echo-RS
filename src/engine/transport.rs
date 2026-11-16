@@ -446,10 +446,29 @@ impl Transport {
     /// Build every datagram owed right now: resends, the queued reliable and
     /// mailbox frames, and a bare ack if nothing else carries it.
     pub fn flush(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.flush_some(out, true);
+    }
+
+    /// Between server frames: resends and reliable frames only. Mailbox
+    /// state and bare acks wait for the next frame, so each peer gets about
+    /// one packet per frame (as native does) rather than one per packet any
+    /// other player sent: with 12 players that was ~1,300 packets a second
+    /// to every client, and everyone stuttered.
+    pub fn flush_reliable(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.flush_some(out, false);
+    }
+
+    fn flush_some(&mut self, out: &mut Vec<Vec<u8>>, frame: bool) {
         let start = out.len();
         let now = Instant::now();
         // Resends first, restamped with current acks.
-        let rto = (self.srtt * 2 + Duration::from_millis(5)).clamp(Duration::from_millis(25), Duration::from_millis(60));
+        // Resend after 1.5 round trips. The round trip is the larger of the
+        // reliable channel's own (only never-resent frames are timed) and the
+        // mailbox acks'. A 60 ms ceiling here resent every frame two or three
+        // times to anyone with a ping over 60 ms, which was most players.
+        let measured = self.rtt_samples.iter().copied().min().map_or(Duration::ZERO, |us| Duration::from_micros(u64::from(us)));
+        let rtt = self.srtt.max(measured);
+        let rto = (rtt * 3 / 2 + Duration::from_millis(10)).clamp(Duration::from_millis(40), Duration::from_millis(500));
         let mut resend = Vec::new();
         for (i, r) in self.retained.iter().enumerate() {
             if now.duration_since(r.sent) >= rto {
@@ -502,13 +521,25 @@ impl Transport {
         }
 
         // Mailbox: unreliable, latest state wins on the receiver.
-        while !self.queued_mailbox.is_empty() {
+        while frame && !self.queued_mailbox.is_empty() {
             if self.mb_ece_pending {
                 self.mb_encoded = true;
                 self.mb_ece_pending = false;
             }
             self.mb_enc.begin_frame();
-            let take = self.queued_mailbox.len().min(256);
+            // Whole messages up to one datagram's worth: a fragmented
+            // mailbox frame is lost whole if any piece is.
+            let mut size = 0;
+            let take = self
+                .queued_mailbox
+                .iter()
+                .take(256)
+                .take_while(|(_, _, d)| {
+                    size += d.len() + 24;
+                    size <= MAX_CHUNK
+                })
+                .count()
+                .max(1);
             for (ty, key, data) in self.queued_mailbox.drain(..take) {
                 self.mb_enc.encode(ty, key, &data);
             }
@@ -524,7 +555,7 @@ impl Transport {
 
         if out.len() > start {
             self.ack_owed = false;
-        } else if self.ack_owed {
+        } else if self.ack_owed && frame {
             self.ack_owed = false;
             let mut plain = vec![0u8; 8];
             let hdr = self.header(false, false, self.mb_next, self.mb_encoded);

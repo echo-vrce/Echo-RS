@@ -14,9 +14,9 @@ Output (in OUT_DIR):
 import asyncio, json, os, struct, sys, time, socket
 import websockets
 
-UPSTREAM = "ws://127.0.0.1:777"
+UPSTREAM = os.environ.get("REC_UPSTREAM", "ws://127.0.0.1:777")
 WS_PORT = 7781
-UDP_PORT = 6800
+UDP_PORT = int(os.environ.get("REC_UDP_PORT", "6800"))
 MARKER = bytes.fromhex("f640bb78a2e78cbb")
 REG = 0x7777777777777777
 
