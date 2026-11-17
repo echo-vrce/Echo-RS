@@ -290,15 +290,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     engine::session::set_frame_hz(args.frame_hz);
-    // The launcher changes the rate of a running server by writing
-    // `frame-hz N` lines to its stdin.
-    std::thread::spawn(|| {
+    // The launcher changes a running server by writing lines to its stdin:
+    // `frame-hz N`, and `servers MAX KEPT` (most at once, kept running).
+    let (limits_tx, mut limits_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    std::thread::spawn(move || {
         for line in std::io::stdin().lines() {
             let Ok(line) = line else { break };
             let mut w = line.split_whitespace();
-            if let (Some("frame-hz"), Some(n)) = (w.next(), w.next().and_then(|n| n.parse::<u64>().ok())) {
-                let hz = engine::session::set_frame_hz(n);
-                tracing::info!(frame_hz = hz, "frame rate set");
+            match (w.next(), w.next().and_then(|n| n.parse::<u64>().ok()), w.next().and_then(|n| n.parse::<u64>().ok())) {
+                (Some("frame-hz"), Some(n), _) => {
+                    let hz = engine::session::set_frame_hz(n);
+                    tracing::info!(frame_hz = hz, "frame rate set");
+                }
+                (Some("servers"), Some(max), Some(kept)) => {
+                    let _ = limits_tx.send((max as usize, kept as usize));
+                }
+                _ => {}
             }
         }
     });
@@ -389,6 +396,15 @@ async fn main() -> Result<()> {
     *hub.scale_tx.lock() = Some(wake_tx.clone());
     let _ = wake_tx.send(());
     let pool_task = tokio::spawn(pool.clone().run(wake_rx));
+    {
+        let (pool, wake) = (pool.clone(), wake_tx.clone());
+        tokio::spawn(async move {
+            while let Some((max, kept)) = limits_rx.recv().await {
+                pool.set_limits(max, kept);
+                let _ = wake.send(());
+            }
+        });
+    }
 
     let cfg = client_config(public_ip, hub_port);
     let cfg_text = serde_json::to_string_pretty(&cfg)?;

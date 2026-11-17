@@ -94,6 +94,14 @@ impl Stats {
 pub const GOAL_SLAM_DUNK: u16 = 1;
 pub const GOAL_INSIDE_SHOT: u16 = 2;
 pub const GOAL_LONG_SHOT: u16 = 3;
+pub const GOAL_BOUNCE_SHOT: u16 = 4;
+pub const GOAL_LONG_BOUNCE_SHOT: u16 = 5;
+pub const GOAL_HEADBUTT: u16 = 6;
+pub const GOAL_LONG_HEADBUTT: u16 = 7;
+/// A bumper shot: thrown at an opponent, who headbutts it into
+/// their own goal. The thrower scores.
+pub const GOAL_BUMPER_SHOT: u16 = 8;
+pub const GOAL_LONG_BUMPER_SHOT: u16 = 9;
 pub const GOAL_SELF: u16 = 10;
 
 /// Goal plane depth and ring radius, as the goal detector uses them.
@@ -110,6 +118,10 @@ const FLIGHT_MIN_SPEED: f32 = 0.6;
 /// ...with consecutive velocities this close (m/s).
 const FLIGHT_TOLERANCE: f32 = 0.15;
 const HISTORY: usize = 48;
+/// A bounce: in one step of a flight the disc, at least this fast before
+/// and after (m/s), turns by more than this (cosine; about 25 degrees).
+const BOUNCE_MIN_SPEED: f32 = 1.0;
+const BOUNCE_COS: f32 = 0.9;
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -126,6 +138,10 @@ struct Flight {
     start: [i32; 3],
     /// Heading into the goal the thrower attacks.
     on_goal: bool,
+    /// Sent on its way by a headbutt (disc state 4), not a throw.
+    hit: bool,
+    /// It has come off a wall since.
+    bounced: bool,
 }
 
 /// What the tracker reports about a goal.
@@ -135,6 +151,9 @@ pub struct GoalInfo {
     /// The client's goal type list, 1-based: see `GOAL_*`.
     pub goal_type: u16,
     pub assister: Option<u16>,
+    /// The player credited when it is not the disc's owner (a bumper shot:
+    /// the thrower, while the opponent who hit it in owns the disc).
+    pub scorer: Option<u16>,
     /// Disc speed at the goal (m/s) and release-to-goal distance (m).
     pub speed: f32,
     pub distance: f32,
@@ -149,6 +168,10 @@ pub struct DiscTracker {
     flight: Option<Flight>,
     /// The current flight already credited a shot on goal.
     shot_credited: bool,
+    /// The throw the current owner took out of the air from the other team:
+    /// (thrower, thrower's team, where it was released). Gone once the new
+    /// owner has the disc in a hand.
+    bumped: Option<(u16, u8, [i32; 3])>,
     pub credits: Vec<(u16, Stat)>,
 }
 
@@ -176,6 +199,16 @@ impl DiscTracker {
         self.handoff = None;
         self.flight = None;
         self.shot_credited = false;
+        self.bumped = None;
+    }
+
+    /// The disc in flight is a bumper shot for `scoring_team` if it goes in
+    /// now: one of its players threw it, and an opponent hit it on (did not
+    /// catch it) toward that opponent's own goal.
+    pub fn bumper(&self, scoring_team: u8) -> bool {
+        self.bumped.is_some_and(|(_, team, _)| team == scoring_team)
+            && self.owner.is_some_and(|(_, team)| team != scoring_team)
+            && self.flight.is_some_and(|f| f.hit)
     }
 
     pub fn owner(&self) -> Option<u16> {
@@ -227,7 +260,10 @@ impl DiscTracker {
     /// `team` is that owner's team.
     /// `held`: the client's own word on whether the disc is in a hand
     /// (None: unknown, judged from the motion instead).
-    pub fn sample(&mut self, t_us: u64, client_us: Option<u32>, owner: u16, team: u8, p: [i32; 3], held: Option<bool>) {
+    ///
+    /// `hit`: the client says a headbutt sent it flying (native:
+    /// disc state 4 from the hit's grant on; 0 after a throw, 2 in a hand).
+    pub fn sample(&mut self, t_us: u64, client_us: Option<u32>, owner: u16, team: u8, p: [i32; 3], held: Option<bool>, hit: bool) {
         if self.hist.back().is_some_and(|s| s.p == p) {
             return; // the client repeats an unchanged transform
         }
@@ -241,19 +277,36 @@ impl DiscTracker {
         }
         if held == Some(true) {
             self.flight = None; // carried, however fast
+            self.bumped = None; // caught: theirs now
             return;
         }
         if held == Some(false) && self.flight.is_none() {
             // Just released: the flight starts at the last held position.
-            self.flight = Some(Flight { thrower: owner, start: release.unwrap_or(p), on_goal: false });
+            self.flight = Some(Flight { thrower: owner, start: release.unwrap_or(p), on_goal: false, hit, bounced: false });
             self.shot_credited = false;
+        }
+        let turned = match (self.velocity(0), self.velocity(1)) {
+            (Some(v0), Some(v1)) => {
+                len(v0) >= BOUNCE_MIN_SPEED && len(v1) >= BOUNCE_MIN_SPEED && (v0[0] * v1[0] + v0[1] * v1[1] + v0[2] * v1[2]) < BOUNCE_COS * len(v0) * len(v1)
+            }
+            _ => false,
+        };
+        if let Some(f) = self.flight.as_mut() {
+            if hit && !f.hit {
+                // Headbutted on in flight: native still measures from the
+                // release (its long headbutt goal: thrown, then hit 2.4 s
+                // later, reported 8.86 m). The hit's own turn is no bounce.
+                f.hit = true;
+            } else if turned {
+                f.bounced = true;
+            }
         }
         if held == Some(false) || self.in_free_flight() {
             if self.flight.is_none() {
                 // Released: the flight starts where the straight line began.
                 let n = self.hist.len();
                 let start = self.hist[n.saturating_sub(4)].p;
-                self.flight = Some(Flight { thrower: owner, start, on_goal: false });
+                self.flight = Some(Flight { thrower: owner, start, on_goal: false, hit, bounced: false });
                 self.shot_credited = false;
             }
             let on_goal = self.flight.as_ref().is_some_and(|f| f.thrower == owner) && self.heading_into_goal(team);
@@ -272,7 +325,13 @@ impl DiscTracker {
 
     fn change_owner(&mut self, t_us: u64, to: u16, to_team: u8) {
         let flight = self.flight.take();
+        self.bumped = None;
         if let Some((from, from_team)) = self.owner {
+            if from_team != to_team
+                && let Some(f) = flight.filter(|f| f.thrower == from)
+            {
+                self.bumped = Some((from, from_team, f.start));
+            }
             match (from_team == to_team, flight) {
                 (true, Some(_)) => {
                     self.credits.push((from, Stat::Passes));
@@ -299,20 +358,49 @@ impl DiscTracker {
     /// Credits the scorer's stats and returns what the score messages carry.
     pub fn goal(&mut self, t_us: u64, at: [i32; 3], scoring_team: u8) -> GoalInfo {
         let speed = self.velocity(0).map(len).unwrap_or(0.0);
-        let mut info = GoalInfo { points: 2, goal_type: GOAL_SLAM_DUNK, assister: None, speed, distance: 0.0 };
+        // A slam dunk (the disc still in a hand) has no disc speed and no
+        // distance: the hand's own speed is not the disc's.
+        let mut info = GoalInfo { points: 2, goal_type: GOAL_SLAM_DUNK, assister: None, scorer: None, speed: 0.0, distance: 0.0 };
         let Some((scorer, team)) = self.owner else { return info };
+        if self.bumper(scoring_team)
+            && let Some((thrower, _, start)) = self.bumped
+        {
+            // Off an opponent's head into their own goal: the thrower's
+            // goal, measured from the throw's release.
+            info.speed = speed;
+            info.distance = len(sub(at, start)) / 1000.0;
+            let long = info.distance * 1000.0 >= THREE_POINT_MM;
+            info.points = if long { 3 } else { 2 };
+            info.goal_type = if long { GOAL_LONG_BUMPER_SHOT } else { GOAL_BUMPER_SHOT };
+            info.scorer = Some(thrower);
+            self.credits.push((thrower, Stat::ShotsOnGoal));
+            self.credits.push((thrower, Stat::Goals));
+            for _ in 0..info.points {
+                self.credits.push((thrower, Stat::Points));
+            }
+            return info;
+        }
         if team != scoring_team {
             info.goal_type = GOAL_SELF;
             return info; // an own goal: the team scores, nobody is credited
         }
         if let Some(f) = self.flight.filter(|f| f.thrower == scorer) {
+            info.speed = speed;
             info.distance = len(sub(at, f.start)) / 1000.0;
-            if info.distance * 1000.0 >= THREE_POINT_MM {
+            let long = info.distance * 1000.0 >= THREE_POINT_MM;
+            if long {
                 info.points = 3;
-                info.goal_type = GOAL_LONG_SHOT;
-            } else {
-                info.goal_type = GOAL_INSIDE_SHOT;
             }
+            // Native's list: slam dunk, inside, long, bounce, long bounce,
+            // headbutt, long headbutt (bumper shots need the level: not told apart).
+            info.goal_type = match (f.hit, f.bounced, long) {
+                (true, _, false) => GOAL_HEADBUTT,
+                (true, _, true) => GOAL_LONG_HEADBUTT,
+                (false, true, false) => GOAL_BOUNCE_SHOT,
+                (false, true, true) => GOAL_LONG_BOUNCE_SHOT,
+                (false, false, false) => GOAL_INSIDE_SHOT,
+                (false, false, true) => GOAL_LONG_SHOT,
+            };
         }
         if !self.shot_credited {
             self.credits.push((scorer, Stat::ShotsOnGoal));
@@ -348,7 +436,7 @@ mod tests {
         let mut p = from;
         let mut at = t0;
         for _ in 0..n {
-            t.sample(at, None, owner, team, p, None);
+            t.sample(at, None, owner, team, p, None, false);
             p = [p[0] + v[0], p[1] + v[1], p[2] + v[2]];
             at += 33 * MS;
         }
@@ -360,7 +448,7 @@ mod tests {
         let mut ts = t0;
         for i in 0..n {
             let w = if i % 2 == 0 { 40 } else { -25 };
-            t.sample(ts, None, owner, team, [at[0] + w, at[1] - w, at[2] + (i as i32 % 3) * 15], None);
+            t.sample(ts, None, owner, team, [at[0] + w, at[1] - w, at[2] + (i as i32 % 3) * 15], None, false);
             ts += 33 * MS;
         }
         ts
@@ -390,7 +478,7 @@ mod tests {
         let (mut ts, mut cs) = (at, 5_000_000u32);
         let mut p = [0, 0, 24_000];
         for i in 0..90 {
-            t.sample(ts, Some(cs), 0, 0, p, None);
+            t.sample(ts, Some(cs), 0, 0, p, None, false);
             p = [p[0], p[1], p[2] + 143];
             ts += if i % 2 == 0 { 10_000 } else { 12_500 };
             cs = cs.wrapping_add(11_000);
@@ -493,22 +581,88 @@ mod held_tests {
     use super::*;
 
     #[test]
+    fn a_headbutted_throw_is_a_headbutt_goal_measured_from_the_release() {
+        // Native 2026-11-11: thrown (state 0), headbutted on (state 4), in
+        // from 8.86 m: type 7, 3 points.
+        let mut t = DiscTracker::new();
+        t.sample(0, None, 0, 0, [0, 0, 27_000], Some(true), false);
+        for i in 1..20u64 {
+            t.sample(i * 16_000, None, 0, 0, [0, 0, 27_000 + i as i32 * 40], Some(false), false);
+        }
+        for i in 20..60u64 {
+            t.sample(i * 16_000, None, 0, 0, [0, 0, 27_800 + (i as i32 - 20) * 60], Some(false), true);
+        }
+        let g = t.goal(1_000_000, [0, 0, 36_000], 0);
+        assert_eq!((g.points, g.goal_type), (3, GOAL_LONG_HEADBUTT), "{g:?}");
+        assert!((g.distance - 9.0).abs() < 0.1, "{g:?}");
+    }
+
+    #[test]
+    fn headbutted_into_their_own_goal_is_the_throwers_bumper_shot() {
+        // Blue (slot 1) throws at orange (slot 5), who headbutts it into
+        // orange's goal (where blue scores, +depth).
+        let mut t = DiscTracker::new();
+        t.sample(0, None, 1, 0, [0, 0, 32_000], Some(true), false);
+        for i in 1..20u64 {
+            t.sample(i * 16_000, None, 1, 0, [0, 0, 32_000 + i as i32 * 60], Some(false), false);
+        }
+        assert!(!t.bumper(0));
+        for i in 20..40u64 {
+            t.sample(i * 16_000, None, 5, 1, [0, 0, 33_200 + (i as i32 - 20) * 100], Some(false), true);
+        }
+        assert!(t.bumper(0) && !t.bumper(1));
+        let g = t.goal(700_000, [0, 0, 36_000], 0);
+        assert_eq!((g.points, g.goal_type, g.scorer), (2, GOAL_BUMPER_SHOT, Some(1)), "{g:?}");
+        assert!((g.distance - 4.0).abs() < 0.1 && g.speed > 5.0, "{g:?}");
+        assert!(t.credits.contains(&(1, Stat::Goals)) && !t.credits.contains(&(5, Stat::Goals)));
+
+        // Caught first, then carried in: an own goal, nobody's bumper.
+        let mut t = DiscTracker::new();
+        t.sample(0, None, 1, 0, [0, 0, 32_000], Some(true), false);
+        for i in 1..20u64 {
+            t.sample(i * 16_000, None, 1, 0, [0, 0, 32_000 + i as i32 * 60], Some(false), false);
+        }
+        t.sample(400_000, None, 5, 1, [0, 0, 33_200], Some(true), false);
+        t.sample(416_000, None, 5, 1, [0, 0, 33_300], Some(true), false);
+        assert!(!t.bumper(0));
+        assert_eq!(t.goal(700_000, [0, 0, 36_000], 0).goal_type, GOAL_SELF);
+    }
+
+    #[test]
+    fn a_throw_off_a_wall_is_a_bounce_shot() {
+        let mut t = DiscTracker::new();
+        t.sample(0, None, 0, 0, [3_000, 0, 33_000], Some(true), false);
+        // Out to the side at 5 m/s, then back in off the wall.
+        for i in 1..20u64 {
+            t.sample(i * 16_000, None, 0, 0, [3_000 + i as i32 * 80, 0, 33_000 + i as i32 * 20], Some(false), false);
+        }
+        for i in 20..40u64 {
+            t.sample(i * 16_000, None, 0, 0, [4_520 - (i as i32 - 19) * 80, 0, 33_380 + (i as i32 - 19) * 20], Some(false), false);
+        }
+        let g = t.goal(700_000, [0, 0, 36_000], 0);
+        assert_eq!((g.points, g.goal_type), (2, GOAL_BOUNCE_SHOT), "{g:?}");
+        assert!(g.speed > 4.0, "{g:?}");
+    }
+
+    #[test]
     fn carried_in_fast_is_a_slam_dunk() {
         let mut t = DiscTracker::new();
         // Carried at 8 m/s straight at the goal: still held.
         for i in 0..40u64 {
-            t.sample(i * 16_000, None, 0, 0, [0, 0, 20_000 + i as i32 * 128], Some(true));
+            t.sample(i * 16_000, None, 0, 0, [0, 0, 20_000 + i as i32 * 128], Some(true), false);
         }
         let g = t.goal(700_000, [0, 0, 36_000], 0);
         assert_eq!((g.points, g.goal_type), (2, GOAL_SLAM_DUNK));
+        // However fast the hand: no disc speed, no distance.
+        assert_eq!((g.speed, g.distance), (0.0, 0.0));
     }
 
     #[test]
     fn released_long_throw_is_a_long_shot() {
         let mut t = DiscTracker::new();
-        t.sample(0, None, 0, 0, [0, 0, 20_000], Some(true));
+        t.sample(0, None, 0, 0, [0, 0, 20_000], Some(true), false);
         for i in 1..40u64 {
-            t.sample(i * 16_000, None, 0, 0, [0, 0, 20_000 + i as i32 * 200], Some(false));
+            t.sample(i * 16_000, None, 0, 0, [0, 0, 20_000 + i as i32 * 200], Some(false), false);
         }
         let g = t.goal(700_000, [0, 0, 36_000], 0);
         assert_eq!((g.points, g.goal_type), (3, GOAL_LONG_SHOT));

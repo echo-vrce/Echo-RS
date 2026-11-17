@@ -142,6 +142,38 @@ async fn run(idx: u32, socket: UdpSocket, url: String, mut stop: watch::Receiver
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// One backend connection. Returns true when the instance should stop.
+/// Server frames for every game server, from one thread that sleeps to each
+/// frame's own time. A tokio interval lands on whole milliseconds, so 120 Hz
+/// frames came 8, 8 and 9 ms apart, and each client saw everyone's states
+/// arrive that unevenly. The thread's sleep is a high-resolution timer on
+/// Windows and Linux alike; a late frame is skipped, not caught up.
+fn frame_ticks() -> watch::Receiver<u64> {
+    static TICKS: std::sync::OnceLock<watch::Sender<u64>> = std::sync::OnceLock::new();
+    TICKS
+        .get_or_init(|| {
+            let (tx, _) = watch::channel(0u64);
+            let ticker = tx.clone();
+            let run = move || {
+                let mut next = Instant::now();
+                loop {
+                    next += Duration::from_nanos(1_000_000_000 / session::frame_hz().max(1));
+                    let now = Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    } else {
+                        next = now;
+                    }
+                    ticker.send_modify(|n| *n = n.wrapping_add(1));
+                }
+            };
+            if let Err(e) = std::thread::Builder::new().name("frame-clock".into()).spawn(run) {
+                tracing::error!(error = %e, "frame clock thread did not start");
+            }
+            tx
+        })
+        .subscribe()
+}
+
 async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch::Receiver<bool>, cfg: EngineConfig) -> bool {
     let (mut tx, mut rx) = ws.split();
     let reg = env(Em::GameServerRegistration(pb::GameServerRegistrationMessage {
@@ -163,8 +195,7 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
     // Service (flush) every 10 ms; game frames at `--frame-hz`.
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut frames = tokio::time::interval(Duration::from_micros(1_000_000 / session::frame_hz()));
-    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut frames = frame_ticks();
     let mut outbox: Vec<pb::Envelope> = Vec::new();
 
     let result = loop {
@@ -185,6 +216,7 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
                 let data = match m {
                     Some(Ok(WsMsg::Binary(d))) => d,
                     Some(Ok(WsMsg::Ping(p))) => { let _ = tx.send(WsMsg::Pong(p)).await; continue }
+                    Some(Ok(WsMsg::Text(t))) => { on_mute(idx, &t, session.as_mut()); continue }
                     Some(Ok(WsMsg::Close(_))) | None | Some(Err(_)) => break false,
                     Some(Ok(_)) => continue,
                 };
@@ -207,19 +239,13 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
                     outbox.append(&mut s.fleet_out);
                 }
             }
-            _ = frames.tick(), if session.is_some() => {
+            _ = frames.changed(), if session.is_some() => {
                 let s = session.as_mut().expect("guarded");
                 s.server_frame();
                 send_udp(socket, s).await;
                 outbox.append(&mut s.fleet_out);
             }
             _ = tick.tick(), if session.is_some() => {
-                // `frame-hz N` on stdin changes the rate while games run.
-                let want = Duration::from_micros(1_000_000 / session::frame_hz());
-                if frames.period() != want {
-                    frames = tokio::time::interval(want);
-                    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                }
                 let s = session.as_mut().expect("guarded");
                 let mut veil_out = veilnet::Out::new();
                 veil.tick(Instant::now(), &mut veil_out);
@@ -327,6 +353,30 @@ async fn send_udp(socket: &UdpSocket, s: &mut Session) {
             debug!(%to, error = %e, "udp send failed");
         }
     }
+}
+
+/// atlas's server mute (`ERGameServerMuteEntrants`), which the bridge passes
+/// on as a text frame: the fleet protobuf has no message for it.
+#[derive(serde::Deserialize)]
+pub(crate) struct MuteEntrants {
+    pub entrant_ids: Vec<uuid::Uuid>,
+    pub muted: bool,
+}
+
+fn on_mute(idx: u32, text: &str, session: Option<&mut Session>) {
+    let m: MuteEntrants = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(instance = idx, error = %e, "unreadable mute from the backend");
+            return;
+        }
+    };
+    let Some(s) = session else {
+        debug!(instance = idx, "mute with no session running; dropped");
+        return;
+    };
+    let changed = s.set_muted(&m.entrant_ids, m.muted);
+    info!(instance = idx, lobby = %s.info.lobby, muted = m.muted, entrants = ?m.entrant_ids, changed, "server mute");
 }
 
 fn on_fleet(

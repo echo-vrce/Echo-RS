@@ -52,7 +52,7 @@
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const HEAD: usize = 24;
 const RECORD_BITS: usize = 284;
@@ -106,6 +106,13 @@ const GRAB_VARS: [(u32, u32, &[(u64, u64)]); 3] = [
     // The mini-arena disc.
     (0xd33d_44b7, 1, &[(0xd279_7da9_9ab3_17a5, 1)]),
 ];
+
+/// An object whose owner has sent no record of it for this long is the
+/// server's again. A client stops sending what it threw once it comes to
+/// rest (native's server simulates it from there); still counted as that
+/// client's, nobody sent it at all, and a player who joined later saw it
+/// where it started.
+const SILENCE: Duration = Duration::from_secs(2);
 
 type Record = [u8; RECORD_BYTES];
 
@@ -278,6 +285,18 @@ struct Entry {
     record: Record,
     /// The client sending this object's state, if any.
     owner: Option<SocketAddr>,
+    /// When that client last sent it.
+    heard: Option<Instant>,
+}
+
+impl Entry {
+    /// No client's any more: at rest where it was last reported.
+    fn release(&mut self) {
+        self.owner = None;
+        set_bit(&mut self.record, ASLEEP, true);
+        set_bit(&mut self.record, HELD, false);
+        set_bit(&mut self.record, EXCLUSIVE, false);
+    }
 }
 
 struct Set {
@@ -325,7 +344,7 @@ impl Props {
     pub fn new() -> Self {
         let sets = baselines()
             .iter()
-            .map(|(id, key_base, d)| Set { id: *id, key_base: *key_base, entries: records(d).into_iter().map(|record| Entry { record, owner: None }).collect() })
+            .map(|(id, key_base, d)| Set { id: *id, key_base: *key_base, entries: records(d).into_iter().map(|record| Entry { record, owner: None, heard: None }).collect() })
             .collect();
         let mut p = Self { sets, pilot: None, flight: None, fury_home: [0.0; 3], vars: Vec::new(), vars_changed: false };
         p.fury_home = p.entry(FURY).map_or([0.0; 3], |e| position(&e.record));
@@ -473,14 +492,16 @@ impl Props {
         }
         let id = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
         let Some(set) = self.sets.iter_mut().find(|s| s.id == id) else { return };
+        let now = Some(Instant::now());
         for record in records(d) {
             let entry = entry_of(&record);
             match set.entries.iter_mut().find(|e| entry_of(&e.record) == entry) {
                 Some(e) => {
                     e.record = record;
                     e.owner = Some(from);
+                    e.heard = now;
                 }
-                None => set.entries.push(Entry { record, owner: Some(from) }),
+                None => set.entries.push(Entry { record, owner: Some(from), heard: now }),
             }
         }
     }
@@ -491,10 +512,20 @@ impl Props {
             self.engine_off();
         }
         for e in self.sets.iter_mut().flat_map(|s| s.entries.iter_mut()).filter(|e| e.owner == Some(who)) {
-            e.owner = None;
-            set_bit(&mut e.record, ASLEEP, true);
-            set_bit(&mut e.record, HELD, false);
-            set_bit(&mut e.record, EXCLUSIVE, false);
+            e.release();
+        }
+    }
+
+    /// Objects their owners stopped sending: the server sends them from
+    /// here on, asleep where they were last reported.
+    pub fn expire(&mut self, now: Instant) {
+        for s in &mut self.sets {
+            for e in s.entries.iter_mut().filter(|e| e.owner.is_some()) {
+                if e.heard.is_none_or(|t| now.saturating_duration_since(t) > SILENCE) {
+                    tracing::debug!(set = format_args!("{:08x}", s.id), entry = entry_of(&e.record), "lobby object: owner silent, the server sends it");
+                    e.release();
+                }
+            }
         }
     }
 
@@ -529,6 +560,23 @@ impl Props {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_object_its_owner_stopped_sending_is_the_servers_again() {
+        let mut p = Props::new();
+        let all = records(&p.broadcast(0, 0)[0].1).len();
+        let mut r = records(&baselines()[0].2)[0];
+        set_bit(&mut r, HELD, true);
+        p.observe(addr(), &message(&r));
+        let now = Instant::now();
+        p.expire(now);
+        assert_eq!(records(&p.broadcast(0, 0)[0].1).len(), all - 1);
+        p.expire(now + SILENCE + Duration::from_millis(100));
+        let sent = records(&p.broadcast(0, 0)[0].1);
+        assert_eq!(sent.len(), all);
+        let back = sent.iter().find(|x| entry_of(x) == entry_of(&r)).expect("entry");
+        assert!(bit(back, ASLEEP) && !bit(back, HELD));
+    }
 
     fn addr() -> SocketAddr {
         "127.0.0.1:6794".parse().expect("addr")

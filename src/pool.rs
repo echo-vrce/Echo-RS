@@ -44,11 +44,24 @@ pub struct Pool {
     hub: Arc<Hub>,
     upstreams: Arc<Upstreams>,
     instances: Mutex<BTreeMap<u32, Slot>>,
+    /// (kept idle, most at once): the launcher can raise them while running.
+    limits: Mutex<(usize, usize)>,
 }
 
 impl Pool {
     pub fn new(cfg: PoolConfig, hub: Arc<Hub>, upstreams: Arc<Upstreams>) -> Arc<Self> {
-        Arc::new(Self { cfg, hub, upstreams, instances: Mutex::new(BTreeMap::new()) })
+        let limits = Mutex::new((cfg.min_idle, cfg.max_instances));
+        Arc::new(Self { cfg, hub, upstreams, instances: Mutex::new(BTreeMap::new()), limits })
+    }
+
+    /// New limits for a running pool: more game servers start on the next
+    /// pass. Lowering them stops nothing that already runs (surplus idle
+    /// ones go only when `--idle-retire-secs` is set).
+    pub fn set_limits(&self, max_instances: usize, min_idle: usize) {
+        let max = max_instances.clamp(1, 1024);
+        let min = min_idle.min(max);
+        *self.limits.lock() = (min, max);
+        info!(kept_running = min, most_at_once = max, running = self.count(), "game server limits changed");
     }
 
     pub fn count(&self) -> usize {
@@ -118,12 +131,13 @@ impl Pool {
     async fn rebalance(self: &Arc<Self>) -> Result<()> {
         let (idle, retire) = self.occupancy();
         let total = self.count();
-        if idle < self.cfg.min_idle && total < self.cfg.max_instances {
-            let want = (self.cfg.min_idle - idle).min(self.cfg.max_instances - total);
+        let (min_idle, max_instances) = *self.limits.lock();
+        if idle < min_idle && total < max_instances {
+            let want = (min_idle - idle).min(max_instances - total);
             for _ in 0..want {
                 self.spawn_next().await?;
             }
-        } else if idle > self.cfg.min_idle && !self.cfg.idle_retire.is_zero() {
+        } else if idle > min_idle && !self.cfg.idle_retire.is_zero() {
             // Stop one surplus idle instance per pass.
             if let Some(idx) = retire.first().copied() {
                 self.retire(idx).await;
@@ -135,7 +149,8 @@ impl Pool {
     async fn spawn_next(self: &Arc<Self>) -> Result<()> {
         // Lowest free index whose UDP port binds.
         let used: Vec<u32> = self.instances.lock().keys().copied().collect();
-        for idx in 0..(self.cfg.max_instances as u32 * 4) {
+        let most = self.limits.lock().1;
+        for idx in 0..(most as u32 * 4) {
             if used.contains(&idx) {
                 continue;
             }

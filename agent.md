@@ -837,3 +837,132 @@ level through replicated vars; we sent only state/clock/countdown, over a baseli
 - Still not from native: barrier box sizes for the 180 and 230 HP barriers (bullet-hit extents, few hits), a det's
   falloff on barriers (one partial sample: 97 of 140 about 2 m off), `CAPTURE_ROUNDS_TO_WIN` (both native capture
   matches ended 2-0: first to two fits, a 1-1 was never seen; the rule is in the match script).
+
+## Arena disc desync fixes (2026-11-17; untested in game, not committed)
+
+- **Silent or departed holder**: in play, if the holder (`arena.granted`, else `disc_owner`) has left or sent no
+  disc state for `DISC_SILENCE` (1 s; native never paused over 0.2 s), `Arena::park_disc` takes the disc: the
+  server publishes it at the holder's last position (`arena.parked`, used after `frozen`, before the spawn) with
+  the reset count moved on, live and free to grab. Not while paused / resuming. Cleared by goal, launch, new round.
+- A disc state from a player the server did not take the disc from is no longer forwarded while the server
+  publishes its own (`!server_disc` in the forward path): a stale holder's states carried the server's count.
+- **Server disc taken without a grab** (in play): the count now moves past the taker's and `granted` names them,
+  as for a no-grab take of a player's disc; in both cases the touch entries now name the taker.
+- **Grab with nobody owning the disc**: granted in the arena whatever owner the requester believed.
+- **Private free play** (before Start): grabs are granted (`Arena::disc_free`; they were all declined as
+  "locked", so a second player's disc was ignored by the others), and the no-grab take and the silent-holder
+  park apply there too (not before anyone has touched the disc).
+- **Lobby objects**: `Props::expire`: an object its owner has not sent for 2 s is the server's again (asleep
+  where last reported), so thrown objects at rest are sent to late joiners.
+- The server disc stamp now wraps at 32 bits (it passed 2^32 µs about 70 min into a session; a non-zero high
+  word made clients drop the holder's disc). Unknown: whether clients ignore the server's disc for the ~60 s
+  in which the server's stamp has wrapped and theirs has not.
+- Suspected, not changed. Lobby: a previous owner's records are still relayed after a grant (the arena
+  drops them). Pause: nothing holds the disc server-side while paused.
+
+## Relay timing (2026-11-17; untested in game, not committed)
+
+- **Frame clock**: `engine::frame_ticks` — one `frame-clock` thread sleeps to each frame's exact time and wakes
+  every game server through a watch channel (a late frame is skipped). The tokio interval it replaces lands on
+  whole milliseconds. Measured on this PC at 120 Hz (sleep only, not through tokio): lateness spread (p95-p05)
+  0.69 ms against 1.16 ms for whole-ms deadlines, median 0.37 against 0.74 ms. Windows' timer floor is ~0.5 ms;
+  closer needs spinning (CPU), not done. `frame-hz N` is picked up by the thread on its next frame.
+- **Disc in flight goes out on arrival**: `Transport::mailbox_now` sends the forwarded disc state in a mailbox
+  frame of its own to every other player at once (it waited up to a frame). Held discs (state byte 25 = 2) still
+  go with the frame, beside the holder's player state. Cost: one extra small packet per flight state per peer.
+
+## Abandoned disc handed to a client (2026-11-17; EXPERIMENT, untested in game, not committed)
+
+No server physics and no level geometry: when the disc's holder leaves or goes silent (`DISC_SILENCE`), the server
+first sends another team player's client a `TOUCH_GRANTED` it did not ask for (`Session::delegate_disc`: not held,
+next generation, that client's last touch seq, the object / entry / actor of the last real grab), so that client's
+own simulation carries the disc on and everyone follows its forwarded states. **Whether a client accepts an
+unrequested grant is unknown** (no recording has one). If it sends no disc state within another second the server
+parks the disc as before. The log says which: "abandoned disc: handed to..." then either "...took it over and
+simulates it" or "...sent nothing". If it never works, remove `delegate_disc`. The same idea would fit lobby props.
+
+## Goals, awards, registration pacing, live server count, Settings layout (2026-11-17; untested in game, not committed)
+
+- **Disc state byte 25** (native 2026-11-11, checked against its touch requests): 2 in a hand, 0 after a throw,
+  4 after a hit (a headbutt; the disc cannot be punched: from the grant of a request with the hit bit until the next grab). We read 4 as
+  "thrown" and 0 as unknown. **Goal types**: in a hand = slam dunk (1) with speed 0 and distance 0 (the user's rule;
+  we sent the hand's speed); hit flight = headbutt 6 / long headbutt 7 (native's recorded type 7: thrown, headbutted
+  2.4 s later, distance 8.86 m measured from the throw's release); a flight that turned > ~25 degrees in one step
+  at >= 1 m/s = bounce 4 / long bounce 5; else inside 2 / long 3. **Bumper shot 8 / long 9** (the user's
+  definition): thrown at an opponent who headbutts it (not a catch) into their own goal: the thrower
+  scores (`GoalInfo::scorer`, `DiscTracker::bumper`), distance from the throw's release, and it is not an own goal
+  (so it counts with self goals off).
+- **Top awards: one per player** (every native award list in `captures/` names each slot once): MVP first, then
+  each stat's best among players still without one.
+- **Registration pacing** (`upstream::Gate`): one game server registers first; an error answer from the backend
+  (nakama `Error`, `ER_REGISTRATION_FAILURE` once the layout question is settled) = nobody tries again until restart;
+  no answer within 10 s / connection lost = that one tries again after 10 s, 20 s, 40 s ... (max 5 min); once one is
+  registered the rest go five at a time, and one refused then gives up alone. Before: every instance reconnected
+  and registered again 0.5 s after any failure (10k requests from 128 servers).
+- **Server count while running**: stdin `servers <most at once> <kept running>` -> `Pool::set_limits`; the launcher
+  sends it when either number changes. Raising starts servers at once; lowering stops none.
+- **Launcher Settings**: Combat pages are per gear (`settings::gear_items`): a gun / tac mod / ordnance shows all
+  its entries (its own table, its cone / explosion, its damage table) on one page; the separate Damage tab is gone.
+  Names and order are `mp_equipment.json`'s (PROTOSTAR, QUARK, BLAZAR, STARBURST, TRANSLOCATOR, ATTACK DRONE,
+  POWER BOOST, POINT BLANK). The stored `balance` changes keep their format.
+
+## Payload HUD and private combat matches (2026-11-17; untested in game, not committed)
+
+- Payload HUD vars (`combat.rs` `payload_vars`), from the Gauss and Fission
+  server recordings: claim state (`Unclaimed` / `attackerPossessed` /
+  `contested`; a defender alone stays `Unclaimed`) plus each level's copy,
+  motion (`still`/`forward`/`backward`; a self-driving payload stays
+  `forward`), direction (`backward` only while rolling back), moving (1/0/-1,
+  0 while held or self-driving), attacker claim (0/1 and the flag byte),
+  defender claim (count), `overtime_progress` 1.0 from the attackers' first
+  claim, Gauss's door count (20 s down to 0 from checkpoint 1).
+- Level vars set on a trackpoint's first reach (checkpoint counter and symbol,
+  load progression, ...): `data/combat_<map>_track_vars.txt` from
+  `tools/gen_track_vars.py <map> <server recording msgs.csv>`; applied for
+  every trackpoint passed (`reach_track_vars`).
+- Private (`MODE_COMBAT_PRIVATE`, `Combat::set_private` from `Session::new`):
+  state `pre_match_wait_for_ready` until every team with players pressed its
+  terminal's ready (`nevt_blue/red_team_ready`, handled before the combat
+  relay in `on_client_event`; `blue/red_team_ready` vars), then straight to
+  the team room; Dyson/Combustion then play as public.
+- Private payload: two halves. First half ends at time up (after overtime) or
+  home: `to_beat` = the payload's furthest point; round over as a capture
+  round, then at the team room `Out::SwapTeams` (session `swap_teams`: every
+  blue<->orange, `EntrantTeamChanged` each) and the payload back to the start
+  (`reset_payload`: `PosStateUpdate` first trackpoint, misc 0, track vars back
+  to before). Second half: orange (the old blue) wins on reaching `to_beat`;
+  time up short of it, blue (the first attackers) wins. Marker/round vars
+  (`payload_furthest_distance_round_1/2`, `payload_team_a/b_distance`,
+  `payload_team_a_marker_*`, `payload_progress_marker_*`,
+  `net_total_round_count`, `net_rounds_played`, `defending_team_index`) are
+  dictionary names, NOT seen in any recording: whether the HUD shows the
+  marker from them is unverified. Whether clients accept the payload going
+  back (TrackpointReached only rises) is unverified too.
+
+## Arena stats to nakama, `save_loadout` feature (2026-11-17; untested in game, not committed)
+
+- **Arena stats.** At an arena match's end (`awards_due`, with the top awards)
+  `Session::send_arena_profile_updates` sends one
+  `UserServerProfileUpdateRequest` per joined blue/orange player out through
+  `fleet_out`: payload `{"matchtype": symbol("echo_arena"), "sessionid":
+  <lobby>, "update": arena_profile_delta(...)}`. `arena_profile_delta` builds
+  `{"stats":{"arena":{name:{"op","val","cnt":1}}}}` (the shape atlas's
+  `ArenaStatistics` reads): every non-zero `STAT_NAMES` stat as `add`
+  (PossessionTime in seconds), `HighestPoints/Saves/Stuns` as `max`, one of
+  `ArenaWins/ArenaLosses/ArenaTies` and `GamesPlayed`. Private matches decide
+  the result by round wins when they differ, else by goals.
+- The bridge forwards it: to nakama as the native SNS frame
+  (`upstream.rs` `profile_update_frame`, platform/account u64 + JSON);
+  to EchoRelay over a short login-service connection (`echorelay_profile_update`).
+- Atlas accepts these from non-native servers (atlas
+  `runtime_event_server_profile_update.go`) and **ignores private arena and
+  combat matches on purpose**, so only public matches fill the boards. Skill
+  ratings are not updated through this path.
+- **`save_loadout`.** `upstream.rs` `with_features` appends
+  `features=save_loadout` to the backend URL (both the nakama and the
+  EchoRelay bridges; a URL that already has `features=` is left alone).
+  Atlas then skips the client's lossy `item_equipped` remote log for this
+  server (`GameServerFeatureSaveLoadout`), since this server saves the exact
+  loadout itself (`save_loadouts` / `loadout_save`). Tests:
+  `nakama_url_gets_the_save_loadout_feature`,
+  `arena_profile_delta_has_natives_stat_shape`.

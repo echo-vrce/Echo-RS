@@ -489,12 +489,17 @@ impl App {
 
     /// Tells a running server the new frame rate (its games switch at once).
     fn send_frame_hz(&mut self, hz: u32) {
+        self.send_line(&format!("frame-hz {hz}"));
+    }
+
+    /// A command line for the running server's stdin.
+    fn send_line(&mut self, line: &str) {
         use std::io::Write;
         if let Some(r) = &mut self.running
             && r.exited.is_none()
             && let Some(w) = &mut r.stdin
         {
-            if writeln!(w, "frame-hz {hz}").and_then(|_| w.flush()).is_err() {
+            if writeln!(w, "{line}").and_then(|_| w.flush()).is_err() {
                 r.stdin = None;
             }
         }
@@ -722,9 +727,10 @@ impl App {
 
     fn games(&mut self, ui: &mut egui::Ui, live: bool) {
         let hz_before = self.setup.frame_hz;
+        let servers_before = (self.setup.max_games, self.setup.keep_running);
         let s = &mut self.setup;
         card(ui, "Game servers", |ui| {
-            ui.add_enabled_ui(!live, |ui| egui::Grid::new("games").num_columns(2).spacing([24.0, 12.0]).min_col_width(170.0).show(ui, |ui| {
+            egui::Grid::new("games").num_columns(2).spacing([24.0, 12.0]).min_col_width(170.0).show(ui, |ui| {
                 field_label(ui, "Max at once", "Most game servers running together");
                 ui.add(egui::DragValue::new(&mut s.max_games).range(1..=128));
                 ui.end_row();
@@ -732,7 +738,10 @@ impl App {
                 let max = s.max_games;
                 ui.add(egui::DragValue::new(&mut s.keep_running).range(0..=max));
                 ui.end_row();
-            }));
+            });
+            if live {
+                hint(ui, "Raising these starts more game servers at once. Lowering them stops none that already run; that takes a restart.");
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Frame rate").strong());
@@ -774,6 +783,11 @@ impl App {
         // A running server switches its games to the new rate at once.
         if self.setup.frame_hz != hz_before {
             self.send_frame_hz(self.setup.frame_hz);
+        }
+        // And starts more game servers when the numbers go up.
+        self.setup.keep_running = self.setup.keep_running.min(self.setup.max_games);
+        if (self.setup.max_games, self.setup.keep_running) != servers_before {
+            self.send_line(&format!("servers {} {}", self.setup.max_games.max(1), self.setup.keep_running));
         }
     }
 
