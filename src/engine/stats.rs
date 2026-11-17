@@ -514,3 +514,148 @@ mod held_tests {
         assert_eq!((g.points, g.goal_type), (3, GOAL_LONG_SHOT));
     }
 }
+
+// ── Combat ────────────────────────────────────────────────────────────────
+
+/// A combat player's match totals, as native's combat server keeps them
+/// (server recordings, 2026-11-16): `SR15NetReliableStatUpdate` every 3 s
+/// with the running totals, `{}` for a player with none.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct CombatStats {
+    pub objective_damage: f32,
+    pub eliminations: u32,
+    pub objective_eliminations: u32,
+    pub objective_time: f32,
+    pub kills: u32,
+    pub assists: u32,
+    pub deaths: u32,
+    pub damage: f32,
+    pub damage_taken: f32,
+    /// Seconds of play on a team (not sent: it decides the XP).
+    pub played: f32,
+}
+
+/// The team update's eight records, in native's order.
+pub const COMBAT_TEAM_STATS: [&str; 8] = [
+    "CombatEliminations",
+    "CombatObjectiveEliminations",
+    "CombatObjectiveTime",
+    "CombatObjectiveDamage",
+    "CombatKills",
+    "CombatAssists",
+    "CombatDeaths",
+    "CombatDamage",
+];
+
+/// A stat value as native's team record writes it: `m * 2^e`. Counts are
+/// whole (`e` 0); times and damage are reals, on a 1/64 grid, a whole one
+/// with its factors of two moved into `e` (native: 110 damage = 55 * 2^1).
+pub fn mantissa_exp(v: f32, real: bool) -> (i32, i32) {
+    if !real || v == 0.0 {
+        return (v as i32, 0);
+    }
+    if v.fract() == 0.0 {
+        let (mut m, mut e) = (v as i64, 0);
+        while m != 0 && m % 2 == 0 {
+            m /= 2;
+            e += 1;
+        }
+        return (m as i32, e);
+    }
+    ((v * 64.0).round() as i32, -6)
+}
+
+impl CombatStats {
+    /// (name, value, real) in the order native writes a player's JSON.
+    fn fields(&self) -> [(&'static str, f32, bool); 9] {
+        [
+            ("CombatObjectiveDamage", self.objective_damage, true),
+            ("CombatEliminations", self.eliminations as f32, false),
+            ("CombatObjectiveEliminations", self.objective_eliminations as f32, false),
+            ("CombatObjectiveTime", self.objective_time, true),
+            ("CombatKills", self.kills as f32, false),
+            ("CombatAssists", self.assists as f32, false),
+            ("CombatDeaths", self.deaths as f32, false),
+            ("CombatDamage", self.damage, true),
+            ("CombatDamageTaken", self.damage_taken, true),
+        ]
+    }
+
+    /// One team record's value: by its name in `COMBAT_TEAM_STATS`.
+    pub fn get(&self, name: &str) -> (f32, bool) {
+        self.fields().iter().find(|f| f.0 == name).map_or((0.0, false), |f| (f.1, f.2))
+    }
+
+    /// The `SR15NetReliableStatUpdate` JSON: every non-zero total (native
+    /// leaves out what a player has none of; damage taken is profile-only).
+    pub fn to_json(&self) -> String {
+        let mut out = Vec::new();
+        for (name, v, real) in self.fields() {
+            if v == 0.0 || name == "CombatDamageTaken" {
+                continue;
+            }
+            let val = if real { format!("{v}") } else { format!("{}", v as u32) };
+            out.push(format!("\"{name}\":{{\"op\":\"add\",\"val\":{val}}}"));
+        }
+        format!("{{{}}}", out.join(","))
+    }
+
+    /// Native's MVP: the most to show for the match (no formula recorded;
+    /// it went to the player ahead on eliminations and objective time in
+    /// every recording).
+    pub fn score(&self) -> u64 {
+        (self.eliminations as f32 * 100.0 + self.objective_eliminations as f32 * 50.0 + self.objective_time * 10.0 + self.damage + self.objective_damage) as u64
+    }
+}
+
+/// XP for a match (native, all four recorded maps): 1200 for a win, 1000 for
+/// a loss, for a player there for most of it (late joiners got only their
+/// tier reward); +100 for the MVP; + the tier reward's XP.
+pub fn combat_xp(won: bool, stayed: bool, mvp: bool, tier_xp: u64) -> u64 {
+    let base = match (stayed, won) {
+        (false, _) => 0,
+        (true, true) => 1200,
+        (true, false) => 1000,
+    };
+    base + if mvp { 100 } else { 0 } + tier_xp
+}
+
+#[cfg(test)]
+mod combat_tests {
+    use super::*;
+
+    /// Native's team records (Dyson, 181.73 s): 110 damage = 55e1, 8.97 s = 574e-6.
+    #[test]
+    fn team_values_encode_like_native() {
+        assert_eq!(mantissa_exp(110.0, true), (55, 1));
+        assert_eq!(mantissa_exp(65.0, true), (65, 0));
+        assert_eq!(mantissa_exp(313.80167, true), (20083, -6));
+        assert_eq!(mantissa_exp(7.0, false), (7, 0));
+        assert_eq!(mantissa_exp(0.0, true), (0, 0));
+    }
+
+    /// Native Dyson's XP: the MVP winner with a gold 1450, the loser with a gold 1150.
+    #[test]
+    fn xp_matches_native() {
+        assert_eq!(combat_xp(true, true, true, 150), 1450);
+        assert_eq!(combat_xp(false, true, false, 150), 1150);
+        assert_eq!(combat_xp(true, true, false, 0), 1200);
+        assert_eq!(combat_xp(false, false, false, 150), 150);
+    }
+
+    /// The team records' symbols, as native's wire bytes.
+    #[test]
+    fn team_stat_symbols_are_natives() {
+        let wire = |n: &str| crate::sns::symbol(n).to_le_bytes();
+        assert_eq!(wire("CombatKills"), [0x4b, 0x69, 0xe9, 0xaa, 0x02, 0x71, 0x50, 0x11]);
+        assert_eq!(wire("CombatObjectiveTime"), [0x99, 0x59, 0x4a, 0xf1, 0x72, 0xc4, 0xd2, 0xf8]);
+        assert_eq!(wire("CombatEliminations"), [0x6f, 0x8d, 0xd3, 0x65, 0x48, 0x09, 0x82, 0x26]);
+    }
+
+    #[test]
+    fn json_leaves_out_zeros() {
+        let s = CombatStats { kills: 2, eliminations: 2, damage: 35.5, ..Default::default() };
+        assert_eq!(s.to_json(), r#"{"CombatEliminations":{"op":"add","val":2},"CombatKills":{"op":"add","val":2},"CombatDamage":{"op":"add","val":35.5}}"#);
+        assert_eq!(CombatStats::default().to_json(), "{}");
+    }
+}

@@ -1,7 +1,7 @@
 //! Updates from the project's GitHub releases.
 //!
 //! On start (and on "Check for updates") the launcher asks GitHub for the
-//! newest release of `heisthecat31/Echo-RS`, takes this platform's zip
+//! newest release of `echo-vrce/Echo-RS`, takes this platform's zip
 //! (`echo-rust-server-windows.zip` / `-linux.zip`) and, when it is not the one
 //! already installed, downloads it and replaces the server and launcher
 //! executables next to the launcher. Nothing else in the folder is touched
@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-const LATEST: &str = "https://api.github.com/repos/heisthecat31/Echo-RS/releases/latest";
-const DOWNLOAD_PREFIX: &str = "https://github.com/heisthecat31/Echo-RS/releases/download/";
+const LATEST: &str = "https://api.github.com/repos/echo-vrce/Echo-RS/releases/latest";
+const DOWNLOAD_PREFIX: &str = "https://github.com/echo-vrce/Echo-RS/releases/download/";
 const MAX_ZIP: u64 = 300 * 1024 * 1024;
 const AGENT: &str = "echo-server-launcher";
 

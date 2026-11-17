@@ -1,0 +1,14 @@
+# barrier_handle var (the var is 0 while the barrier is down, else 1)
+0xb8 7503df8c72b9af22
+0xb9 6b7bdeefa7fc58ca
+0xba c86e56e1460987d8
+0xbb 8f8e39e4e67b5496
+0xbc 91f63887333ea37e
+0xbd feb6a7622a20255e
+0xbe e0cea601ff65d2b6
+0xbf a72ec9045f1701f8
+0xc0 d77a2442b552ecde
+0xc1 c902252160171b36
+0xc2 8ee24a24c065c878
+0xc3 909a4b4715203f90
+0xc4 ffdad4a20c3eb9b0

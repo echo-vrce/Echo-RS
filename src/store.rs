@@ -236,6 +236,45 @@ impl Store {
         }
     }
 
+    /// A game server's stat changes for a player (`{"stats": {group: {name:
+    /// {"op", "val"}}}}`, as native's `SNSRefreshProfileFromServer` carries
+    /// them): kept in the server profile the way it stores stats,
+    /// `{"cnt", "op", "val"}`; `add` sums, `max` keeps the larger, `rep`
+    /// replaces.
+    pub fn apply_stats(&self, xpid: XpId, update: &Value) {
+        let Some(groups) = update.get("stats").and_then(Value::as_object) else { return };
+        let mut accounts = self.accounts.lock();
+        let Some(a) = accounts.get_mut(&xpid) else { return };
+        if !a.server_profile["stats"].is_object() {
+            a.server_profile["stats"] = json!({});
+        }
+        for (group, stats) in groups {
+            let Some(stats) = stats.as_object() else { continue };
+            let g = &mut a.server_profile["stats"][group.as_str()];
+            if !g.is_object() {
+                *g = json!({});
+            }
+            for (name, change) in stats {
+                let op = change.get("op").and_then(Value::as_str).unwrap_or("add");
+                let Some(v) = change.get("val").and_then(Value::as_f64) else { continue };
+                let cur = &mut g[name.as_str()];
+                let old = cur.get("val").and_then(Value::as_f64);
+                let cnt = cur.get("cnt").and_then(Value::as_u64).unwrap_or(0) + 1;
+                let new = match (op, old) {
+                    ("add", Some(o)) => o + v,
+                    ("max", Some(o)) => o.max(v),
+                    _ => v,
+                };
+                let whole = change.get("val").is_some_and(|x| x.is_u64() || x.is_i64()) && old.is_none_or(|o| o.fract() == 0.0);
+                let val = if whole { json!(new as i64) } else { json!(new) };
+                *cur = json!({"cnt": cnt, "op": op, "val": val});
+            }
+        }
+        let out = a.clone();
+        drop(accounts);
+        self.save(&out);
+    }
+
     /// A loadout reported by a game server: slot name → item symbol.
     pub fn save_loadout(&self, xpid: XpId, slots: &[(&str, u64)]) {
         let mut accounts = self.accounts.lock();

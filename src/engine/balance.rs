@@ -28,7 +28,7 @@ use tracing::{info, warn};
 static CHANGES: OnceLock<Map<String, Value>> = OnceLock::new();
 static BASE: OnceLock<Base> = OnceLock::new();
 
-const ECHOCOMBAT_WEAPONS: &str = include_str!("data/mp_weapon_settings_echocombat.json");
+pub(crate) const ECHOCOMBAT_WEAPONS: &str = include_str!("data/mp_weapon_settings_echocombat.json");
 /// The gear list a native H server with EchoCombat sends (its social lobby, 2026-11-16):
 /// the stock gear plus PROTOSTAR, QUARK, BLAZAR, STARBURST, UMBRAL VEIL, OVERCHARGE, ...
 const ECHOCOMBAT_EQUIPMENT: &str = include_str!("data/mp_equipment_echocombat.json");
@@ -320,7 +320,7 @@ mod tests {
         let ask_medigun: Map<String, Value> = serde_json::from_str(r#"{"mp_weapon_settings": {"medigun": {"enabled": true}}}"#).expect("json");
         let ec = build(&body, Base { echocombat: true, medigun: false }, &ask_medigun).expect("build");
         let w = document(&ec, "mp_weapon_settings").expect("weapons");
-        assert_eq!(w.pointer("/grenade_properties/dot/radius"), Some(&Value::from(3.5)));
+        assert_eq!(w.pointer("/grenade_properties/dot/radius"), Some(&Value::from(2.25)));
         assert_eq!(w.pointer("/medigun/enabled"), Some(&Value::Bool(false)));
         let gear = document(&ec, "mp_equipment").expect("equipment").to_string();
         assert!(gear.contains("PROTOSTAR") && gear.contains("OVERCHARGE"), "EchoCombat gear list");

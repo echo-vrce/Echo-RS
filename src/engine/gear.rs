@@ -27,14 +27,14 @@
 //!   (an extra `AbilityCooldown`, a full `DamageableHealthBroadcast` and the
 //!   heal bubbles' last parameters).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rad_protocol::symbol::MatSym;
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, info};
 
 const fn h(name: &str) -> u64 {
     MatSym::hash(name).data
@@ -73,9 +73,33 @@ pub const COOLDOWN_REFUND: u64 = h("SR15NetCooldownRefund");
 pub const DEPOSIT_MAGAZINE: u64 = h("SR15NetGameDepositMagazine");
 pub const PLAYER_RESPAWN: u64 = h("SR15NetDamageablePlayerRespawn");
 pub const PLAYER_RESPAWN_COMPLETE: u64 = h("SR15NetDamageablePlayerRespawnComplete");
+/// A non-player damageable's new health and shield, to everyone (native
+/// `CR15NetDamageableCS::DealDamage` after `ProcessDamageServer`):
+/// `[space u64][index u16][generation u16][kind u32 = 1][health f32][shield f32]`.
+/// Each client sets them (`ProcessDamageClient`); health reaching 0 is its death
+/// event, which breaks a barrier.
+pub const DEAL_DAMAGE: u64 = h("SR15NetDamageableDealDamage");
+/// A drone's shot: its owner's client aims and sends it, the server passes it
+/// to every other peer (`CR15NetAutoTargetCS::FireBulletNetwork`).
+pub const AUTO_TARGET_FIRE: u64 = h("SR15NetAutoTargetFireBullet");
 
 /// Physics objects (bytes 4..8 of a 64-byte `PhysicsSimStateEvent`).
 const BODY_OBJECT: [u8; 4] = [0x8e, 0xc2, 0x1d, 0x00];
+/// The combat maps' war room targets live in their own space: native answers
+/// a shot on one with `LocallyTrackedDamage` in this space to the shooter only
+/// (Gauss, Dyson and Fission recordings), and with nothing else.
+const WAR_ROOM_SPACE: [u8; 8] = [0x0b, 0xef, 0x8d, 0x10, 0x9e, 0xaf, 0xa1, 0x08];
+/// Thrown ordnance takes bullets: native deals from 9999 (the level's
+/// ordnance templates), then the owner's client sets it off.
+const ORDNANCE_HEALTH: f32 = 9999.0;
+/// Native's barrier break: `DealDamage` 0 in the hit's frame, the break event
+/// and `DealDamage` 0 again a frame later (10 ms), and the level script's own
+/// event a frame after that (Dyson and Gauss recordings).
+const BREAK_EVENT_AFTER: Duration = Duration::from_millis(10);
+const BREAK_ECHO_AFTER: Duration = Duration::from_millis(17);
+/// A respawn: the event and full health, then the script's event a frame later.
+const RESPAWN_ECHO_AFTER: Duration = Duration::from_millis(7);
+#[cfg(test)]
 const AREA_OBJECT: [u8; 4] = [0x26, 0x45, 0x2b, 0xfc];
 /// Explosion kinds (bytes 8..16 of the explosion messages).
 const EX_ROCKET: [u8; 8] = [0xdc, 0x35, 0x4e, 0x7e, 0x5c, 0x3d, 0x0a, 0xb3];
@@ -93,6 +117,13 @@ const HURT_ORDNANCE: u32 = 2;
 /// DETONATOR damage (native: 65 on a dummy, killed a player at 27).
 const DET_DAMAGE: f32 = 65.0;
 const DET_RADIUS: f64 = 1.5;
+/// How far a det reaches barriers, and its damage to one at a distance:
+/// full to 1 m, then down to 40% at the edge.
+const DET_BARRIER_REACH: f32 = 2.5;
+fn det_barrier_falloff(d: f32) -> f32 {
+    let f = if d <= 1.0 { 1.0 } else { 1.0 - 0.6 * ((d - 1.0) / (DET_BARRIER_REACH - 1.0)).clamp(0.0, 1.0) };
+    DET_DAMAGE * f
+}
 /// Health regeneration, as native did it: 12.4 s after the last loss, about
 /// 73 health a second (kind 8) up to full, then a plain full-health broadcast.
 const REGEN_DELAY: Duration = Duration::from_millis(12_400);
@@ -103,6 +134,113 @@ const HURT_REGEN: u32 = 8;
 const ITEM_DET: [u8; 8] = [0xfe, 0xe7, 0x94, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
 const ITEM_STUN: [u8; 8] = [0xbe, 0x0b, 0x67, 0x29, 0x48, 0x3e, 0xc3, 0xc8];
 const ITEM_DOT: [u8; 8] = [0xfe, 0xed, 0x94, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
+const ITEM_DRONE: [u8; 8] = [0xb5, 0x4a, 0x80, 0xcb, 0xde, 0xc7, 0x2d, 0xe3];
+/// A bullet collision's target (bytes 32..40) is a pool handle when its kind
+/// (bytes 36..40) is 1: `[index u16][generation u16]`.
+const HANDLE_KIND: [u8; 4] = [1, 0, 0, 0];
+/// Hit body part 6 is "barrier" in the damage table.
+const PART_BARRIER: u64 = 6;
+/// A barrier the level data does not list (the stock maximum).
+const BARRIER_HEALTH: f32 = 230.0;
+/// Native's barrier break / respawn event (`ComponentEvent` to the barrier's
+/// net handle, all clients, around a `DealDamage` with its new health).
+/// Wire bytes `ff278203989fcc2b` / `c4b6bab2ee99ea6a` (u64s little-endian;
+/// these were written byte-reversed before 2026-11-16, so clients never saw
+/// the break and kept broken barriers up).
+const BARRIER_EVENT: u64 = 0x2bcc_9f98_0382_27ff;
+pub const BARRIER_MODULE: u64 = 0x6aea_99ee_b2ba_b6c4;
+use super::msg::COMPONENT_EVENT;
+
+/// A level's damageable net components (`tools/gen_combat_maps.py`): pool
+/// slot, net handle, max health, respawn seconds (0: stays down).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Barrier {
+    pool: u16,
+    handle: u16,
+    max: f32,
+    respawn: f32,
+    /// The actor's place and rotation (x, y, z, w), and its box in that
+    /// frame: half extents, centred `off_z` along its z (none: no splash).
+    pos: [f32; 3],
+    rot: [f32; 4],
+    half: [f32; 3],
+    off_z: f32,
+}
+
+impl Barrier {
+    /// The point of the barrier's box nearest `at`, and how far it is.
+    fn nearest(&self, at: [f32; 3]) -> Option<([f32; 3], f32)> {
+        if self.half.iter().all(|h| *h <= 0.0) {
+            return None;
+        }
+        let rel = [at[0] - self.pos[0], at[1] - self.pos[1], at[2] - self.pos[2]];
+        let [x, y, z, w] = self.rot;
+        let mut l = rotate([-x, -y, -z, w], rel);
+        l[2] -= self.off_z;
+        for i in 0..3 {
+            l[i] = l[i].clamp(-self.half[i], self.half[i]);
+        }
+        l[2] += self.off_z;
+        let r = rotate(self.rot, l);
+        let p = [self.pos[0] + r[0], self.pos[1] + r[1], self.pos[2] + r[2]];
+        Some((p, dist(at, p)))
+    }
+}
+
+/// `v` rotated by the unit quaternion `q` (x, y, z, w).
+fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let (u, w) = ([q[0], q[1], q[2]], q[3]);
+    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let t = cross(u, v).map(|c| 2.0 * c);
+    let c = cross(u, t);
+    [v[0] + w * t[0] + c[0], v[1] + w * t[1] + c[1], v[2] + w * t[2] + c[2]]
+}
+
+fn barriers_of(space: [u8; 8]) -> Vec<Barrier> {
+    use super::combat::{LEVEL_COMBUSTION, LEVEL_DYSON, LEVEL_FISSION, LEVEL_GAUSS};
+    let text = match u64::from_le_bytes(space) {
+        LEVEL_GAUSS => include_str!("data/combat_gauss_barriers.txt"),
+        LEVEL_DYSON => include_str!("data/combat_dyson_barriers.txt"),
+        LEVEL_FISSION => include_str!("data/combat_fission_barriers.txt"),
+        LEVEL_COMBUSTION => include_str!("data/combat_combustion_barriers.txt"),
+        _ if space == AREA => include_str!("data/lobby_combat_barriers.txt"),
+        _ => "",
+    };
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let n = |i: usize| f.get(i).and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.0);
+            Some(Barrier {
+                pool: f.first()?.parse().ok()?,
+                handle: f.get(1)?.parse().ok()?,
+                max: f.get(2)?.parse().ok()?,
+                respawn: f.get(3)?.parse().ok()?,
+                pos: [n(4), n(5), n(6)],
+                rot: if f.len() > 10 { [n(7), n(8), n(9), n(10)] } else { [0.0, 0.0, 0.0, 1.0] },
+                half: [n(11), n(12), n(13)],
+                off_z: n(14),
+            })
+        })
+        .collect()
+}
+
+fn barrier_event(handle: u16) -> [u8; 24] {
+    super::msg::component_event(BARRIER_EVENT, BARRIER_MODULE, handle, super::msg::FILTER_ALL_ALT)
+}
+/// OVERCHARGE (the user's spec, 2026-11-16): the user and linked teammates
+/// take 25% less damage; linked teammates cannot die for 8 s from their first
+/// link, until the link breaks or they leave.
+const OVERCHARGE_DR: f32 = 0.25;
+/// DOT FIELD's time on the ground (the user's choice, 2026-11-16; stock 8 s).
+const DOT_LIFETIME: Duration = Duration::from_secs(11);
+const CHEAT_DEATH: Duration = Duration::from_secs(8);
+
+/// How long an OVERCHARGE boost lasts (`ability_properties.buff.dr_duration`).
+fn overcharge_duration() -> Duration {
+    let secs = weapons().pointer("/ability_properties/buff/dr_duration").and_then(Value::as_f64).unwrap_or(10.0);
+    Duration::from_secs_f64(secs.clamp(1.0, 60.0))
+}
 /// A player's damageable id is this with its low byte xor the slot.
 const PLAYER_ID: [u8; 8] = [0xf2, 0x34, 0xd5, 0x09, 0x99, 0x74, 0x11, 0x3f];
 const NO_PLAYER: [u8; 8] = [0xff; 8];
@@ -111,6 +249,8 @@ const DAMAGEABLE: [u8; 8] = [0x8e, 0xc2, 0x1d, 0x00, 0xd3, 0x15, 0x99, 0x3f];
 /// A dead player's client asks to respawn after 6.5 s; if it never does, the
 /// server brings them back itself.
 const RESPAWN_AFTER: Duration = Duration::from_secs(10);
+/// A match: native respawns the dead 6.65 s after the kill (Gauss recording).
+const MATCH_RESPAWN: Duration = Duration::from_millis(6650);
 /// Gear stations: eight sets of fifteen bits, one bit per player slot.
 const STATIONS: u32 = 8;
 const STATION_SLOTS: u32 = 15;
@@ -122,6 +262,28 @@ const DUMMIES: &[([f32; 3], u32)] = &[
     ([50.26, 4.91, -8.09], 0x16),
 ];
 const DUMMY_RADIUS: f32 = 0.8;
+/// A match's war rooms' twelve training dummies (the war room level's
+/// damageables, `0bef8d109eafa108`, pool slots 0..11): their bodies, 1.3 m over
+/// the actors' places (bullets hit them 1.2-1.4 m up), and their pool slot,
+/// which markers name (`[slot u32][1]`, in the war room's space).
+const WAR_ROOM_DUMMIES: &[[f32; 3]] = &[
+    [205.675, -9.571, -187.111],
+    [195.879, -6.424, -182.117],
+    [210.663, -9.635, -204.388],
+    [203.512, -9.565, -213.805],
+    [181.457, -13.832, -200.085],
+    [185.552, -7.452, -211.445],
+    [-168.535, -13.832, 199.912],
+    [-146.802, -9.694, 185.853],
+    [-139.36, -9.329, 195.551],
+    [-144.683, -9.479, 213.064],
+    [-164.103, -7.412, 188.919],
+    [-153.959, -6.095, 217.622],
+];
+const WAR_ROOM_DUMMY_RADIUS: f32 = 0.5;
+/// A hit code with this bit is a war room dummy's (its marker goes in the war
+/// room's space).
+const WAR_ROOM_CODE: u32 = 1 << 31;
 const PLAYER_CODE: u32 = 0x17;
 /// OVERCHARGE's heal bubble (`HealBubbleParamUpdate` bytes 8..16: heal 3, 10 s, radius 12).
 const OVERCHARGE_BUBBLE: [u8; 8] = [0x41, 0xe3, 0x5b, 0x49, 0x67, 0x32, 0x83, 0xb9];
@@ -130,9 +292,6 @@ const FULL_HEALTH: f32 = 112.0;
 /// The position native reports is the body's, a little lower.
 const BODY_DROP: f32 = 0.35;
 const BODY_RADIUS: f32 = 0.3;
-/// How far from a body's reported point a bullet's hit point may be (head
-/// to feet, arms out).
-const SHOT_REACH: f32 = 1.2;
 /// A player's health and what last hurt them, as `DamageableHealthBroadcast`
 /// carries it: `[owner][u32 0][health][7.0][kind u32][u32 0][ffffffff until hurt]
 /// [hit position][12 zero][cause]`. Native keeps the last hurt's fields.
@@ -195,6 +354,7 @@ fn cooldown(item: [u8; 8]) -> Duration {
         ITEM_DET => "det",
         ITEM_STUN => "stun",
         ITEM_DOT => "dot",
+        ITEM_DRONE => "drone",
         [0xe9, 0xed, 0x9c, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8] => "burst",
         _ => "",
     };
@@ -203,9 +363,15 @@ fn cooldown(item: [u8; 8]) -> Duration {
 }
 
 fn lifetime(item: [u8; 8]) -> Duration {
+    if item == ITEM_DRONE {
+        // Natively the drone flies its lifetime (20 s) before it is used up.
+        let secs = weapons().pointer("/grenade_properties/drone/lifetime").and_then(Value::as_f64).unwrap_or(20.0);
+        return Duration::from_secs_f64(secs.clamp(1.0, 600.0));
+    }
     match item {
         [0xbe, 0x0b, 0x67, 0x29, 0x48, 0x3e, 0xc3, 0xc8] => Duration::from_secs(6),
-        [0xfe, 0xed, 0x94, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8] => Duration::from_secs(8),
+        // DOT FIELD: grenade_properties.dot.lifetime (11 s, the user's choice; stock 8).
+        ITEM_DOT => DOT_LIFETIME,
         _ => Duration::from_millis(120),
     }
 }
@@ -229,6 +395,7 @@ pub fn handles(ty: u64) -> bool {
         PLAYER_RESPAWN,
         PLAYER_RESPAWN_COMPLETE,
         DEPOSIT_MAGAZINE,
+        AUTO_TARGET_FIRE,
     ]
     .contains(&ty)
 }
@@ -283,7 +450,16 @@ struct Drain {
     left: u32,
 }
 
+/// What the match stats credit: damage that landed and kills.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Credit {
+    Damage { by: Option<SocketAddr>, victim: SocketAddr, amount: f32 },
+    Kill { by: Option<SocketAddr>, victim: SocketAddr },
+}
+
 pub struct Gear {
+    /// Damage and kills since the session last took them (match stats).
+    pub credits: Vec<Credit>,
     bits: [[u8; 4]; BITS],
     mags: HashMap<[u8; 8], Mag>,
     later: Vec<(Instant, SocketAddr, Out)>,
@@ -307,6 +483,24 @@ pub struct Gear {
     /// Walked out (the client's area-leave event): stations freed at this time
     /// unless the player walks back in first.
     leaving: HashMap<SocketAddr, Instant>,
+    /// Clients that sent a combat-area event: their walking out is known from
+    /// the leave event, not guessed from a loadout number.
+    area_events: HashSet<SocketAddr>,
+    /// Health of the area's damageables we have seen hit (barriers), by target id.
+    area_health: HashMap<[u8; 8], f32>,
+    /// The space's barriers (level data) and when broken ones come back.
+    barriers: Vec<Barrier>,
+    respawns: Vec<(Instant, [u8; 8], Barrier)>,
+    /// OVERCHARGE users and until when their boost lasts (PowerBoost: their gun
+    /// hits deal more, the hits they take less).
+    boosted: HashMap<SocketAddr, Instant>,
+    /// Teammates an OVERCHARGE bubble linked, and when their cheat death ends.
+    links: HashMap<SocketAddr, Instant>,
+    /// The space combat objects live in: the lobby's combat area, or a combat
+    /// map's level (native's Gauss server uses the level's id).
+    space: [u8; 8],
+    /// A combat match: everyone is in combat, and the server respawns the dead.
+    in_match: bool,
 }
 
 fn arr8(d: &[u8], o: usize) -> [u8; 8] {
@@ -338,6 +532,7 @@ impl Gear {
             }
         }
         Self {
+            credits: Vec::new(),
             bits,
             mags: HashMap::new(),
             later: Vec::new(),
@@ -352,7 +547,32 @@ impl Gear {
             inside: Vec::new(),
             left: HashMap::new(),
             leaving: HashMap::new(),
+            area_events: HashSet::new(),
+            area_health: HashMap::new(),
+            barriers: barriers_of(AREA),
+            respawns: Vec::new(),
+            boosted: HashMap::new(),
+            links: HashMap::new(),
+            space: AREA,
+            in_match: false,
         }
+    }
+
+    /// A combat match on `level`: its space, everyone in combat.
+    pub fn set_match(&mut self, level: u64) {
+        self.space = level.to_le_bytes();
+        self.barriers = barriers_of(self.space);
+        self.in_match = true;
+    }
+
+    /// In combat: the lobby's combat area, or anywhere in a match.
+    fn in_combat(&self, who: &SocketAddr) -> bool {
+        self.in_match || self.inside.contains(who)
+    }
+
+    /// Whether a player is alive (not dead and waiting to respawn).
+    pub fn alive(&self, who: SocketAddr) -> bool {
+        !self.lives.get(&who).is_some_and(|l| l.dead)
     }
 
     /// A punch stuns only when the puncher is in the combat area.
@@ -364,7 +584,7 @@ impl Gear {
     /// body's position) in the brawler room. Native lifts the lobby's cease
     /// fire (`VAR_HOLD` 0) for them there; without it they cannot punch.
     pub fn may_fight(&self, who: SocketAddr) -> bool {
-        self.inside.contains(&who) || self.bodies.get(&who).is_some_and(|(_, p)| in_brawler_room(*p))
+        self.in_combat(&who) || self.bodies.get(&who).is_some_and(|(_, p)| in_brawler_room(*p))
     }
 
     /// The player's last body position, if known.
@@ -382,7 +602,7 @@ impl Gear {
     }
 
     fn bitfield(&self) -> Vec<u8> {
-        let mut b = AREA.to_vec();
+        let mut b = self.space.to_vec();
         for (i, v) in self.bits.iter().enumerate() {
             b.extend_from_slice(v);
             b.extend_from_slice(&(i as u32).to_le_bytes());
@@ -398,7 +618,7 @@ impl Gear {
         let pos = transform(d);
         if d[4..8] == BODY_OBJECT {
             self.bodies.insert(from, (u16::from_le_bytes([d[0], d[1]]), pos));
-        } else if d[4..8] == AREA_OBJECT {
+        } else if d[4..8] == self.space[..4] {
             self.thrown_at.insert(from, pos);
         }
     }
@@ -414,6 +634,8 @@ impl Gear {
         self.inside.retain(|a| *a != who);
         self.left.remove(&who);
         self.leaving.remove(&who);
+        self.boosted.remove(&who);
+        self.links.remove(&who);
         // The leaver itself is gone: these go to the others.
         outs.into_iter().map(|o| Out { to: To::Others, ..o }).collect()
     }
@@ -423,7 +645,7 @@ impl Gear {
         let mut v = Vec::new();
         for (a, (slot, p)) in &self.bodies {
             // Only players in the combat area can be hit (no stun or damage in the lobby).
-            if !self.inside.contains(a) {
+            if !self.in_combat(a) {
                 continue;
             }
             let d = dist(at, *p);
@@ -433,10 +655,18 @@ impl Gear {
                 v.push((id, [p[0], p[1] - BODY_DROP, p[2]], d, Some(*a), PLAYER_CODE));
             }
         }
-        for (p, code) in DUMMIES {
+        // The lobby's training dummies (none in a match).
+        for (p, code) in DUMMIES.iter().filter(|_| !self.in_match) {
             let d = dist(at, *p);
             if d <= radius + DUMMY_RADIUS {
                 v.push((NO_PLAYER, *p, d, None, *code));
+            }
+        }
+        // A match's war room dummies.
+        for (i, p) in WAR_ROOM_DUMMIES.iter().enumerate().filter(|_| self.in_match) {
+            let d = dist(at, *p);
+            if d <= radius + WAR_ROOM_DUMMY_RADIUS {
+                v.push((NO_PLAYER, *p, d, None, WAR_ROOM_CODE | i as u32));
             }
         }
         v
@@ -444,19 +674,202 @@ impl Gear {
 
     /// Damage to a player: their new health to everyone, and `PlayerKilled` at 0.
     /// A player's slot, from their body physics.
-    fn slot_of(&self, who: &SocketAddr) -> u32 {
+    pub fn slot_of(&self, who: &SocketAddr) -> u32 {
         self.bodies.get(who).map_or(0, |b| u32::from(b.0))
     }
 
-    /// The player whose body is nearest a bullet's hit point (not the shooter).
-    fn shot_player(&self, shooter: SocketAddr, at: [f32; 3]) -> Option<SocketAddr> {
-        self.bodies
+    /// The player a damageable id names (`PLAYER_ID` with the low byte xor
+    /// their slot), in the combat area.
+    fn player_by_id(&self, id: [u8; 8]) -> Option<SocketAddr> {
+        if id[1..] != PLAYER_ID[1..] {
+            return None;
+        }
+        let slot = u16::from(id[0] ^ PLAYER_ID[0]);
+        self.bodies.iter().find(|(a, (s, _))| *s == slot && self.in_combat(a)).map(|(a, _)| *a)
+    }
+
+    /// OVERCHARGE's bonus on a gun hit by `shooter` (PowerBoost): +body, or +head
+    /// on body part 5, while the user's own boost lasts (linked teammates get
+    /// no bonus).
+    fn overcharge_bonus(&self, shooter: SocketAddr, part: u64, now: Instant) -> f32 {
+        if !self.boosted.get(&shooter).is_some_and(|t| *t > now) || self.links.contains_key(&shooter) {
+            return 0.0;
+        }
+        let b = |k: &str, def: f64| weapons().pointer(&format!("/ability_properties/buff/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32;
+        if part == 5 { b("damage_bonus_head", 2.0) } else { b("damage_bonus_body", 1.0) }
+    }
+
+    /// A client's `DamageableDamageDealt`: `[space 8][target id 8][amount f32]
+    /// [body u8 + pad][type 8]`. EchoCombat's OVERCHARGE (PowerBoost) sends its
+    /// use and its links as negative amounts: -(1,000,000 + dr permille * 1000 +
+    /// seconds), +2,000,000 for a link, +2,000,000 more when the buff carries
+    /// cheat death; -(6,000,000 + ...) ends a link.
+    fn damage_dealt(&mut self, from: SocketAddr, d: &[u8], now: Instant) {
+        let amount = f32::from_le_bytes(d[16..20].try_into().expect("4"));
+        let marker = -amount;
+        if !(1_000_000.0..7_000_000.0).contains(&marker) {
+            debug!(%from, amount, "client damage dealt (not a marker)");
+            return;
+        }
+        let id = arr8(d, 8);
+        let Some(target) = self.player_by_id(id).or_else(|| (id[1..] == PLAYER_ID[1..]).then_some(from)) else {
+            return;
+        };
+        let m = marker as u32;
+        if (6_000_000..7_000_000).contains(&m) {
+            info!(%from, %target, "OVERCHARGE link broken");
+            self.links.remove(&target);
+            self.boosted.remove(&target);
+            return;
+        }
+        let link = (2_000_000..3_000_000).contains(&m) || (4_000_000..5_000_000).contains(&m);
+        if link && target != from {
+            // Cheat death runs from the first link of this use.
+            let ends = self.links.get(&target).copied().filter(|t| *t > now).unwrap_or(now + CHEAT_DEATH);
+            info!(%from, %target, "OVERCHARGE linked: damage cut, cannot die for 8 s");
+            self.links.insert(target, ends);
+        } else {
+            info!(%from, "OVERCHARGE use marker");
+        }
+        self.boosted.insert(target, now + overcharge_duration());
+    }
+
+    /// What a hit on `who` really costs after OVERCHARGE: 25% off while boosted
+    /// or linked, and a linked teammate is left at 1 health instead of dying.
+    fn after_overcharge(&self, who: SocketAddr, amount: f32, health: f32, now: Instant) -> f32 {
+        let mut a = amount;
+        if self.boosted.get(&who).is_some_and(|t| *t > now) {
+            a *= 1.0 - OVERCHARGE_DR;
+        }
+        if self.links.get(&who).is_some_and(|t| *t > now) && health - a < 1.0 {
+            a = (health - 1.0).max(0.0);
+        }
+        a
+    }
+
+    /// A new round: every barrier back at full health (native Dyson, between
+    /// its rounds: the respawn event for all, `DealDamage` max for all, the
+    /// event for all again, in one frame).
+    pub fn restore_barriers(&mut self) -> Vec<(SocketAddr, Out)> {
+        self.respawns.clear();
+        let anyone = SocketAddr::from(([0, 0, 0, 0], 0));
+        let all = self.barriers.clone();
+        let target = |b: &Barrier| {
+            let mut t = [0u8; 8];
+            t[..2].copy_from_slice(&b.pool.to_le_bytes());
+            t[4] = 1;
+            t
+        };
+        let mut v = Vec::new();
+        for b in &all {
+            v.push((anyone, out(To::All, COMPONENT_EVENT, &barrier_event(b.handle))));
+        }
+        for b in &all {
+            self.area_health.insert(target(b), b.max);
+            v.push((anyone, self.deal(target(b), b.max)));
+        }
+        let echo = Instant::now() + RESPAWN_ECHO_AFTER;
+        for b in &all {
+            self.later.push((echo, anyone, out(To::All, COMPONENT_EVENT, &barrier_event(b.handle))));
+        }
+        v
+    }
+
+    /// The barriers that are down now (their net handles).
+    pub fn barriers_down(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self
+            .area_health
             .iter()
-            .filter(|(a, _)| **a != shooter && self.inside.contains(a))
-            .map(|(a, (_, p))| (*a, dist(at, [p[0], p[1] - BODY_DROP, p[2]])))
-            .filter(|(_, d)| *d <= SHOT_REACH)
-            .min_by(|x, y| x.1.total_cmp(&y.1))
-            .map(|(a, _)| a)
+            .filter(|(t, h)| **h <= 0.0 && t[4..8] == HANDLE_KIND)
+            .filter_map(|(t, _)| self.barrier(*t).map(|b| b.handle))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn barrier(&self, target: [u8; 8]) -> Option<Barrier> {
+        let pool = u16::from_le_bytes([target[0], target[1]]);
+        self.barriers.iter().find(|b| b.pool == pool).copied()
+    }
+
+    fn deal(&self, target: [u8; 8], health: f32) -> Out {
+        let mut b = self.space.to_vec();
+        b.extend_from_slice(&target);
+        b.extend_from_slice(&health.to_le_bytes());
+        b.extend_from_slice(&0f32.to_le_bytes());
+        out(To::All, DEAL_DAMAGE, &b)
+    }
+
+    /// A bullet on one of the space's barriers: its health down, then native's
+    /// `DealDamage` to everyone. At 0 native follows with the break event a
+    /// frame later (`ComponentEvent`, `DealDamage` 0, then another
+    /// `ComponentEvent` the frame after: the barrier drops and stops bullets
+    /// no more), and after the level's respawn time the same with full health
+    /// (exactly 30 s in the Gauss and Dyson recordings). A broken one takes no
+    /// more.
+    fn hit_barrier(&mut self, from: SocketAddr, target: [u8; 8], amount: f32, now: Instant) -> Vec<Out> {
+        let known = self.barrier(target);
+        let max = known.map_or(BARRIER_HEALTH, |b| b.max);
+        let health = self.area_health.entry(target).or_insert(max);
+        if *health <= 0.0 || amount <= 0.0 {
+            return Vec::new();
+        }
+        *health = (*health - amount).max(0.0);
+        let left = *health;
+        let v = vec![self.deal(target, left)];
+        if left > 0.0 {
+            info!(%from, barrier = %hex8(target), amount, left, "barrier hit");
+            return v;
+        }
+        info!(%from, barrier = %hex8(target), "barrier destroyed");
+        if let Some(b) = known {
+            let ev = barrier_event(b.handle);
+            let zero = self.deal(target, 0.0);
+            self.later.push((now + BREAK_EVENT_AFTER, from, out(To::All, COMPONENT_EVENT, &ev)));
+            self.later.push((now + BREAK_EVENT_AFTER, from, zero));
+            self.later.push((now + BREAK_ECHO_AFTER, from, out(To::All, COMPONENT_EVENT, &ev)));
+            if b.respawn > 0.0 {
+                self.respawns.push((now + Duration::from_secs_f32(b.respawn), target, b));
+            }
+        }
+        v
+    }
+
+    /// An explosion's reach into the barriers: native (Dyson's dets) sends each
+    /// one it reaches its `DealDamage`, then `ExplosionPlayerDamage` with no
+    /// victim at the barrier's point nearest the blast, the break a frame later
+    /// as for bullets. `table` is the damage table's entry (its `barrier`
+    /// multiplier: det 2.15, rocket 2), `damage` the blast's at a distance.
+    fn splash_barriers(&mut self, from: SocketAddr, kind: [u8; 8], id: [u8; 8], at: [f32; 3], reach: f32, table: &str, damage: &dyn Fn(f32) -> f32, now: Instant) -> Vec<Out> {
+        let w = if self.in_match { combat_weapons() } else { weapons() };
+        let scale = w.pointer(&format!("/damage_table/{table}/barrier")).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+        if scale <= 0.0 {
+            return Vec::new();
+        }
+        let mut hit: Vec<(Barrier, [f32; 3], f32)> = self
+            .barriers
+            .iter()
+            .filter_map(|b| b.nearest(at).filter(|(_, d)| *d <= reach).map(|(p, d)| (*b, p, d)))
+            .collect();
+        hit.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let mut v = Vec::new();
+        for (b, p, d) in hit {
+            let mut target = [0u8; 8];
+            target[..2].copy_from_slice(&b.pool.to_le_bytes());
+            target[4] = 1;
+            if self.area_health.get(&target).is_some_and(|h| *h <= 0.0) {
+                continue;
+            }
+            let amount = damage(d) * scale;
+            if amount <= 0.0 {
+                continue;
+            }
+            info!(%from, barrier = b.handle, distance = d, amount, "explosion reached a barrier");
+            v.extend(self.hit_barrier(from, target, amount, now));
+            v.push(out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&self.space, kind, p, NO_PLAYER, id)));
+        }
+        v
     }
 
     fn hurt(&mut self, who: SocketAddr, amount: f32, kind: u32, pos: [f32; 3], cause: [u8; 8], by: Option<SocketAddr>) -> Vec<Out> {
@@ -464,11 +877,15 @@ impl Gear {
         let owner = self.bubble_owner.get(&who).copied().unwrap_or(DAMAGEABLE);
         let slot = self.slot_of(&who);
         let killer = by.map_or(slot, |a| self.slot_of(&a));
+        let health = self.lives.get(&who).map_or(FULL_HEALTH, |l| l.health);
+        let amount = self.after_overcharge(who, amount, health, Instant::now());
         let life = self.lives.entry(who).or_default();
         if life.dead || amount <= 0.0 {
             return Vec::new();
         }
+        let before = life.health;
         life.health = (life.health - amount).max(0.0);
+        let landed = before - life.health;
         life.hurt = Some((kind, pos, cause));
         life.lost_at = Some(Instant::now());
         life.regen_at = None;
@@ -477,23 +894,28 @@ impl Gear {
             life.dead = true;
             life.died_at = Some(Instant::now());
             info!(%who, cause = %hex8(cause), "player killed");
+            self.credits.push(Credit::Kill { by: by.filter(|a| *a != who), victim: who });
             // `[id][cause][victim slot][killer slot]` (Gauss match).
             v.push(out(To::All, PLAYER_KILLED, &[owner.as_slice(), &cause, &slot.to_le_bytes(), &killer.to_le_bytes()].concat()));
         }
         let life = *life;
+        if landed > 0.0 {
+            self.credits.insert(self.credits.len() - usize::from(life.dead), Credit::Damage { by: by.filter(|a| *a != who), victim: who, amount: landed });
+        }
         v.push(out(To::All, HEALTH_BROADCAST, &health_body(owner, slot, &life, false)));
         v
     }
 
     /// One explosion: `ExplosionPlayerDamage` per victim, else `NothingHit`.
     fn explode(&self, kind: [u8; 8], id: [u8; 8], at: [f32; 3], radius: f32) -> (Vec<Out>, Vec<Hit>) {
+        let space = self.space;
         let hits = self.victims(at, radius);
         info!(kind = %hex8(kind), x = at[0], y = at[1], z = at[2], radius, hits = hits.len(), "explosion");
         if hits.is_empty() {
-            let b = [AREA.as_slice(), &kind, &id].concat();
+            let b = [space.as_slice(), &kind, &id].concat();
             return (vec![out(To::All, EXPLOSION_NOTHING_HIT, &b)], hits);
         }
-        let outs = hits.iter().map(|(victim, pos, ..)| out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(kind, *pos, *victim, id))).collect();
+        let outs = hits.iter().map(|(victim, pos, ..)| out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, kind, *pos, *victim, id))).collect();
         (outs, hits)
     }
 
@@ -529,6 +951,9 @@ impl Gear {
     /// around these, newer ones did not: a player who walked out stayed in
     /// combat mode (stun, block and gear outside the brawler room).
     pub fn area_event(&mut self, from: SocketAddr, sym: u64, now: Instant) -> Vec<Out> {
+        if matches!(sym, AREA_ENTER_EVENT | AREA_LEAVE_EVENT) {
+            self.area_events.insert(from);
+        }
         match sym {
             AREA_ENTER_EVENT => {
                 self.leaving.remove(&from);
@@ -543,6 +968,11 @@ impl Gear {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Whether this client reports the combat-area edge itself.
+    pub fn sends_area_events(&self, who: SocketAddr) -> bool {
+        self.area_events.contains(&who)
     }
 
     /// A player walked out of the combat area (the client then sends its loadout
@@ -583,9 +1013,10 @@ impl Gear {
 
     /// Replies to one client message.
     pub fn on_message(&mut self, from: SocketAddr, ty: u64, d: &[u8], now: Instant) -> Vec<Out> {
+        let space = self.space;
         match ty {
             TELEPORT_REQUEST => vec![out(To::Sender, TELEPORT, d)],
-            BITFIELD_REQUEST if d.len() == 8 && d == AREA => vec![out(To::Sender, BITFIELD_RESPONSE, &self.bitfield())],
+            BITFIELD_REQUEST if d.len() == 8 && d == self.space => vec![out(To::Sender, BITFIELD_RESPONSE, &self.bitfield())],
             SET_BITS if d.len() == 8 => {
                 let i = u32::from_le_bytes(d[4..8].try_into().expect("4")) as usize;
                 if let Some(b) = self.bits.get_mut(i) {
@@ -610,6 +1041,7 @@ impl Gear {
                 let left = ((b("dr_duration", 10.0) / every).ceil() as u32).saturating_sub(1);
                 self.drains.retain(|x| x.who != from);
                 self.drains.push(Drain { who: from, owner: arr8(d, 0), next: now + Duration::from_secs_f32(every), left });
+                self.boosted.insert(from, now + overcharge_duration());
                 info!(%from, ticks = left, "OVERCHARGE on");
                 vec![out(To::Others, ty, d)]
             }
@@ -655,21 +1087,58 @@ impl Gear {
                 vec![out(To::All, ty, d)]
             }
             ABILITY_ACTIVATE | HEAL_BUBBLE_PARAMS => vec![out(To::All, ty, d)],
+            // `[gun 8][direction 12][hit point 12][target 8][target space u32]
+            // [damage f32][body part u8 + pad][shooter 8]`: the target is what
+            // the shooter's client hit (native `NetBulletCollisionCB` damages
+            // exactly it), a player's id in the body space or a pool handle in
+            // the area's.
             BULLET_COLLISION if d.len() == 64 => {
                 self.using_gear(from, now);
-                let marker = tracked_damage(d);
-                let mut v = vec![out(To::Sender, TRACKED_DAMAGE, &marker)];
-                // The collision names the gun and the shooter, not the victim:
-                // whoever's body is at the hit point takes the damage.
                 let at = f3(d, 20);
-                if let Some(victim) = self.shot_player(from, at) {
-                    let amount = f32::from_le_bytes(marker[16..20].try_into().expect("4"));
-                    let part = u32::from_le_bytes(d[48..52].try_into().expect("4"));
-                    info!(%from, %victim, amount, part, "shot hit a player");
-                    v.extend(self.hurt(victim, amount, part, at, arr8(d, 0), Some(from)));
+                let target = arr8(d, 32);
+                let part = u64::from(d[48]);
+                let table = if self.in_match { combat_weapons() } else { weapons() };
+                let mut marker = tracked_damage(table, &space, d);
+                let amount = f32::from_le_bytes(marker[16..20].try_into().expect("4")) + self.overcharge_bonus(from, part, now);
+                marker[16..20].copy_from_slice(&amount.to_le_bytes());
+                if d[40..44] == WAR_ROOM_SPACE[..4] {
+                    return vec![out(To::Sender, TRACKED_DAMAGE, &tracked_damage(combat_weapons(), &WAR_ROOM_SPACE, d))];
                 }
-                v
+                // In a match native marks nothing itself: the shooter's client does.
+                let mark = !self.in_match;
+                if d[40..44] == BODY_OBJECT {
+                    let mut v = if mark { vec![out(To::Sender, TRACKED_DAMAGE, &marker)] } else { Vec::new() };
+                    match self.player_by_id(target).filter(|a| *a != from) {
+                        Some(victim) => {
+                            info!(%from, %victim, amount, part, "shot hit a player");
+                            v.extend(self.hurt(victim, amount, part as u32, at, arr8(d, 0), Some(from)));
+                        }
+                        None => debug!(%from, target = %hex8(target), "shot hit a player not in the area"),
+                    }
+                    return v;
+                }
+                let index = u32::from(u16::from_le_bytes([target[0], target[1]]));
+                let dummy = DUMMIES.iter().any(|(_, c)| *c == index);
+                if d[40..44] == space[..4] && target[4..8] == HANDLE_KIND && !dummy && (part == PART_BARRIER || self.barrier(target).is_some()) {
+                    return self.hit_barrier(from, target, amount, now);
+                }
+                if d[40..44] == space[..4] && self.mags.contains_key(&target) {
+                    let health = self.area_health.entry(target).or_insert(ORDNANCE_HEALTH);
+                    *health = (*health - amount).max(0.0);
+                    let left = *health;
+                    return vec![self.deal(target, left)];
+                }
+                if mark {
+                    vec![out(To::Sender, TRACKED_DAMAGE, &marker)]
+                } else {
+                    Vec::new()
+                }
             }
+            DAMAGE_DEALT if d.len() >= 20 => {
+                self.damage_dealt(from, d, now);
+                Vec::new()
+            }
+            AUTO_TARGET_FIRE => vec![out(To::Others, ty, d)],
             ACTIVATE_EXPLOSION if d.len() == 40 => {
                 let kind = arr8(d, 8);
                 let at = f3(d, 16);
@@ -695,12 +1164,20 @@ impl Gear {
                     (1.0, MARK_ROCKET, Box::new(|_| 0.0))
                 };
                 let (mut v, hits) = self.explode(kind, id, at, radius);
+                // Rockets break barriers too (rocket_aoe's barrier 2); COMET's
+                // blast does not (scout_aoe's 0).
+                let table = if comet { "scout_aoe" } else { "rocket_aoe" };
+                let walls = self.splash_barriers(from, kind, id, at, radius + BODY_RADIUS, table, &*damage, now);
+                if !walls.is_empty() && hits.is_empty() {
+                    v.retain(|o| o.ty != EXPLOSION_NOTHING_HIT);
+                }
+                v.extend(walls);
                 for (_, pos, dd, who, code) in hits {
                     let own = who == Some(from);
                     let amount = damage(dd) * if own { own_scale } else { 1.0 };
                     // Native marks hits on others; a self-hit only costs health.
                     if !own {
-                        v.push(out(To::Sender, TRACKED_DAMAGE, &marker(mark, amount, pos, code)));
+                        v.push(out(To::Sender, TRACKED_DAMAGE, &marker(&space, mark, amount, pos, code)));
                     }
                     if let Some(a) = who {
                         v.extend(self.hurt(a, amount, HURT_EXPLOSION, pos, mark, Some(from)));
@@ -731,12 +1208,19 @@ impl Gear {
                         hits.sort_by(|x, y| x.2.total_cmp(&y.2));
                         if !hits.is_empty() {
                             o.truncate(0);
-                            o.push(out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(EX_DET, hits[0].1, hits[0].0, id)));
+                            o.push(out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, EX_DET, hits[0].1, hits[0].0, id)));
+                        }
+                        // Barriers: native's dets broke Dyson's 101s outright
+                        // (65 x 2.15) and left one 2 m off at 4 (97 taken).
+                        let walls = self.splash_barriers(thrower, EX_DET, id, at, radius.max(DET_BARRIER_REACH), "det", &det_barrier_falloff, now);
+                        if !walls.is_empty() && hits.is_empty() {
+                            o.retain(|x| x.ty != EXPLOSION_NOTHING_HIT);
                         }
                         v.extend(o);
+                        v.extend(walls);
                         for (_, pos, _, who, code) in hits {
                             if who != Some(thrower) {
-                                self.later.push((now, thrower, out(To::Sender, TRACKED_DAMAGE, &marker(ITEM_DET, DET_DAMAGE, pos, code))));
+                                self.later.push((now, thrower, out(To::Sender, TRACKED_DAMAGE, &marker(&space, ITEM_DET, DET_DAMAGE, pos, code))));
                             }
                             if let Some(a) = who {
                                 v.extend(self.hurt(a, DET_DAMAGE, HURT_ORDNANCE, pos, ITEM_DET, Some(thrower)));
@@ -780,6 +1264,7 @@ impl Gear {
 
     /// Replies whose time has come, with the client each `To` is relative to.
     pub fn due(&mut self, now: Instant) -> Vec<(SocketAddr, Out)> {
+        let space = self.space;
         let mut ready = Vec::new();
         let gone: Vec<SocketAddr> = self.leaving.iter().filter(|(_, t)| **t <= now).map(|(a, _)| *a).collect();
         for a in gone {
@@ -810,15 +1295,22 @@ impl Gear {
             }
             self.drains.retain(|d| d.left > 0);
         }
-        // A dead player whose client never asked to respawn.
+        // A dead player whose client never asked to respawn. In a match the
+        // server respawns everyone (native: `PlayerRespawn [damageable 8]
+        // [slot u32][0 u32]` 6.65 s after each kill in the Gauss recording).
+        let wait = if self.in_match { MATCH_RESPAWN } else { RESPAWN_AFTER };
         let stuck: Vec<SocketAddr> =
-            self.lives.iter().filter(|(_, l)| l.dead && l.died_at.is_some_and(|t| now.duration_since(t) > RESPAWN_AFTER)).map(|(a, _)| *a).collect();
+            self.lives.iter().filter(|(_, l)| l.dead && l.died_at.is_some_and(|t| now.duration_since(t) > wait)).map(|(a, _)| *a).collect();
         for who in stuck {
             let slot = self.slot_of(&who);
             let owner = self.bubble_owner.get(&who).copied().unwrap_or(DAMAGEABLE);
             if let Some(life) = self.lives.get_mut(&who) {
                 *life = Life::default();
                 info!(%who, "dead player brought back by the server");
+                if self.in_match {
+                    let b = [DAMAGEABLE.as_slice(), &slot.to_le_bytes(), &[0; 4]].concat();
+                    ready.push((who, out(To::All, PLAYER_RESPAWN, &b)));
+                }
                 ready.push((who, out(To::All, HEALTH_BROADCAST, &health_body(owner, slot, life, false))));
             }
         }
@@ -859,9 +1351,9 @@ impl Gear {
                 if f.kind == EX_DOT {
                     let tick = weapons().pointer("/grenade_properties/dot/damage_per_tick").and_then(Value::as_f64).unwrap_or(4.0) as f32;
                     for (victim, pos, _, who, code) in &hits {
-                        ready.push((f.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(f.kind, *pos, *victim, f.mag))));
+                        ready.push((f.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, f.kind, *pos, *victim, f.mag))));
                         if *who != Some(f.thrower) {
-                            ready.push((f.thrower, out(To::Sender, TRACKED_DAMAGE, &marker(ITEM_DOT, tick, *pos, *code))));
+                            ready.push((f.thrower, out(To::Sender, TRACKED_DAMAGE, &marker(&space, ITEM_DOT, tick, *pos, *code))));
                         }
                         if let Some(a) = who {
                             for o in self.hurt(*a, tick, HURT_ORDNANCE, *pos, ITEM_DOT, Some(f.thrower)) {
@@ -873,18 +1365,31 @@ impl Gear {
                 }
                 let fresh: Vec<Hit> = hits.into_iter().filter(|h| !f.hit.contains(&h.0)).collect();
                 if fresh.is_empty() {
-                    ready.push((f.thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[AREA.as_slice(), &f.kind, &f.mag].concat())));
+                    ready.push((f.thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &f.kind, &f.mag].concat())));
                 }
                 for (victim, pos, _, who, _) in fresh {
                     f.hit.push(victim);
-                    ready.push((f.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(f.kind, pos, victim, f.mag))));
+                    ready.push((f.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, f.kind, pos, victim, f.mag))));
                     let target: u64 = if who.is_some() { u64::from(victim[0] ^ PLAYER_ID[0]) } else { 0x0c };
-                    ready.push((f.thrower, out(To::All, STUN_MSG, &[AREA.as_slice(), &target.to_le_bytes()].concat())));
+                    ready.push((f.thrower, out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())));
                 }
             }
         }
         fields.retain(|f| f.until > now);
         self.fields = fields;
+        // Broken barriers whose time is up: native's respawn event, full health.
+        let back: Vec<([u8; 8], Barrier)> = self.respawns.iter().filter(|(t, _, _)| *t <= now).map(|(_, t, b)| (*t, *b)).collect();
+        self.respawns.retain(|(t, _, _)| *t > now);
+        // `To::All` goes to everyone whoever it is relative to.
+        let anyone = SocketAddr::from(([0, 0, 0, 0], 0));
+        for (target, b) in back {
+            info!(barrier = %hex8(target), "barrier respawned");
+            self.area_health.insert(target, b.max);
+            let ev = barrier_event(b.handle);
+            ready.push((anyone, out(To::All, COMPONENT_EVENT, &ev)));
+            ready.push((anyone, self.deal(target, b.max)));
+            self.later.push((now + RESPAWN_ECHO_AFTER, anyone, out(To::All, COMPONENT_EVENT, &ev)));
+        }
         self.later.retain(|(at, from, o)| {
             if *at <= now {
                 ready.push((*from, o.clone()));
@@ -896,10 +1401,17 @@ impl Gear {
         for (_, o) in &ready {
             if o.ty == DESTROY_MAGAZINE && o.body.len() == 8 {
                 self.mags.remove(&arr8(&o.body, 0));
+                self.area_health.remove(&arr8(&o.body, 0));
             }
         }
         ready
     }
+}
+
+/// A combat match's weapon settings (the EchoCombat block every combat level gets).
+fn combat_weapons() -> &'static Value {
+    static W: OnceLock<Value> = OnceLock::new();
+    W.get_or_init(|| serde_json::from_str(super::balance::ECHOCOMBAT_WEAPONS).unwrap_or_default())
 }
 
 /// The weapon settings this server sends (its social block, with the host's changes).
@@ -918,16 +1430,18 @@ fn weapons() -> &'static Value {
 /// Damage-table multiplier for a hit: the weapon is the one whose
 /// `projectile_damage` is the shot's base damage (else SCOUT/COMET, whose
 /// damage falls off), the part from the collision (2 arm, 4 torso, 5 head).
-fn multiplier(base: f32, part: u64) -> f32 {
-    let w = weapons();
+fn multiplier(w: &Value, base: f32, part: u64) -> f32 {
     let weapon = w
         .get("weapon_properties")
         .and_then(Value::as_object)
         .and_then(|m| m.iter().find(|(_, v)| v.get("projectile_damage").and_then(Value::as_f64).is_some_and(|p| (p as f32 - base).abs() < 0.01)))
         .map_or("scout", |(k, _)| k.as_str());
+    // Native's markers (blaster, scout): 0 and 1 legs, 2 and 3 arms, 4 torso, 5 head.
     let part = match part {
-        2 => "arm",
+        0 | 1 => "leg",
+        2 | 3 => "arm",
         5 => "head",
+        6 => "barrier",
         _ => "torso",
     };
     w.pointer(&format!("/damage_table/{weapon}/{part}")).and_then(Value::as_f64).map_or(1.0, |m| m as f32)
@@ -935,12 +1449,12 @@ fn multiplier(base: f32, part: u64) -> f32 {
 
 /// `DamageableLocallyTrackedDamage` for a `DamageableBulletCollision`:
 /// `[area 8][target 8][damage f32][hit point 12][kind u32][count u32]`.
-fn tracked_damage(d: &[u8]) -> Vec<u8> {
+fn tracked_damage(w: &Value, space: &[u8; 8], d: &[u8]) -> Vec<u8> {
     let base = f32::from_le_bytes(d[44..48].try_into().expect("4"));
     let part = u64::from_le_bytes(d[48..56].try_into().expect("8"));
-    let mut b = AREA.to_vec();
+    let mut b = space.to_vec();
     b.extend_from_slice(&d[0..8]);
-    b.extend_from_slice(&(base * multiplier(base, part)).to_le_bytes());
+    b.extend_from_slice(&(base * multiplier(w, base, part)).to_le_bytes());
     b.extend_from_slice(&d[20..40]);
     b
 }
@@ -958,14 +1472,21 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-/// Position in a 64-byte physics update: three 19-bit millimetre fields from bit 267.
-/// The lobby's brawler room (`mpl_lobby_b2`), from a native recording
-/// (2026-11-16): native's cease-fire var dropped to 0 as the player passed
-/// (19.7, 0.5, 10.4) going in and rose to 1 at (22.0, 1.0, 9.7) coming out;
-/// the deepest point was (31.0, 0.2, 15.2). The combat area is at negative z.
+/// The brawler room's dome (`mpl_lobby_b_punch_hex_sphere_a`), measured from
+/// the level model: a sphere centred here with a 7.6 m radius (shell 7.2..7.9).
+const BRAWLER_DOME: [f32; 3] = [26.5, -2.17, 14.15];
+/// The fight zone reaches just past the shell. Native's cease fire flipped
+/// 7.7..8.3 m from the centre at the doorway (2026-11-16 recording), and our
+/// walk along the inside wall stayed within 7.9 m.
+const BRAWLER_RADIUS: f32 = 8.0;
+
+/// Whether a body position is inside the lobby's brawler room dome.
 pub fn in_brawler_room(p: [f32; 3]) -> bool {
-    (19.5..=42.0).contains(&p[0]) && (-3.0..=5.0).contains(&p[1]) && (9.7..=26.0).contains(&p[2])
+    let d: f32 = (0..3).map(|i| (p[i] - BRAWLER_DOME[i]).powi(2)).sum();
+    d <= BRAWLER_RADIUS * BRAWLER_RADIUS
 }
+
+/// Position in a 64-byte physics update: three 19-bit millimetre fields from bit 267.
 
 fn transform(d: &[u8]) -> [f32; 3] {
     let field = |bit: usize| {
@@ -980,8 +1501,8 @@ fn transform(d: &[u8]) -> [f32; 3] {
 }
 
 /// `ExplosionPlayerDamage`: `[area][kind][position 12][u32 0][victim][explosion id]`.
-fn player_damage(kind: [u8; 8], pos: [f32; 3], victim: [u8; 8], id: [u8; 8]) -> Vec<u8> {
-    let mut b = [AREA.as_slice(), &kind].concat();
+fn player_damage(space: &[u8; 8], kind: [u8; 8], pos: [f32; 3], victim: [u8; 8], id: [u8; 8]) -> Vec<u8> {
+    let mut b = [space.as_slice(), &kind].concat();
     for x in pos {
         b.extend_from_slice(&x.to_le_bytes());
     }
@@ -992,8 +1513,9 @@ fn player_damage(kind: [u8; 8], pos: [f32; 3], victim: [u8; 8], id: [u8; 8]) -> 
 }
 
 /// The shooter's hit marker: `LocallyTrackedDamage` naming what dealt it.
-fn marker(what: [u8; 8], damage: f32, pos: [f32; 3], code: u32) -> Vec<u8> {
-    let mut b = [AREA.as_slice(), &what].concat();
+fn marker(space: &[u8; 8], what: [u8; 8], damage: f32, pos: [f32; 3], code: u32) -> Vec<u8> {
+    let (space, code) = if code & WAR_ROOM_CODE != 0 { (&WAR_ROOM_SPACE, code & !WAR_ROOM_CODE) } else { (space, code) };
+    let mut b = [space.as_slice(), &what].concat();
     b.extend_from_slice(&damage.to_le_bytes());
     for x in pos {
         b.extend_from_slice(&x.to_le_bytes());
@@ -1016,6 +1538,12 @@ mod tests {
     }
 
     #[test]
+    fn barrier_event_is_the_recorded_bytes() {
+        // Native Dyson (netrec-dyson-20261116-server, t 290.493): barrier 0xbd.
+        assert_eq!(barrier_event(0xbd).to_vec(), unhex("ff278203989fcc2bc4b6bab2ee99ea6abd000d00ffffffff"));
+    }
+
+    #[test]
     fn entry_health_broadcast_matches_native() {
         // Native lobby recording 2026-11-16, answer to the area-enter event (slot 0).
         let mut g = Gear::new();
@@ -1034,7 +1562,7 @@ mod tests {
             ("be4d8ed1d9c72de3e2ff524223c0d8bf454bebc120332f429d41b23f42a6cac1170000000100000026452bfc0000e0400500000000000000f234d5099974113f",
              "26452bfcf77799cbbe4d8ed1d9c72de30000e04020332f429d41b23f42a6cac11700000001000000"),
         ] {
-            assert_eq!(tracked_damage(&unhex(hit)), unhex(marker));
+            assert_eq!(tracked_damage(weapons(), &AREA, &unhex(hit)), unhex(marker));
         }
     }
 
@@ -1044,7 +1572,9 @@ mod tests {
         let mut g = Gear::new();
         let t0 = Instant::now();
         assert_eq!(AREA_ENTER_EVENT.to_le_bytes(), [0xc0, 0x64, 0x71, 0xff, 0xde, 0x09, 0x5d, 0x63]);
+        assert!(!g.sends_area_events(addr()));
         g.area_event(addr(), AREA_ENTER_EVENT, t0);
+        assert!(g.sends_area_events(addr()), "no loadout-number guess for this client");
         assert!(g.inside.contains(&addr()));
         assert!(g.area_event(addr(), AREA_LEAVE_EVENT, t0).is_empty());
         assert!(g.due(t0 + Duration::from_secs(1)).iter().all(|(_, o)| o.ty != SET_BITS));
@@ -1065,12 +1595,26 @@ mod tests {
     }
 
     #[test]
-    fn brawler_room_matches_where_native_lifted_the_cease_fire() {
-        // Native lobby recording 2026-11-16: positions around the var's flips.
-        for p in [[19.65, 0.49, 10.36], [31.0, 0.16, 15.2], [26.3, 0.95, 11.9], [22.3, 0.98, 9.85]] {
+    fn brawler_room_is_the_dome() {
+        // Native recording 2026-11-16 (deep inside, and the last point before
+        // the var rose), then our walk along the dome's inside wall, where the
+        // old box wrongly put the cease fire back.
+        for p in [
+            [31.0, 0.16, 15.2],
+            [26.3, 0.95, 11.9],
+            [22.3, 0.98, 9.85],
+            [19.14, 0.46, 15.42],
+            [21.86, -1.14, 9.04],
+            [32.76, -1.48, 10.24],
+            [27.42, -1.87, 6.92],
+            [29.8, -1.33, 20.57],
+            [23.18, -1.72, 7.79],
+        ] {
             assert!(in_brawler_room(p), "{p:?}");
         }
-        for p in [[0.0, 2.0, 0.0], [19.09, 0.54, 10.11], [21.31, 0.98, 9.35], [37.0, 1.9, -22.0], [16.6, 1.3, 6.4]] {
+        // Native's doorway point before the var dropped, the lobby, the
+        // combat area, and our way out through the gap.
+        for p in [[0.0, 2.0, 0.0], [19.09, 0.54, 10.11], [37.0, 1.9, -22.0], [16.6, 1.3, 6.4], [20.63, -1.36, 7.96], [14.08, -0.29, 6.87]] {
             assert!(!in_brawler_room(p), "{p:?}");
         }
     }
@@ -1110,7 +1654,7 @@ mod tests {
         // PULSAR head shot: 9 x 1.5 (both from the recording).
         let bc = unhex("9e5b615f8c9cd62f95b2924260e454bd12132ac2fb362f429749c23fcc77cac1170000000100000026452bfc000010410500000000000000f234d5099974113f");
         let want = unhex("26452bfcf77799cb9e5b615f8c9cd62f00005841fb362f429749c23fcc77cac11700000001000000");
-        assert_eq!(tracked_damage(&bc), want);
+        assert_eq!(tracked_damage(weapons(), &AREA, &bc), want);
     }
 
     #[test]
@@ -1165,6 +1709,79 @@ mod tests {
         // Out of range: nothing hit.
         let v = g.on_message(addr(), ACTIVATE_EXPLOSION, &explosion([30.0, 1.2, -23.5]), Instant::now());
         assert_eq!(v[0].ty, EXPLOSION_NOTHING_HIT);
+    }
+
+    #[test]
+    fn barrier_boxes_put_natives_blast_points_on_their_edges() {
+        // Native Dyson 251.401: a det's point on pool 107 (handle 0xba) sat on
+        // its edge, (-0.035, -1.913, 3.074).
+        let b = barriers_of(super::super::combat::LEVEL_DYSON.to_le_bytes()).into_iter().find(|b| b.pool == 107).expect("pool 107");
+        let (p, d) = b.nearest([0.2, -2.5, 3.5]).expect("a box");
+        // (Within the box's 0.26 m depth: native's blast was on its other face.)
+        assert!(dist(p, [-0.035, -1.913, 3.074]) < 0.3, "{p:?}");
+        assert!(d > 0.0);
+        // Inside the box: the point itself.
+        let (_, d) = b.nearest(b.pos).expect("a box");
+        assert!(d < 1e-4);
+    }
+
+    #[test]
+    fn explosions_break_barriers() {
+        use super::super::combat::LEVEL_DYSON;
+        let mut g = Gear::new();
+        g.set_match(LEVEL_DYSON);
+        let t0 = Instant::now();
+        // A METEOR at Dyson's 101-health barriers 106 and 107 (handles 0xb9,
+        // 0xba): 40 x 2 to each it reaches, DealDamage then a victimless
+        // ExplosionPlayerDamage at the barrier.
+        let v = g.on_message(addr(), ACTIVATE_EXPLOSION, &explosion([-2.4, -1.5, 2.3]), t0);
+        assert!(!v.iter().any(|o| o.ty == EXPLOSION_NOTHING_HIT));
+        let deals: Vec<&Out> = v.iter().filter(|o| o.ty == DEAL_DAMAGE).collect();
+        assert_eq!(deals.len(), 2, "{:?}", v.iter().map(|o| o.ty).collect::<Vec<_>>());
+        for d in &deals {
+            assert!([106u8, 107].contains(&d.body[8]));
+            assert_eq!(&d.body[16..20], &21f32.to_le_bytes(), "101 - 80");
+        }
+        let blasts: Vec<&Out> = v.iter().filter(|o| o.ty == EXPLOSION_PLAYER_DAMAGE).collect();
+        assert_eq!(blasts.len(), 2);
+        assert!(blasts.iter().all(|o| o.body[32..40] == NO_PLAYER));
+        // A second one breaks them: the break event a frame later.
+        let v = g.on_message(addr(), ACTIVATE_EXPLOSION, &explosion([-2.4, -1.5, 2.3]), t0);
+        assert!(v.iter().filter(|o| o.ty == DEAL_DAMAGE).all(|o| o.body[16..20] == 0f32.to_le_bytes()));
+        let later = g.due(t0 + Duration::from_millis(11));
+        let events: Vec<u16> = later.iter().filter(|(_, o)| o.ty == COMPONENT_EVENT).map(|(_, o)| u16::from_le_bytes([o.body[16], o.body[17]])).collect();
+        assert!(events.contains(&0xb9) && events.contains(&0xba), "{events:?}");
+        assert_eq!(g.barriers_down(), vec![0xb9, 0xba]);
+        // Down ones take no more; far away, nothing.
+        let v = g.on_message(addr(), ACTIVATE_EXPLOSION, &explosion([-2.4, -1.5, 2.3]), t0);
+        assert!(!v.iter().any(|o| o.ty == DEAL_DAMAGE));
+        let v = g.on_message(addr(), ACTIVATE_EXPLOSION, &explosion([30.0, 10.0, 30.0]), t0);
+        assert_eq!(v.iter().map(|o| o.ty).collect::<Vec<_>>(), [EXPLOSION_NOTHING_HIT]);
+    }
+
+    #[test]
+    fn war_room_dummies_take_splash() {
+        use super::super::combat::LEVEL_GAUSS;
+        let mut g = Gear::new();
+        g.set_match(LEVEL_GAUSS);
+        // A METEOR beside war room dummy 4 (the one native's Gauss bullets hit
+        // at about (181.8, -13.7, -200.4)).
+        let v = g.on_message(addr(), ACTIVATE_EXPLOSION, &explosion([181.8, -13.7, -199.6]), Instant::now());
+        assert_eq!(v[0].ty, EXPLOSION_PLAYER_DAMAGE);
+        let m = v.iter().find(|o| o.ty == TRACKED_DAMAGE).expect("a marker");
+        assert_eq!(&m.body[..8], &WAR_ROOM_SPACE);
+        assert_eq!(&m.body[32..40], &unhex("0400000001000000"));
+        assert!(f32::from_le_bytes(m.body[16..20].try_into().expect("4")) > 0.0);
+    }
+
+    #[test]
+    fn body_parts_match_natives_markers() {
+        // Native war room markers: BLASTER (2) on parts 0, 1 (legs) 1.5, on
+        // 3 (arm) 1.8, on 4 2, on 5 4; COMET on 2 (arm) x 0.9.
+        let w = combat_weapons();
+        for (part, want) in [(0, 0.75), (1, 0.75), (2, 0.9), (3, 0.9), (4, 1.0), (5, 2.0)] {
+            assert_eq!(multiplier(w, 2.0, part), want, "part {part}");
+        }
     }
 
     #[test]
@@ -1303,22 +1920,34 @@ mod tests {
         assert!((1.0..=7.0).contains(&dmg), "{dmg}");
     }
 
-    /// Two players in the area: a bullet at slot 1's body hurts slot 1 (its
-    /// slot in the broadcast, not 0), and the kill names victim and killer.
-    #[test]
-    fn a_shot_hurts_the_player_it_hit() {
+    /// Two players in the area, 0.3 m apart: the collision names slot 1 (the
+    /// target id, as the shooter's client hit it), so slot 1 is hurt whoever
+    /// stands nearer the hit point; the kill names victim and killer.
+    fn two_in_the_area() -> (Gear, SocketAddr, SocketAddr, Instant) {
         let mut g = Gear::new();
         let t0 = Instant::now();
         let (me, them): (SocketAddr, SocketAddr) = ("127.0.0.1:7000".parse().expect("a"), "127.0.0.1:7001".parse().expect("a"));
         let params = unhex("8ec21d00d315993f41e35b49673283b9f234d5099974113f00000000000080bf0000803f0000404000004040000020418401404100000000");
         for (a, slot) in [(me, 0u8), (them, 1)] {
-            g.observe_physics(a, &body(slot, [43_800 + 2_000 * i32::from(slot), 1_870, -25_300]));
+            g.observe_physics(a, &body(slot, [43_800 + 300 * i32::from(slot), 1_870, -25_300]));
             g.on_message(a, HEAL_BUBBLE_PARAMS, &params, t0);
             g.on_message(a, SET_OWNER, &[0; 8], t0);
         }
-        // PULSAR head shot (9 x 1.5) landing on slot 1's head.
-        let mut bc = unhex("9e5b615f8c9cd62f95b2924260e454bd12132ac2fb362f429749c23fcc77cac1170000000100000026452bfc000010410500000000000000f234d5099974113f");
-        for (k, x) in [45.8f32, 1.52, -25.3].iter().enumerate() {
+        (g, me, them, t0)
+    }
+
+    /// A PULSAR head shot (9 x 1.5) from slot 0 on slot 1, as the client sends it
+    /// (recording 2026-11-16: target `f334d5099974113f` in space `8ec21d00`).
+    fn head_shot_on_slot_1() -> Vec<u8> {
+        unhex("9e5b615f8c9cd62f2e5d68bf4c5a40c1332c9e420259d54146a4b040a36a38c2f334d5099974113f8ec21d00000010410500000000000000f234d5099974113f")
+    }
+
+    #[test]
+    fn a_shot_hurts_the_player_it_hit() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        let mut bc = head_shot_on_slot_1();
+        // The hit point is right on slot 0 (the shooter's own body): slot 1 is still the one hit.
+        for (k, x) in [43.8f32, 1.52, -25.3].iter().enumerate() {
             bc[20 + 4 * k..24 + 4 * k].copy_from_slice(&x.to_le_bytes());
         }
         let v = g.on_message(me, BULLET_COLLISION, &bc, t0);
@@ -1331,9 +1960,131 @@ mod tests {
         let v = g.on_message(me, BULLET_COLLISION, &bc, t0);
         let killed = v.iter().find(|o| o.ty == PLAYER_KILLED).expect("killed");
         assert_eq!(&killed.body[16..24], &[1, 0, 0, 0, 0, 0, 0, 0]);
-        // A miss (nobody near) hurts nobody.
-        bc[20..24].copy_from_slice(&80f32.to_le_bytes());
+        // A shot naming its own shooter hurts nobody.
         assert!(g.on_message(them, BULLET_COLLISION, &bc, t0).iter().all(|o| o.ty != HEALTH_BROADCAST));
+    }
+
+    /// The recording's barrier hits (area handle 8, body part 6): native's
+    /// DealDamage to everyone with the health left; at 0 it breaks and takes no more.
+    #[test]
+    fn shooting_a_barrier_breaks_it() {
+        let mut g = Gear::new();
+        let me = addr();
+        let t0 = Instant::now();
+        g.on_message(me, SET_OWNER, &[0; 8], t0);
+        let bc = unhex("9e5b615f8c9cd62f58c27d3f69924bc17af39d42fb362f429749c23fcc77cac1080000000100000026452bfc000010410600000000000000f234d5099974113f");
+        let v = g.on_message(me, BULLET_COLLISION, &bc, t0);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ty, DEAL_DAMAGE);
+        assert_eq!(v[0].to, To::All);
+        assert_eq!(&v[0].body[..16], &unhex("26452bfcf77799cb0800000001000000")[..]);
+        // PULSAR on a barrier: 9 x 0.5.
+        assert_eq!(&v[0].body[16..20], &(BARRIER_HEALTH - 4.5).to_le_bytes());
+        let mut last = Vec::new();
+        for _ in 0..200 {
+            last = g.on_message(me, BULLET_COLLISION, &bc, t0);
+            if g.area_health.get(&arr8(&bc, 32)) == Some(&0.0) {
+                break;
+            }
+        }
+        // Native's break: DealDamage 0 in the hit's frame; the event and
+        // DealDamage 0 a frame later; the script's event a frame after that
+        // (pool 8 is the IdsResponse's handle 66).
+        let ev = barrier_event(66);
+        assert_eq!(last.iter().map(|o| o.ty).collect::<Vec<_>>(), [DEAL_DAMAGE]);
+        assert_eq!(&last[0].body[16..20], &0f32.to_le_bytes());
+        let kinds = |v: Vec<(SocketAddr, Out)>| v.into_iter().map(|(_, o)| o).filter(|o| o.ty == COMPONENT_EVENT || o.ty == DEAL_DAMAGE).collect::<Vec<_>>();
+        let next = kinds(g.due(t0 + Duration::from_millis(11)));
+        assert_eq!(next.iter().map(|o| o.ty).collect::<Vec<_>>(), [COMPONENT_EVENT, DEAL_DAMAGE]);
+        assert_eq!(next[0].body, ev);
+        assert_eq!(&next[1].body[16..20], &0f32.to_le_bytes());
+        let echo = kinds(g.due(t0 + Duration::from_millis(18)));
+        assert_eq!(echo.iter().map(|o| o.ty).collect::<Vec<_>>(), [COMPONENT_EVENT]);
+        assert!(g.on_message(me, BULLET_COLLISION, &bc, t0).is_empty(), "a broken barrier takes no more");
+        // Back after 30 s at full health.
+        assert!(g.due(t0 + Duration::from_secs(29)).iter().all(|(_, o)| o.ty != COMPONENT_EVENT));
+        let at = t0 + Duration::from_secs(31);
+        let back = kinds(g.due(at));
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].body, ev);
+        assert_eq!(&back[1].body[16..20], &230f32.to_le_bytes());
+        let echo = kinds(g.due(at + Duration::from_millis(8)));
+        assert_eq!(echo.len(), 1);
+        assert_eq!(echo[0].body, ev);
+        assert_eq!(g.on_message(me, BULLET_COLLISION, &bc, t0).len(), 1, "it takes hits again");
+    }
+
+    /// A war room target in a match: native's `LocallyTrackedDamage` in the
+    /// war room's space to the shooter only (Gauss recording, 252.905: a head
+    /// shot, 6 x 1.4), nothing else.
+    #[test]
+    fn war_room_targets_get_natives_marker() {
+        let mut g = Gear::new();
+        g.set_match(super::super::combat::LEVEL_GAUSS);
+        let me = addr();
+        let t0 = Instant::now();
+        let bc = unhex("edef83a8b1d0e8c80a838ec2591639c165aee4bf31e13543536d59c1135e48c304000000010000000bef8d100000c0400500000000000000f234d5099974113f");
+        let v = g.on_message(me, BULLET_COLLISION, &bc, t0);
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].ty, v[0].to), (TRACKED_DAMAGE, To::Sender));
+        assert_eq!(v[0].body, unhex("0bef8d109eafa108edef83a8b1d0e8c86666064131e13543536d59c1135e48c30400000001000000"));
+    }
+
+    /// The level data's barriers: Gauss's 9 (pool 0x69.. = handle 0x164..,
+    /// as recorded), the lobby area's 11.
+    #[test]
+    fn barriers_come_from_the_levels() {
+        let gauss = barriers_of(super::super::combat::LEVEL_GAUSS.to_le_bytes());
+        assert_eq!(gauss.len(), 9);
+        assert!(gauss.iter().any(|b| b.pool == 0x71 && b.handle == 0x16c && b.max == 230.0 && b.respawn == 30.0));
+        assert_eq!(barriers_of(AREA).len(), 11);
+        assert!(barriers_of(super::super::combat::LEVEL_FISSION.to_le_bytes()).is_empty());
+    }
+
+    /// OVERCHARGE: the user's hits deal +1 (+2 on the head) and they take 25%
+    /// less; a linked teammate takes 25% less and cannot die for 8 s.
+    #[test]
+    fn overcharge_boosts_cuts_and_saves() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        let oc = unhex("f234d5099974113f41e35b49673283b9f234d5099974113f");
+        g.on_message(me, HEAL_BUBBLE_ACTIVATE, &oc, t0);
+        let v = g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        let hb = v.iter().find(|o| o.ty == HEALTH_BROADCAST).expect("hurt");
+        assert_eq!(&hb.body[12..16], &(112.0f32 - 15.5).to_le_bytes(), "13.5 + 2 on the head");
+        // Slot 1 shoots back at the boosted user: 25% off.
+        let mut back = head_shot_on_slot_1();
+        back[32] = 0xf2;
+        back[56] = 0xf3;
+        let v = g.on_message(them, BULLET_COLLISION, &back, t0);
+        let hb = v.iter().find(|o| o.ty == HEALTH_BROADCAST).expect("hurt");
+        assert_eq!(&hb.body[12..16], &(112.0f32 - 13.5 * 0.75).to_le_bytes());
+        // The user's client links slot 1 (PowerBoost link marker with cheat death).
+        let mut link = unhex("8ec21d00d315993ff334d5099974113f0000000000000000000000000000000000");
+        link.truncate(32);
+        link[16..20].copy_from_slice(&(-4_090_010f32).to_le_bytes());
+        g.on_message(me, DAMAGE_DEALT, &link, t0);
+        // Linked: no bonus for them, 25% off, and never below 1 health.
+        for _ in 0..30 {
+            let v = g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+            assert!(v.iter().all(|o| o.ty != PLAYER_KILLED), "cheat death");
+        }
+        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(1.0));
+        // The link breaks: the next lethal hit kills.
+        link[16..20].copy_from_slice(&(-6_090_010f32).to_le_bytes());
+        g.on_message(me, DAMAGE_DEALT, &link, t0);
+        let v = g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        assert!(v.iter().any(|o| o.ty == PLAYER_KILLED));
+    }
+
+    /// The drone flies its 20 s before it is used up (it was ended after 0.12 s,
+    /// so it blew up as it was thrown), and its shots reach everyone else.
+    #[test]
+    fn the_drone_lives_and_its_shots_are_relayed() {
+        assert_eq!(lifetime(ITEM_DRONE), Duration::from_secs(20));
+        assert_eq!(lifetime(ITEM_DOT), Duration::from_secs(11));
+        let mut g = Gear::new();
+        let v = g.on_message(addr(), AUTO_TARGET_FIRE, &[1, 2, 3], Instant::now());
+        assert_eq!(v, vec![out(To::Others, AUTO_TARGET_FIRE, &[1, 2, 3])]);
     }
 
     #[test]

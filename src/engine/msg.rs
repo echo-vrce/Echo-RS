@@ -399,14 +399,26 @@ pub fn captured() -> &'static Captured {
             (0x3f99_15d3_001d_c28e, hex(include_str!("data/ids_response_8ec2.hex"))),
             (0x6daa_00a6_d33d_44b7, hex(include_str!("data/ids_response_b744.hex"))),
             (0xcb99_77f7_fc2b_4526, hex(include_str!("data/ids_response_2645.hex"))),
+            (super::combat::LEVEL_DYSON, hex(include_str!("data/combat_dyson_ids.hex"))),
+            (super::combat::LEVEL_COMBUSTION, hex(include_str!("data/combat_combustion_ids.hex"))),
+            (super::combat::LEVEL_FISSION, hex(include_str!("data/combat_fission_ids.hex"))),
+            (super::combat::LEVEL_GAUSS, hex(include_str!("data/combat_gauss_ids.hex"))),
         ],
         // Clients play with these values; the host's changes are merged in.
         balance: vec![
             (LEVEL_SOCIAL, super::balance::apply(hex(include_str!("data/balance_settings_mass_update.hex")))),
             (LEVEL_ARENA, super::balance::apply(hex(include_str!("data/balance_settings_arena_4bbc.hex")))),
+            (super::combat::LEVEL_DYSON, super::balance::apply(hex(include_str!("data/combat_dyson_balance.hex")))),
+            (super::combat::LEVEL_COMBUSTION, super::balance::apply(hex(include_str!("data/combat_combustion_balance.hex")))),
+            (super::combat::LEVEL_FISSION, super::balance::apply(hex(include_str!("data/combat_fission_balance.hex")))),
+            (super::combat::LEVEL_GAUSS, super::balance::apply(hex(include_str!("data/combat_gauss_balance.hex")))),
         ],
         baselines: vec![
             (LEVEL_SOCIAL, vec![hex(include_str!("data/replicated_delta_unreliable_vars_045c.hex"))]),
+            (super::combat::LEVEL_DYSON, vec![hex(include_str!("data/combat_dyson_rep_s0.hex"))]),
+            (super::combat::LEVEL_COMBUSTION, vec![hex(include_str!("data/combat_combustion_rep_s0.hex"))]),
+            (super::combat::LEVEL_FISSION, vec![hex(include_str!("data/combat_fission_rep_s0.hex"))]),
+            (super::combat::LEVEL_GAUSS, vec![hex(include_str!("data/combat_gauss_rep_s0.hex"))]),
             (
                 LEVEL_ARENA,
                 vec![

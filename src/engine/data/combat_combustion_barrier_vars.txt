@@ -1,0 +1,1 @@
+# barrier_handle var (the var is 0 while the barrier is down, else 1)

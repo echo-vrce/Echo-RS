@@ -1,0 +1,2 @@
+# sphere x y z radius | box x y z qx qy qz qw hx hy hz (world, y up)
+sphere 0.0000 -0.0281 -0.4959 5.8858

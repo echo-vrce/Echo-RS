@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::goal;
 use super::msg::{self, *};
 use super::rules::{self, RULES, Rules, Target};
-use super::stats::{DiscTracker, Stat, Stats};
+use super::stats::{CombatStats, DiscTracker, Stat, Stats};
 use super::transport::{SessionCrypto, Transport, mac_matches, reliable_batch};
 
 pub const MAX_SLOTS: usize = 16;
@@ -132,6 +132,9 @@ struct Peer {
     loadout_save_at: Option<Instant>,
     /// The player changed their loadout here: it is saved once more as they leave.
     loadout_changed: bool,
+    /// When the player last changed team (the team orbs in the lobby's combat
+    /// area): the client sends a new loadout number for it.
+    team_changed_at: Option<Instant>,
     /// Per-slot generation the client stamps on its own transforms.
     generation: Option<u16>,
     deferred: Vec<(u32, u64, Vec<u8>)>,
@@ -154,6 +157,10 @@ struct Peer {
     seen_types: HashMap<(u64, bool, usize, u32), u32>,
     /// Running match totals (native sends totals, never deltas).
     stats: Stats,
+    /// Combat match totals.
+    cstats: CombatStats,
+    /// A hand on the payload (the client's touch state).
+    on_payload: bool,
     /// When this peer last sent a stun (one credit per stun burst).
     last_stun: Option<Instant>,
     /// Lobby: the cease fire last sent to this player (true = lifted).
@@ -181,6 +188,7 @@ impl Peer {
             jersey: None,
             loadout_save_at: None,
             loadout_changed: false,
+            team_changed_at: None,
             generation: None,
             deferred: Vec::new(),
             join_tail_in: None,
@@ -192,6 +200,8 @@ impl Peer {
             rep_seq: 0,
             ping_token: 0,
             stats: Stats::default(),
+            cstats: CombatStats::default(),
+            on_payload: false,
             last_stun: None,
             fight_sent: None,
             ping_dirty: false,
@@ -892,6 +902,15 @@ pub struct Session {
     pub info: SessionInfo,
     social: bool,
     arena_level: bool,
+    /// A combat match (Dyson, Combustion, Fission, Gauss): its round flow.
+    combat: Option<super::combat::Combat>,
+    combat_at: Option<Instant>,
+    /// The combat vars last sent (only changes go out, plus all twice a second).
+    combat_sent: HashMap<u64, u64>,
+    /// Seconds since the last combat stat update.
+    combat_stat_clock: f32,
+    /// Who hurt whom lately (assists): victim -> (attacker, when).
+    recent_hits: HashMap<SocketAddr, Vec<(SocketAddr, Instant)>>,
     /// Component handles from the IdsResponse this session sends.
     handles: Handles,
     peers: HashMap<SocketAddr, Peer>,
@@ -965,8 +984,38 @@ fn loadout_save(lobby: &str, p: &Peer) -> Option<pb::Envelope> {
     })))
 }
 
+/// Native combat's stat updates: every 3 s of the match (Dyson: 103.5, 106.5, ...).
+const COMBAT_STATS_EVERY: f32 = 3.0;
+/// Damage this recent counts toward an assist (not recorded: native's Dyson
+/// had none).
+const COMBAT_ASSIST_WINDOW: Duration = Duration::from_secs(10);
+
+/// A profile's period stat groups: `daily_YYYY_MM_DD` and `weekly_` + its
+/// Monday (native on 2026-11-16, a Monday: both that date).
+fn profile_periods(unix: u64) -> (String, String) {
+    let days = (unix / 86_400) as i64;
+    let date = |d: i64| {
+        // The civil date of a day count since 1970-01-01.
+        let z = d + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let dd = doy - (153 * mp + 2) / 5 + 1;
+        let mm = if mp < 10 { mp + 3 } else { mp - 9 };
+        let yy = yoe + era * 400 + i64::from(mm <= 2);
+        format!("{yy:04}_{mm:02}_{dd:02}")
+    };
+    // 1970-01-01 was a Thursday: that week's Monday is 3 days before.
+    let monday = days - (days + 3).rem_euclid(7);
+    (format!("daily_{}", date(days)), format!("weekly_{}", date(monday)))
+}
+
 /// How long after the last loadout change to save it.
 const LOADOUT_SAVE_DELAY: Duration = Duration::from_millis(1500);
+/// A loadout number this soon after a team change belongs to the change.
+const TEAM_LOADOUT_WINDOW: Duration = Duration::from_secs(2);
 
 fn swizzle(raw: [u8; 16]) -> Uuid {
     let mut b = raw;
@@ -986,6 +1035,24 @@ fn hex_str(d: &[u8]) -> String {
 /// never returned to their pool.
 const POOLED_DESTROY_WINDOW: std::ops::Range<usize> = 40..56;
 
+/// The combat flow for a combat map, with the settings its clients get.
+fn combat_for(level: u64) -> Option<super::combat::Combat> {
+    if !super::combat::LEVELS.contains(&level) {
+        return None;
+    }
+    let block = captured().balance.iter().find(|(l, _)| *l == level).map(|(_, b)| b.as_slice())?;
+    let name = match level {
+        super::combat::LEVEL_DYSON => "mpl_combat_dyson_map_settings",
+        super::combat::LEVEL_COMBUSTION => "mpl_combat_combustion_map_settings",
+        super::combat::LEVEL_FISSION => "mpl_combat_fission_map_settings",
+        _ => "mpl_combat_gauss_map_settings",
+    };
+    let settings = super::balance::document(block, name).unwrap_or_default();
+    let rules = super::balance::document(block, "mp_combat_rules").unwrap_or_default();
+    let components = ids_response(level, level, 0).map_or(1, |b| b.len().saturating_sub(8) / 10);
+    super::combat::Combat::new(level, components, settings, rules)
+}
+
 fn u16_at(p: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([p[o], p[o + 1]])
 }
@@ -1000,10 +1067,20 @@ impl Session {
         if private && let Some(c) = baseline(info.level, info.mode).and_then(|b| var_raw(&b[0], VAR_COUNTDOWN)) {
             arena.countdown = f32::from_bits(c as u32);
         }
+        let combat = combat_for(info.level);
+        let mut gear = super::gear::Gear::new();
+        if combat.is_some() {
+            gear.set_match(info.level);
+        }
         Self {
             info,
             social,
             arena_level,
+            combat,
+            combat_at: None,
+            combat_sent: HashMap::new(),
+            combat_stat_clock: 0.0,
+            recent_hits: HashMap::new(),
             handles,
             peers: HashMap::new(),
             pending: Vec::new(),
@@ -1019,7 +1096,7 @@ impl Session {
             started: Instant::now(),
             arena,
             touch: HashMap::new(),
-            gear: super::gear::Gear::new(),
+            gear,
             props: super::props::Props::new(),
             server_disc_was: false,
             touch_seq: HashMap::new(),
@@ -1255,8 +1332,13 @@ impl Session {
                     p.jersey = Some(n);
                 }
                 self.relay_reliable(from, ty, d, false);
-                // Social lobby: sent on walking out of the combat area.
-                if self.social {
+                // Social lobby: older clients sent it on walking out of the
+                // combat area. It also follows a team change (the team orbs,
+                // inside the area), and clients with the area-leave event
+                // report walking out with that: freeing the stations here took
+                // the player's gun as they picked a team.
+                let team_change = self.peers.get(&from).and_then(|p| p.team_changed_at).is_some_and(|t| t.elapsed() < TEAM_LOADOUT_WINDOW);
+                if self.social && !team_change && !self.gear.sends_area_events(from) {
                     for o in self.gear.left_area(from) {
                         self.send_gear(from, o);
                     }
@@ -1310,6 +1392,19 @@ impl Session {
                 self.gear.observe_physics(from, d);
                 self.props.observe(from, d);
             }
+            if ty == PHYSICS && self.combat.is_some() {
+                self.gear.observe_physics(from, d);
+            }
+        }
+        if ty == super::combat::TOUCH_STATE && self.combat.is_some() {
+            // A hand on the payload claims it (native).
+            if let Some((_, on)) = super::combat::payload_touch(d)
+                && let Some(p) = self.peers.get_mut(&from)
+            {
+                p.on_payload = on;
+            }
+        }
+        if ty == PLAYER_STATE || ty == PHYSICS {
             if ty == PHYSICS && self.arena_level {
                 // Native (public match, 2026-11-16): once the disc is granted to
                 // someone, the previous holder's states (it keeps sending them
@@ -2185,6 +2280,9 @@ impl Session {
         if self.arena_level {
             self.run_rules();
         }
+        if self.combat.is_some() {
+            self.run_combat();
+        }
         self.replicate();
         // The lobby objects nobody owns, ten times a second (native: 45; they
         // do not move here, so less is enough).
@@ -2204,6 +2302,75 @@ impl Session {
     }
 
     // ── Arena ──────────────────────────────────────────────────────────────
+
+    /// The combat match's flow (`combat.rs`), on wall time.
+    fn run_combat(&mut self) {
+        let now = Instant::now();
+        let dt = self.combat_at.map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(1.0));
+        self.combat_at = Some(now);
+        let players: Vec<super::combat::Player> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.stage == Stage::Joined && matches!(p.team, TEAM_BLUE | TEAM_ORANGE))
+            .map(|(a, p)| {
+                let slot = self.gear.slot_of(a) as u8;
+                (u8::from(p.team == TEAM_ORANGE), self.gear.alive(*a), self.gear.body_pos(*a), slot)
+            })
+            .collect();
+        let down = self.gear.barriers_down();
+        let holders: Vec<u8> = self.peers.iter().filter(|(_, p)| p.on_payload && p.stage == Stage::Joined).map(|(a, _)| self.gear.slot_of(a) as u8).collect();
+        let Some(c) = self.combat.as_mut() else { return };
+        c.set_barriers_down(down);
+        c.set_payload_holders(holders);
+        let outs = c.step(dt, &players);
+        self.combat_stats(dt, now);
+        for o in outs {
+            match o {
+                super::combat::Out::Reliable(ty, body) => {
+                    for a in self.joined() {
+                        self.reliable_to(a, ty, &body);
+                    }
+                }
+                super::combat::Out::Event(sym, module, handle, filter) => {
+                    let ev = component_event(sym, module, handle, filter);
+                    for a in self.joined() {
+                        self.reliable_to(a, COMPONENT_EVENT, &ev);
+                    }
+                }
+                super::combat::Out::Awards => {
+                    self.send_combat_stats();
+                    self.send_combat_awards();
+                }
+                super::combat::Out::RestoreBarriers => {
+                    for (from, o) in self.gear.restore_barriers() {
+                        self.send_gear(from, o);
+                    }
+                }
+                super::combat::Out::Unlock => {
+                    if self.join_locked {
+                        self.join_locked = false;
+                        info!("join unlock (next combat round)");
+                        self.fleet_out.push(env(Em::LobbySessionEvent(pb::LobbySessionEventMessage {
+                            lobby_session_id: self.info.lobby.to_string(),
+                            code: pb::lobby_session_event_message::Code::Unlocked as i32,
+                        })));
+                    }
+                }
+                super::combat::Out::Lock => {
+                    // Native: the totals at once when a round or the match is won.
+                    self.send_combat_stats();
+                    if !self.join_locked {
+                        self.join_locked = true;
+                        info!("join lock (combat match over)");
+                        self.fleet_out.push(env(Em::LobbySessionEvent(pb::LobbySessionEventMessage {
+                            lobby_session_id: self.info.lobby.to_string(),
+                            code: pb::lobby_session_event_message::Code::Locked as i32,
+                        })));
+                    }
+                }
+            }
+        }
+    }
 
     fn team_counts(&self) -> (usize, usize) {
         let joined = self.peers.values().filter(|p| p.stage == Stage::Joined);
@@ -2589,6 +2756,317 @@ impl Session {
         }
     }
 
+    /// The combat match's stats: the gear's damage and kills, time on the
+    /// objective, and native's update every 3 s.
+    fn combat_stats(&mut self, dt: f32, now: Instant) {
+        let Some(c) = self.combat.as_ref() else { return };
+        if c.phase == super::combat::Phase::Waiting {
+            self.gear.credits.clear();
+            self.recent_hits.clear();
+            self.combat_stat_clock = 0.0;
+            for p in self.peers.values_mut() {
+                p.cstats = CombatStats::default();
+            }
+            return;
+        }
+        let playing = c.phase == super::combat::Phase::Playing;
+        let counting = c.counting();
+        let mut objective: HashMap<SocketAddr, bool> = HashMap::new();
+        for (a, p) in &self.peers {
+            if p.stage == Stage::Joined && matches!(p.team, TEAM_BLUE | TEAM_ORANGE) {
+                objective.insert(*a, self.gear.body_pos(*a).is_some_and(|q| c.on_objective(q)));
+            }
+        }
+        let credits: Vec<super::gear::Credit> = self.gear.credits.drain(..).collect();
+        if playing {
+            for (a, o) in &objective {
+                let alive = self.gear.alive(*a);
+                if let Some(p) = self.peers.get_mut(a) {
+                    p.cstats.played += dt;
+                    if *o && alive {
+                        p.cstats.objective_time += dt;
+                    }
+                }
+            }
+        }
+        let on_obj = |a: &SocketAddr| objective.get(a).copied().unwrap_or(false);
+        for cr in credits {
+            match cr {
+                super::gear::Credit::Damage { by, victim, amount } => {
+                    if let Some(p) = self.peers.get_mut(&victim) {
+                        p.cstats.damage_taken += amount;
+                    }
+                    let Some(by) = by else { continue };
+                    let obj = on_obj(&by) || on_obj(&victim);
+                    if let Some(p) = self.peers.get_mut(&by) {
+                        p.cstats.damage += amount;
+                        if obj {
+                            p.cstats.objective_damage += amount;
+                        }
+                    }
+                    let hits = self.recent_hits.entry(victim).or_default();
+                    hits.retain(|(a, _)| *a != by);
+                    hits.push((by, now));
+                }
+                super::gear::Credit::Kill { by, victim } => {
+                    let obj = by.is_some_and(|b| on_obj(&b)) || on_obj(&victim);
+                    if let Some(p) = self.peers.get_mut(&victim) {
+                        p.cstats.deaths += 1;
+                    }
+                    if let Some(p) = by.and_then(|b| self.peers.get_mut(&b)) {
+                        p.cstats.kills += 1;
+                        p.cstats.eliminations += 1;
+                        if obj {
+                            p.cstats.objective_eliminations += 1;
+                        }
+                    }
+                    // Others who hurt the victim in the last 10 s assisted.
+                    let helpers: Vec<SocketAddr> = self
+                        .recent_hits
+                        .remove(&victim)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(a, t)| Some(*a) != by && now.duration_since(*t) <= COMBAT_ASSIST_WINDOW)
+                        .map(|(a, _)| a)
+                        .collect();
+                    for a in helpers {
+                        if let Some(p) = self.peers.get_mut(&a) {
+                            p.cstats.assists += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if counting {
+            self.combat_stat_clock += dt;
+            if self.combat_stat_clock >= COMBAT_STATS_EVERY {
+                self.combat_stat_clock = 0.0;
+                self.send_combat_stats();
+            }
+        }
+    }
+
+    /// Native combat: `SR15NetReliableStatUpdate` per player (`[slot u32]` +
+    /// the running totals' JSON) and `SR15NetReliableTeamStatUpdate` per team
+    /// (`[team u16]` + eight `[stat sym][m i32][e i32][players i32]` records,
+    /// value `m * 2^e`, players = how many on the team have any).
+    fn send_combat_stats(&mut self) {
+        let mut msgs = Vec::new();
+        let mut teams: [Vec<CombatStats>; 2] = [Vec::new(), Vec::new()];
+        let mut slots: Vec<(usize, &Peer)> = self.peers.values().filter_map(|p| p.slot.map(|s| (s, p))).collect();
+        slots.sort_by_key(|(s, _)| *s);
+        for (slot, p) in slots {
+            if matches!(p.team, TEAM_BLUE | TEAM_ORANGE) {
+                teams[usize::from(p.team)].push(p.cstats);
+            }
+            let generation = p.generation.unwrap_or(p.genidx);
+            let mut m = ((u32::from(generation) << 16) | slot as u32).to_le_bytes().to_vec();
+            m.extend_from_slice(p.cstats.to_json().as_bytes());
+            m.push(0);
+            msgs.push(m);
+        }
+        let mut team_msgs = Vec::new();
+        for (i, members) in teams.iter().enumerate() {
+            let mut m = (i as u16).to_le_bytes().to_vec();
+            for name in super::stats::COMBAT_TEAM_STATS {
+                let mut total = 0.0;
+                let mut real = false;
+                let mut have = 0i32;
+                for s in members {
+                    let (v, r) = s.get(name);
+                    real = r;
+                    total += v;
+                    have += i32::from(v != 0.0);
+                }
+                let (mant, exp) = super::stats::mantissa_exp(total, real);
+                m.extend_from_slice(&crate::sns::symbol(name).to_le_bytes());
+                m.extend_from_slice(&mant.to_le_bytes());
+                m.extend_from_slice(&exp.to_le_bytes());
+                m.extend_from_slice(&have.to_le_bytes());
+            }
+            team_msgs.push(m);
+        }
+        for a in self.joined() {
+            for m in &msgs {
+                self.reliable_to(a, STAT_UPDATE, m);
+            }
+            for m in &team_msgs {
+                self.reliable_to(a, TEAM_STAT_UPDATE, m);
+            }
+        }
+    }
+
+    /// Native combat at match over: the MVP (`SR15NetTopAwardsMsg`, one
+    /// award, from the winning team), one tier reward per player (gold, then
+    /// silver, then bronze, in eliminations, objective eliminations and
+    /// objective time: the best player without one yet), and each player's
+    /// profile change (`SNSRefreshProfileFromServer`: their stats and XP),
+    /// which the backend also keeps.
+    fn send_combat_awards(&mut self) {
+        let Some(c) = self.combat.as_ref() else { return };
+        let winner = c.winner.map(|w| match w {
+            super::combat::Winner::Blue => Some(TEAM_BLUE),
+            super::combat::Winner::Orange => Some(TEAM_ORANGE),
+            super::combat::Winner::Draw => None,
+        });
+        let winner = winner.flatten();
+        let capture = c.is_capture();
+        struct P {
+            addr: SocketAddr,
+            slot: usize,
+            handle: u32,
+            team: u8,
+            name: Vec<u8>,
+            s: CombatStats,
+            xpid: Option<[u64; 2]>,
+        }
+        let mut players: Vec<P> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| matches!(p.team, TEAM_BLUE | TEAM_ORANGE))
+            .filter_map(|(a, p)| {
+                let slot = p.slot?;
+                let name = p
+                    .entrant_header
+                    .as_deref()
+                    .and_then(|h| h.get(60..96))
+                    .map(|n| n.split(|&b| b == 0).next().unwrap_or(&[]).to_vec())
+                    .unwrap_or_default();
+                let handle = (u32::from(p.generation.unwrap_or(0)) << 16) | slot as u32;
+                Some(P { addr: *a, slot, handle, team: p.team, name, s: p.cstats, xpid: p.xpid })
+            })
+            .collect();
+        players.sort_by_key(|p| p.slot);
+        if players.is_empty() {
+            return;
+        }
+        let won = |p: &P| winner == Some(p.team);
+        let mvp = players
+            .iter()
+            .filter(|p| winner.is_none() || won(p))
+            .max_by_key(|p| (p.s.score(), std::cmp::Reverse(p.slot)))
+            .map(|p| p.slot);
+        if let Some(m) = mvp.and_then(|s| players.iter().find(|p| p.slot == s)) {
+            let mut b = vec![1u8];
+            b.extend_from_slice(&AWARD_MVP_ID.to_le_bytes());
+            b.extend_from_slice(&AWARD_MVP_STAT.to_le_bytes());
+            b.extend_from_slice(&m.s.score().max(1).to_le_bytes());
+            b.extend_from_slice(&(m.slot as u64).to_le_bytes());
+            b.extend_from_slice(&m.handle.to_le_bytes());
+            b.extend_from_slice(&u16::from(m.team == TEAM_ORANGE).to_le_bytes());
+            let mut n = [0u8; 32];
+            let k = m.name.len().min(31);
+            n[..k].copy_from_slice(&m.name[..k]);
+            b.extend_from_slice(&n);
+            b.extend_from_slice(&[0, 0]);
+            info!(mvp = %String::from_utf8_lossy(&m.name), "combat top awards");
+            for a in self.joined() {
+                self.reliable_to(a, TOP_AWARDS, &b);
+            }
+        }
+        // Tier rewards.
+        let tier_stats: [(&str, fn(&CombatStats) -> f32); 3] = [
+            ("CombatEliminations", |s| s.eliminations as f32),
+            ("CombatObjectiveEliminations", |s| s.objective_eliminations as f32),
+            ("CombatObjectiveTime", |s| s.objective_time),
+        ];
+        let mut tier_xp: HashMap<usize, u64> = HashMap::new();
+        let mut rewards = Vec::new();
+        for (tier, xp) in [(TIER_GOLD, 150u64), (TIER_SILVER, 100), (TIER_BRONZE, 50)] {
+            for (name, get) in &tier_stats {
+                let best = players
+                    .iter()
+                    .filter(|p| !tier_xp.contains_key(&p.slot) && get(&p.s) > 0.0)
+                    .max_by(|a, b| get(&a.s).total_cmp(&get(&b.s)).then(b.slot.cmp(&a.slot)));
+                let Some(p) = best else { continue };
+                let mut b = [0u8; 32];
+                b[0..8].copy_from_slice(&crate::sns::symbol(name).to_le_bytes());
+                b[8..16].copy_from_slice(&tier.to_le_bytes());
+                b[16..24].copy_from_slice(&(p.slot as u64).to_le_bytes());
+                b[24..32].copy_from_slice(&xp.to_le_bytes());
+                tier_xp.insert(p.slot, xp);
+                rewards.push((p.addr, b));
+            }
+        }
+        for (to, b) in rewards {
+            self.reliable_to(to, TIER_REWARD, &b);
+        }
+        // XP and the profile.
+        let longest = players.iter().map(|p| p.s.played).fold(0.0f32, f32::max);
+        let (day, week) = profile_periods(crate::store::now_secs());
+        for p in &players {
+            let stayed = longest > 0.0 && p.s.played >= 0.5 * longest;
+            let is_mvp = mvp == Some(p.slot);
+            let w = won(p);
+            let xp = super::stats::combat_xp(w, stayed, is_mvp, tier_xp.get(&p.slot).copied().unwrap_or(0));
+            let mut st = serde_json::Map::new();
+            let mut add = |k: &str, v: serde_json::Value| {
+                st.insert(k.to_string(), serde_json::json!({"op": "add", "val": v, "cnt": 1}));
+            };
+            let s = p.s;
+            for (k, v) in [
+                ("CombatObjectiveDamage", s.objective_damage),
+                ("CombatObjectiveTime", s.objective_time),
+                ("CombatDamage", s.damage),
+                ("CombatDamageTaken", s.damage_taken),
+            ] {
+                if v > 0.0 {
+                    add(k, serde_json::json!(v));
+                }
+            }
+            for (k, v) in [
+                ("CombatEliminations", s.eliminations),
+                ("CombatObjectiveEliminations", s.objective_eliminations),
+                ("CombatKills", s.kills),
+                ("CombatAssists", s.assists),
+                ("CombatDeaths", s.deaths),
+            ] {
+                if v > 0 {
+                    add(k, serde_json::json!(v));
+                }
+            }
+            if winner.is_some() && stayed {
+                add(if w { "CombatWins" } else { "CombatLosses" }, serde_json::json!(1));
+                if w {
+                    add(if capture { "CombatPointCaptureWins" } else { "CombatPayloadWins" }, serde_json::json!(1));
+                }
+                add(if capture { "CombatPointCaptureGamesPlayed" } else { "CombatPayloadGamesPlayed" }, serde_json::json!(1));
+            }
+            if is_mvp {
+                add("CombatMVPs", serde_json::json!(1));
+            }
+            if xp > 0 {
+                add("XP", serde_json::json!(xp));
+            }
+            let stats = serde_json::Value::Object(st);
+            let mut groups = serde_json::Map::new();
+            groups.insert("combat".into(), stats.clone());
+            groups.insert(day.clone(), stats.clone());
+            groups.insert(week.clone(), stats);
+            let delta = serde_json::json!({ "stats": groups });
+            info!(slot = p.slot, xp, won = w, mvp = is_mvp, "combat profile update");
+            if let Some([platform, account]) = p.xpid {
+                let mut b = platform.to_le_bytes().to_vec();
+                b.extend_from_slice(&account.to_le_bytes());
+                b.extend_from_slice(delta.to_string().as_bytes());
+                b.push(0);
+                self.reliable_to(p.addr, REFRESH_PROFILE, &b);
+                let id = crate::sns::XpId { platform, account }.token();
+                self.fleet_out.push(env(Em::UserServerProfileUpdateRequest(pb::SnsUserServerProfileUpdateRequestMessage {
+                    user_id: Some(pb::XPlatformId { id }),
+                    // nakama keeps these (its statistics boards) when the
+                    // match type is a combat one and the session is its match.
+                    payload: serde_json::json!({
+                        "matchtype": crate::sns::symbol("echo_combat") as i64,
+                        "sessionid": self.info.lobby.to_string(),
+                        "update": delta,
+                    })
+                    .to_string(),
+                })));
+            }
+        }
+    }
+
     /// Native, at match over: `SR15NetTopAwardsMsg` = `[count u8]`, then
     /// arrays of `count`: award ids, stat hashes, values (u64 each), slots
     /// (u64), handles (u32), teams (u16), names (32 bytes), and a u16 each.
@@ -2805,6 +3283,17 @@ impl Session {
         // client lets them punch and block only then.
         let hold_hi = var_raw(&base[0], VAR_HOLD).unwrap_or(1) & !0xffff_ffff;
         let gear = &self.gear;
+        // The combat mode's vars: those that changed every frame, all of them
+        // twice a second (late joiners, lost packets).
+        let combat_vars = self.combat.as_ref().map(|c| {
+            let all: Vec<(u64, u64)> = c.vars().into_iter().map(|(h, v)| (h, v.resolve(var_raw(&base[0], h).unwrap_or(0)))).collect();
+            let every = server_frame % (frame_hz() / 2).max(1) == 0;
+            let changed: Vec<(u64, u64)> = all.iter().copied().filter(|(h, v)| every || self.combat_sent.get(h) != Some(v)).collect();
+            (all, changed)
+        });
+        if let Some((all, _)) = &combat_vars {
+            self.combat_sent = all.iter().copied().collect();
+        }
         let second = server_frame % frame_hz() == 0;
         for (addr, p) in self.peers.iter_mut() {
             if p.stage != Stage::Joined || !p.rep_ready {
@@ -2832,6 +3321,11 @@ impl Session {
                     stamp(&mut body, p.rep_seq);
                     p.t.queue_mailbox(REPLICATED_VARS, key_replicated(1, frame, slot), &body);
                 }
+                p.rep_seq += 1;
+            } else if let Some((_, vars)) = combat_vars.as_ref() {
+                let mut body = delta(&base[0], vars);
+                stamp(&mut body, p.rep_seq);
+                p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
                 p.rep_seq += 1;
             } else if self.social {
                 let fight = gear.may_fight(*addr);
@@ -2939,6 +3433,23 @@ impl Session {
         }
         let sym = u64::from_le_bytes(d[0..8].try_into().expect("8"));
         let module = u64::from_le_bytes(d[8..16].try_into().expect("8"));
+        if self.combat.is_some() {
+            // Native relays a client's filter-13 events (the war room, doors,
+            // barriers: the level scripts each client runs) to the others,
+            // byte for byte; filter-5 ones are for the server alone.
+            let filter = if d.len() >= 20 { u16::from_le_bytes([d[18], d[19]]) } else { 0 };
+            if d.len() == 24 && filter == FILTER_ALL_ALT {
+                self.relay_reliable(from, COMPONENT_EVENT, d, false);
+            }
+            // The level scripts' reaction to the server-only ones (native's
+            // doors, the war room's objects, area triggers set level vars).
+            if filter == FILTER_ALL
+                && let Some(c) = self.combat.as_mut()
+            {
+                c.client_event(sym, module, u16::from_le_bytes([d[16], d[17]]));
+            }
+            return;
+        }
         if self.social {
             // Walking into / out of the brawler room.
             for o in self.gear.area_event(from, sym, Instant::now()) {
@@ -3117,6 +3628,7 @@ impl Session {
             p.team = want;
             p.team_slot = team_slot;
             p.requested_team = Some(want);
+            p.team_changed_at = Some(Instant::now());
             let tc = team_changed(slot, want, Some(old));
             for a in self.joined() {
                 self.reliable_to(a, ENTRANT_TEAM_CHANGED, &tc);

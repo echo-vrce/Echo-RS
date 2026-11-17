@@ -432,6 +432,15 @@ impl Hub {
                     debug!(lobby = %lid, player = %x, "entrant left");
                 }
             }
+            Some(Em::UserServerProfileUpdateRequest(m)) => {
+                // A game server's stat changes (a combat match's XP and stats).
+                let Some(x) = m.user_id.as_ref().and_then(|u| XpId::parse(&u.id)) else { return };
+                let Ok(body) = serde_json::from_str::<serde_json::Value>(&m.payload) else { return };
+                if let Some(update) = body.get("update") {
+                    debug!(player = %x, "profile stats from a game server");
+                    self.store.apply_stats(x, update);
+                }
+            }
             Some(Em::GameServerSaveLoadout(m)) => {
                 let Ok(lid) = m.lobby_session_id.parse::<Uuid>() else { return };
                 let Ok(eid) = m.entrant_id.parse::<Uuid>() else { return };
@@ -592,11 +601,8 @@ impl Hub {
                 let Some(server_id) = s.servers.values().filter(|g| g.lobby.is_none()).max_by_key(|g| g.embedded).map(|g| g.id) else {
                     return Placement::NeedServer;
                 };
-                let level = if req.level == 0 || req.level == u64::MAX {
-                    if req.settings.level > 0 { req.settings.level as u64 } else { self.modes.default_level(mode) }
-                } else {
-                    req.level
-                };
+                // The level checked above (the default is random for combat).
+                let level = level_wanted;
                 let private = match req.kind {
                     LobbyRequestKind::Create { lobby_type, .. } => lobby_type == 1 || self.modes.is_private(mode),
                     _ => self.modes.is_private(mode),

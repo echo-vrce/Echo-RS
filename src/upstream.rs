@@ -216,6 +216,15 @@ async fn bridge_nakama(up: &Upstreams, idx: u32, local: WebSocket, url: &str) ->
                 let Some(Ok(m)) = m else { break };
                 let AxMsg::Binary(mut data) = m else { if matches!(m, AxMsg::Close(_)) { break } continue };
                 if let Some((mut env, legacy)) = decode_any(&data) {
+                    // nakama ignores this one as protobuf: it reads native's
+                    // SNSUserServerProfileUpdateRequest into its statistics.
+                    if let Some(Em::UserServerProfileUpdateRequest(m)) = &env.message {
+                        if let Some(frame) = profile_update_frame(m) {
+                            info!(instance = idx, player = ?m.user_id.as_ref().map(|u| &u.id), "sending match stats to nakama");
+                            rtx.send(TMsg::Binary(frame.into())).await?;
+                        }
+                        continue;
+                    }
                     if let Some(Em::GameServerRegistration(reg)) = &mut env.message {
                         if reg.internal_ip_address.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback()) {
                             reg.internal_ip_address = up.lan_ip.to_string();
@@ -369,6 +378,23 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                 let Some(Ok(m)) = m else { break };
                 let AxMsg::Binary(data) = m else { if matches!(m, AxMsg::Close(_)) { break } continue };
                 let Ok(env) = pb::Envelope::decode(data.as_slice()) else { continue };
+                if let Some(Em::UserServerProfileUpdateRequest(m)) = &env.message {
+                    // A combat match's stats and XP for a player: native's
+                    // SNSUserServerProfileUpdateRequest. nakama takes it on this
+                    // (authenticated) socket and adds it to its statistics;
+                    // EchoRelay on its login service.
+                    if let Some(frame) = profile_update_frame(m) {
+                        if nakama {
+                            info!(instance = idx, player = ?m.user_id.as_ref().map(|u| &u.id), "sending match stats to nakama");
+                            rtx.send(TMsg::Binary(frame.into())).await?;
+                        } else if let Some(login) = up.login_url.clone() {
+                            tokio::spawn(async move { echorelay_profile_update(&login, frame).await });
+                        } else {
+                            warn!(instance = idx, "match stats but no login service to keep them");
+                        }
+                    }
+                    continue;
+                }
                 if let Some(Em::GameServerSaveLoadout(save)) = &env.message {
                     if nakama {
                         if let Some(out) = nakama_save_loadout(save) {
@@ -484,6 +510,28 @@ fn nakama_save_loadout(m: &pb::GameServerSaveLoadoutMessage) -> Option<Vec<u8>> 
     w.guid(entrant).u64(xpid[0]).u64(xpid[1]).u32(m.loadout_slot as u32).json_nt(json.to_string().as_bytes());
     info!(%entrant, items = m.loadout_instances.iter().map(|i| i.items.len()).sum::<usize>(), "saving loadout to nakama");
     Some(er_message(NAKAMA_SAVE_LOADOUT, w))
+}
+
+/// `SNSUserServerProfileUpdateRequest`: `[platform u64][account u64][payload json]`.
+fn profile_update_frame(m: &pb::SnsUserServerProfileUpdateRequestMessage) -> Option<Vec<u8>> {
+    let x = sns::XpId::parse(&m.user_id.as_ref()?.id)?;
+    let mut w = Writer::new();
+    w.u64(x.platform).u64(x.account).json_nt(m.payload.as_bytes());
+    Some(er_message(PROFILE_UPDATE_REQUEST, w))
+}
+
+async fn echorelay_profile_update(login: &str, frame: Vec<u8>) {
+    let r = async {
+        let (mut ws, _) = tokio_tungstenite::connect_async(login).await.context("connecting to the login service")?;
+        ws.send(TMsg::Binary(frame.into())).await?;
+        let _ = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        let _ = ws.close(None).await;
+        anyhow::Ok(())
+    };
+    match r.await {
+        Ok(()) => info!("sent match stats to EchoRelay"),
+        Err(e) => warn!(error = %e, "could not send match stats to EchoRelay"),
+    }
 }
 
 /// EchoRelay: a server profile update on its login service, as the native

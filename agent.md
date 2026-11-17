@@ -255,7 +255,7 @@ read over HTTP for this: `CR15NetGame::ClientPingResponseCB`, `ClientsPingEstCB`
   done: the server does not simulate or broadcast unowned props (native does, owner
   `ffffffff`), and the public arena disc bugs above are untouched.
 - Launcher: `launcher/src/update.rs` gets the newest GitHub release
-  (`heisthecat31/Echo-RS`, asset `echo-rust-server-windows.zip` / `-linux.zip`) at start
+  (`echo-vrce/Echo-RS`, asset `echo-rust-server-windows.zip` / `-linux.zip`) at start
   and on "Check for updates", swaps the two executables while the server is stopped
   (`*.old` removed next start), records the asset's upload time in `update-state.json`
   (the tag is re-uploaded in place). An automatic check never replaces a newer local
@@ -442,9 +442,11 @@ The user's order: **Combat lobby first** (`mpl_lobby_b_combat`, symbol
   free ~3.5 s after they leave; in the brawler room (no client message at all) it follows the body position:
   0 at (19.7, 0.5, 10.4) going in, 1 at (22.0, 1.0, 9.7) coming out (lobby1 capture 71.70 / 76.53 s).
   We never changed it, so nobody could punch in the brawler room. Now per player in `replicate`:
-  `Gear::may_fight` (combat area, or `in_brawler_room` box x 19.5..42, y -3..5, z 9.7..26), sent on change and
-  every second; logged as "lobby cease fire lifted/on" with the position. The box is fitted to one native
-  walk: if punching fails in part of the room, the log's position shows where.
+  `Gear::may_fight` (combat area, or `in_brawler_room`: within 8.0 m of the dome centre (26.5, -2.17, 14.15)),
+  sent on change and every second; logged as "lobby cease fire lifted/on" with the position. The dome
+  (`mpl_lobby_b_punch_hex_sphere_a`) was measured from a 1:1 FBX export of the level (cm, same axes as the
+  game): a sphere of radius 7.6 m, shell 7.2..7.9. Native's var flipped 7.7..8.3 m out at the doorway, and our
+  walk along the inside wall stayed within 7.9 m. An earlier box fit cut the room's sides off.
 - Whether native's value is per player or lobby-wide is unknown (one-player captures); we send it per player.
 - The `c064` / `c164` events are named `nevt_to_server_holstered_next_target_0/1` in SymbolNames.txt but are
   the combat-area edge in every capture. `nevt_to_all_*` / `nevt_to_peers_*` script events are not relayed by us.
@@ -467,3 +469,371 @@ The user's order: **Combat lobby first** (`mpl_lobby_b_combat`, symbol
   203.0.113.7 (server --public-ip) answered over this PC's IPv6, none without the plugin. Not tested: the real
   game, a remote player, the Starlink router passing inbound IPv6.
 - The hub listener is dual-stack too (`main::bind_tcp`), unrelated to the plugin.
+
+## Hits, barriers, OVERCHARGE, drone, DOT (2026-11-16)
+
+- `DamageableBulletCollision` (64 B, layout from native `CR15NetDamageableCS::NetBulletCollisionCB`):
+  `[gun 8][direction 12][hit point 12][target 8][target space u32][damage f32][body part u8 +3][shooter 8]`.
+  The target is what the shooter's client hit: a player is `PLAYER_ID` with byte 0 ^ slot in space `8ec21d00`;
+  area objects are pool handles `[index u16][gen u16][kind u32 = 1]` in space `26452bfc` (dummies 0x17/0x0d/0x16,
+  the barrier the user shot was index 8, body part 6 = "barrier"). We hurt exactly that target now (the old
+  nearest-body-within-1.2 m guess hit the wrong player when two stood close).
+- Barriers: native `DealDamage` -> `ProcessDamageServer` then broadcasts `SR15NetDamageableDealDamage`
+  `[space 8][handle 8][health f32][shield f32]`; clients set it (`ProcessDamageClient`) and break the barrier
+  at 0. Max health, break and respawn now come from the level data: see "Barriers from the level data" below.
+- OVERCHARGE (PowerBoost + the user's spec): the user's gun hits +damage_bonus_body (1) / +damage_bonus_head (2)
+  for dr_duration; the user and linked teammates take 25% less; a linked teammate cannot die for 8 s from the
+  first link (left at 1 health) until the unlink marker or they leave. Links come from the client's PowerBoost as
+  `DamageableDamageDealt` with amount -(1e6 use / 2e6 link / +2e6 rez / 6e6 unlink + dr permille*1000 + s).
+- Drone (item `b54a80cbdec72de3`): it fell back to the detonator's 0.12 s lifetime, so the server marked it used as
+  it was thrown and it blew up. Now `grenade_properties.drone.lifetime` (20 s) and its cooldown. Its shots
+  (`SR15NetAutoTargetFireBullet`, sent by the owner's client) are relayed to the others, as native's
+  `FireBulletNetwork` does. Shooting a drone down (its 70 health) is not done.
+- DOT FIELD: radius back to stock 2.25 m (EchoCombat had 3.5), 11 s on the ground (user; stock 8).
+  The host's balance-settings.json can still override the radius.
+
+## Combat matches (2026-11-16, offline; untested in game)
+
+- **Loading, all four maps** (`tools/gen_combat_maps.py`, needs the PC install + the balance JSON):
+  - IdsResponse: native answers from the level's net-component table (resource type
+    `0xc29715d62e039402`, 32-byte rows, actor id first), handles from 0x1b (the player space
+    has 0..0x1a). 13 of Gauss's 352 rows carry another name of the same actor; the client resolves
+    any name (`CncaGameSpace::Actor` binary-searches the level's name table), and the rows
+    give the captured Gauss and arena responses actor for actor, in order. Gauss uses its captured bytes.
+  - Balance: the captured Gauss block with each map's `mpl_combat_<map>_map_settings`.
+  - Baseline: Gauss's vars with the map's space id (the client inserts any var a packet names;
+    `CReplicatedVariables::SerializeFromPacket`). Vars only another map's scripts use start at defaults.
+- `src/engine/combat.rs` (+ `Session::run_combat`): game state, clock and countdown; native's
+  match-script events (module `6fa8cc9cd721a563`, the level's last net component = actor
+  `9550158657ffada8` on every map); the end sequence and top awards; join lock at the end.
+- **Payload, Gauss and Fission**: attackers = orange within 3.5 m (radius guessed), speed
+  1.25 x attacker multiplier x section (Gauss s02 0.75 between cp1 and cp2), contested stops, empty 5 s
+  then -0.25 m/s back to the last checkpoint. A checkpoint adds +120 s and holds clock and payload
+  for the celebration timer. End of track: orange wins; time up (4 s overtime while attackers claim): blue.
+  - Tracks from the level (`data/combat_<map>_track.txt`): `CR15TrackPointCR` (0x451830f92ddc5cc6,
+    56-byte rows, next at +32, flags u32 at +16: 0x60 checkpoint, 0x10 end) chained; points are the
+    first net components (trackpoint = 0x1b + k), the payload the next (Gauss 0xd0, Fission 0x60).
+    Positions from the name resource's transform table (48-byte rows quat/pos/scale): the single run of
+    `count` (u64 at 0xa8) unit-quaternion rows. Gauss's equal the recorded ones; checkpoints 77.8 / 126.0,
+    end 206.8 (recorded 78.1 / 126.0 / 206.8). Fission 56.5 / 103.7, end 181.8; its payload spawns on point 0.
+- **Capture point, Dyson and Combustion** (from the decompiled `CR15NetCaptureVolumeCS`, never recorded):
+  server sends `SR15NetCaptureVolumeUpdate` `[space 8][pool idx u16 = 0][gen u16 = 0][1 u32][possession u16
+  0 blue / 1 orange / 2 neutral][flags u16: 1 contested, 2 locked][converting u16, 0xffff][0 u16]` + per team
+  `[claimer bits u16 (bit = slot)][count u16][progress f32]`; `SR15NetCaptureVolumeReset` `[space][idx][gen][1]`
+  at round begin. Lock 45 s, a team alone converts in 4 s (progress down when not alone). Shapes from the level
+  (`data/combat_<map>_capture.txt`): `CR15NetCaptureVolumeCR` (0x93a1c9eaaaa00b44) lists `[id][kind]` from 0x98
+  (9 sphere, 10 OBB); data in resource 0xe8e38d7781a338a6 (sorted id table, second table, data). Dyson: sphere
+  r 5.89 at the centre; Combustion: 7 boxes. Points (the maps' scripts natively, unknown): holder 1/s on it,
+  0.5/s off it, 0 contested, 75 wins; sent in the arena team score vars (may not show on the combat HUD).
+  Round time is the settings' 4000 s; time up goes to the leader.
+- Gear in a match: everyone is in combat, the space is the level's id (native's Gauss server uses
+  it for explosions, DealDamage, the bitfield), no lobby dummies, respawn 6.65 s after a kill
+  (`PlayerRespawn [damageable][slot][0]`).
+- Not done: the capture points' native HUD score vars, the server-side level-script events listed under
+  "Hand-off" below. A native Dyson/Combustion recording would check the capture guesses.
+
+## Combat pass 2 (2026-11-16, the user's first test of a combat match)
+
+The user's report: joined straight into the map (no war-room hold), the orb had no timer, barriers
+didn't respawn, broken barriers stayed visible but let shots through, lobby training dummies show no damage.
+Also fixed earlier this pass: queueing for combat landed in the social lobby (`engine::session_info` now
+picks a random allowed combat map unless one is given; `lobby.rs` no longer picks a second time).
+
+### New native recordings: a full public Gauss match, both sides
+
+- `captures/netrec-gauss-20261116/` (client, the user playing; NetRecorder 1.1 `role client`) and
+  `captures/netrec-gauss-20261116-server/20261116_145847_7488/` (the native server of the same match,
+  `role server`). Decoded with `echo-rust-server --decode-netrec <dir>` -> `msgs.csv`. The server side
+  shows every client's c2s too. Times differ (client t+~107 s = server t).
+- Scratch decoders (not in the repo): replicated-var histories via a CSV pass over
+  `SR15NetReplicatedDeltaUnreliableVars` (rows from byte 30: `[hash u64][value u64]`).
+
+### Round flow (native, server times)
+
+| t | state (`VAR_GAME_STATE`) | match-script event (module 6fa8cc9cd721a563, handle 0x17a, filter 5) | countdown |
+|---|---|---|---|
+| 222.2 | (load) | `0x9ebb9a61909b5440`, `0x5ca9e3d2775375f5` | |
+| 223.9 | pre_match `d69cc3ed9f1e31bf` | | 30 (`pre_match_wait_time`) |
+| 252.25 | `dad765f3754f6262`, `e1c16321def4cc6c`, `fbc46082c080fbcf` (one frame each) | `0x18c4b28b0f4812c4` | 15 (`team_room_wait_time`) |
+| 267.27 | `37756d8877ed5768`, round_start `7b54c48fed3ecd93` | `0x0e5ce3dcce8c0872` | 45 (`pre_launch`) |
+| 312.28 | main_loop_enter, playing | `EV_ROUND_BEGIN` | clock 180 |
+| 647.74 (time up) | | `0xff20bef70ee3749c`, then `0xe14549f2f4c40266` filter 13 twice; LockEntrants | |
+| 648.3 | round_over ... (as before) | round over A/B, top awards; celebration +15, stats +25, lobby +40 | |
+
+- Our flow skipped the team room and its events: Waiting -> pre_match 30 s -> round_start. Now
+  `combat.rs` follows the table: `Phase::TeamRoom`, the load / team-room / round-start events, the
+  intermediate states one step each (`Combat::states` queue), and the end events by winner (payload home:
+  `EV_OVER_A`, `EV_OVER_B`, `EV_OVER_C` filter 13 twice, from the older recording; time up / draw: the
+  `EV_TIME_UP_*` pair). `combat::Out::Event` now carries its filter.
+- No teleport / orb messages at all in either recording: the war-room hold and the orb's countdown are the
+  client's level scripts reading the game state and countdown. The hypothesis (unconfirmed in game) is that
+  our missing team-room states/events are why the user walked straight out. The per-wave war-room locks
+  (`spawn_timers.orb_a_obj_N_*` in the map settings) showed up as no replicated var: client scripts too.
+
+### Client script events are relayed (new)
+
+- In a combat match clients send `SR15NetComponentEvent`s from their level scripts. Native relays the
+  filter-13 ones (bytes 18..20 = 13) to every other player, byte for byte, sender excluded (server recording:
+  war room handle 0x11c `2082acf24514897a` during the team room, doors 0x159/0x15a, 0x15e, barriers, etc.).
+  Filter-5 ones (`9e9111c27a42c0fb`, `9f9111c27a42c0fb`, `c06471ffde095d63`, `4401a3b4a69a55d5`, ...) go to the
+  server only. Before this pass `Session::on_client_event` dropped them all in combat; now it relays filter 13.
+- The native server also answers some with its own events (e.g. `bdb8b07964d35935` on 0x159/0x15a twice after a
+  client's `786488adc2ff4737`; the checkpoint events on modules `60b5...` / `1a03...` handle 0x15b and the payload
+  component 0xd0 events `d319d111f016a32b`, `56607fe3f592c908`, `a15f9368af3295e0`, `ec211f5b7798bc4f`). Those are
+  native's server-side scripts and are NOT done: list them from the server recording
+  (`dir == s2c`, `name == SR15NetComponentEvent`, no matching c2s just before) and map each to its trigger.
+
+### Barriers from the level data (new)
+
+- `CR15NetDamageableCR` (type `0xbd1868f576836696`): 56-byte rows from 0x40, actor at +0, max health f32 +28,
+  respawn seconds +32 (0 = stays down). Pool slots run over the rows in order; an ordnance template
+  (bytes 8..12 `ffff0f00`) takes **15** slots (Gauss's first barrier, component 329, is pool 0x69 in the
+  recording). The net handle is the actor's in the level's IdsResponse.
+- `tools/gen_combat_maps.py` writes `data/combat_<map>_barriers.txt` and `data/lobby_combat_barriers.txt`
+  (`pool handle max respawn`). Gauss 9 x (230 hp, 30 s), handles 0x164.. (recorded pool 0x71 -> 0x16c);
+  Dyson 13 (6 x 101 hp / 1 s, 3 x 230 / never, 4 x 180 / 30 s); Fission, Combustion none; lobby area 11
+  (230 hp, 30 s, pool 2 never) with handles 58.. from `ids_response_2645.hex`.
+- Native break (recorded twice): `DealDamage` 0 (the hit), then `ComponentEvent` `0xff278203989fcc2b`
+  module `0xc4b6bab2ee99ea6a`, the barrier's net handle, filter 13, `ffffffff`; `DealDamage` 0; the event
+  again. Exactly `respawn` s later the same with `DealDamage` max. `gear.rs` now does this (`barriers_of`,
+  `hit_barrier`, `respawns` in `due()`); unlisted barriers fall back to 230 hp and no event.
+  The break event is what makes the barrier drop visually; without it clients only stopped colliding.
+
+### Dummies
+
+- The lobby training dummies' path is unchanged and matches native byte for byte (only
+  `DamageableLocallyTrackedDamage` back to the shooter; tests check it). The user saw no damage numbers in this
+  build; not reproduced. Next: ask them to retest in the normal social lobby and compare with v0.1.4.
+
+## Combat pass 3 (2026-11-16 late): native Dyson, Combustion, Fission recordings
+
+Recordings (NetRecorder 1.1, client = the user, server = a native EchoVRCE server), decoded to `msgs.csv`:
+`captures/netrec-{dyson,fission,combustion}-20261116/` and `...-server/<run>/`. Server t = client t + 29.0 (Dyson).
+Raw balance JSON for every mode: `J:\echoApkTextureDev\Echo VR 4987570\assets\sourcedb\rad15\json\balance`
+(the Dyson native block is also decoded in `captures/balance/dyson/`; its map settings = `56f338e6d9c06227.json`).
+
+### Bug fixed: barrier events were byte-reversed
+
+`gear.rs` `BARRIER_EVENT` / `BARRIER_MODULE` were written as the wire bytes read as a big-endian u64, so the
+break/respawn event we sent was `2bcc9f98...` / `6aea99ee...`, not native's `ff278203989fcc2b` / `c4b6bab2ee99ea6a`.
+Likely why broken barriers stayed visible. Test `barrier_event_is_the_recorded_bytes` pins it.
+
+### Capture point (Dyson, Combustion), now as native
+
+- `SR15NetCaptureVolumeUpdate` bytes 16..24: `[possession u8][0][2 uninitialised bytes][converting u16][0 u16]`
+  (no contested/locked flags). Progress is seconds (0..4). Sent every frame while anything changes.
+- Nothing is sent while locked: first update exactly 45.0 s after `EV_ROUND_BEGIN`, already naming the converter.
+- Conversion: the converter's progress +1/s while its team is alone, -1/s otherwise (contested or empty); the other
+  team can only start once it drained to 0. 4 s flips possession, from neutral or straight from the other team.
+- Points (checked to the frame on both Dyson rounds): holder alone 1/s, nobody on it 0.5/s, any enemy on it 0.
+  75 wins the round. No var carries points (clients' scripts count them from the updates).
+- Every frame while contested (after unlock): `ComponentEvent` `eae1d95d61eb7a20`, module `c4b6bab2ee99ea6a`,
+  the volume's handle (Dyson 0xae, Combustion 0xa9 = the `CR15NetCaptureVolumeCR` actor at +0x40), filter 5.
+- Rounds: both maps played two rounds (one team won both; `round_count` 1 regardless). Code: first to 2
+  (`CAPTURE_ROUNDS_TO_WIN`, a guess for 1-1). No `round_start`: team room 15 s opens onto the round.
+  Between rounds: win events at +0, `ROUND_OVER_A` + round_over states + LockEntrants at +0.5, at +15.5
+  `0x6f884020dc2e8d0c`, UnlockEntrants, `EV_TEAM_ROOM`, all barriers restored (event / DealDamage max / event,
+  `Gear::restore_barriers`), team room; `CaptureVolumeReset` 5 s before the round begins.
+- Early entrant lock (done): in the round that decides the match, once the leader has 75% of `points_to_win`
+  (Combustion 389.26 at 56.27 points; Dyson's fits too). A first round past 75% does not lock.
+
+### All maps: who won
+
+- Orange: `OVER_C` (filter 13) twice. Blue: `TIME_UP_B` twice, after `TIME_UP_A` when a payload's time ran out.
+  `OVER_A` / `OVER_B` never appear on a server recording (removed).
+- The winner's team score var (`VAR_RED_SCORE` / `VAR_BLUE_SCORE` lo32) goes to 1; round score vars never set.
+
+### Payload (Fission recording)
+
+- `UpdateMiscState` `[handle][state u16][attackers u8][defenders u8][direction i8][0]`; byte 5 is now defenders.
+- Defenders alone push it back at once (no 5 s wait). `PosStateUpdate` on every trackpoint change, backwards too;
+  `TrackpointReached` only for new ground; the start point is never announced. All three done.
+- Multi-attacker speed (x1.2/1.3/1.35) was already in.
+- Misc state u16 (done): 1 during a checkpoint's celebration (clock held for `cN_celebration_timer`: Gauss 35 s / 20 s
+  exactly), 2 while autodriving, 8 once the match is over (sent with the win events).
+- Autodrive (done): `SR15NetPayloadUpdatedAutodriveReliable` `[handle][on u16][speed f32 0.15]`. Only on Fission,
+  at checkpoint 1 (tp 58): the payload drives itself FORWARD at 0.15 m/s to the track's 0x20 point (tp 59, 59.31 m;
+  `Track::autodrive`), the clock held until it arrives (18.5 s), state 2 from 5 s in, then autodrive off.
+  The user thought autodrive was the "payload returning" rollback; the recordings say otherwise: every rollback is
+  misc direction -1 with no autodrive message.
+- Rollback ("payload returning"), measured on Gauss: 0.25 m/s exactly (0.249 / 0.250 between trackpoints), after
+  5 s empty or at once with only defenders on it.
+- Overtime (done): when the clock hits 0 with attackers on it, `EV_OVERTIME_A` + `EV_OVERTIME_B`
+  (wire `23370169fde82c7d`, `8944e17a6a6fd420`, match module, filter 5; once per overtime). A checkpoint reached in
+  overtime sets the clock to 0 + `checkpoint_N` (Gauss: 120.00).
+- Early entrant lock (done): at 90% of the track (Fission 163.63 of 181.81 m, exact).
+- Not done: Gauss's s01/s03 section multipliers (choke-driven by scripts); an attacker arriving during a rollback
+  keeps direction -1 for 0.2-1.2 s natively; Fission's second celebration held 12 s, not its 10 s setting.
+
+### Second Gauss match (`captures/netrec-gauss2-20261116/`, client only so far)
+
+- The server zip (`J:\IDM\20261116_153707_10900.zip`) was not on disk yet; decode it into
+  `captures/netrec-gauss2-20261116-server/` when it is.
+- Confirms: defenders alone push back at once (`d00000000001ff00` many times), blue time-up events
+  (`TIME_UP_A`, `TIME_UP_B` x2, lock, then the usual end), the end state u16 = 8.
+- The old `EV_OVER_A` / `EV_OVER_B` are the overtime events (see Payload above): both times the clock hit 0 with
+  attackers on, 7.7 s and 12.9 s before the checkpoint that saved it.
+
+### Native-side findings for the user (not our code)
+
+- Detonator double damage (Dyson ~23:15:55): the thrower's client sent "detonated" (`a9509fd4...`) twice, 0.21 s apart;
+  native exploded on both (the second after it had already sent USED), so the victim got two
+  `ExplosionPlayerDamage`. Ours explodes once (`Mag::ending`).
+- Frame drop (~23:17:11): the native server process stalled 1.77 s (no frames to anyone, input queued); it began just
+  after a detonator throw. Clients only sent keepalives meanwhile. Not caused by anything we run.
+
+### Hand-off: state at the end of this pass
+
+- 91 tests pass; Windows + Linux built; zips in `dist/` rebuilt from `target/` (the user's server was running from
+  `dist/windows`, so its exe was not replaced). Nothing committed since v0.1.4.
+- Next: game test of Dyson/Combustion (rounds, contested event, barriers now dropping), Fission/Gauss (defenders
+  pushing back, Fission's autodrive, overtime, early lock); the open items above; war room hold; dummies' damage
+  numbers.
+
+## Combat pass 4 (2026-11-17): the level scripts' replicated vars
+
+The user's first Dyson test: no game-mode HUD, the point orange instead of locked, no "capturing" voice/sound, it
+never turned blue, an orb usable where it should not be, the timer refreshing twice. Cause: native's server runs
+the levels' scripts (`bin/win10/scripts/<hash>.dll`, compiled, no names in them) and they drive the HUD and the
+level through replicated vars; we sent only state/clock/countdown, over a baseline copied from a Gauss capture
+(another level's per-actor keys: 314 of Dyson's 322 vars missing or wrong).
+
+### What native sends (server recordings of all four maps, `peer 0` view)
+
+- One var stream only. The first full `SR15NetReplicatedDeltaUnreliableVars` (~300 rows) is per level: 27 keys are
+  common to all four maps, Dyson/Combustion share 43, the rest are per actor. The high 32 bits of int/float values
+  are garbage (stack residue: `000001dd`, `00000230`, even a previous key's half); clients read the typed part.
+- Match vars (all maps): sub-phase symbol `9de606e4…` (`6f6337a4…` → team room `d5039cdb…` → payload round start
+  `541c3aa0…` → round `1509ee27…`); team room flag `16940a2d…` (1 until the round begins; payload maps: also 1 during
+  some checkpoint holds, not modelled); round over flag `0eae8218…` (1 with `round_over_update`, 0 4.0 s into the
+  next team room; stays 1 after the match); post-match flag `5ef77e9e…` (1 at celebration + 3.04 s, 0 at the return
+  to lobby event); `f5bb086c…` celebration; round counter `4eb3e1b1…`.
+- Capture maps (keys shared by Dyson and Combustion): owner `e9192a0c…` and "who is on it" `34f3a75d…` as symbols
+  (locked `3fe39514…3df69263`, neutral `f558bbb6…`, blue `c8c33e48…`, orange `41d2c82f…`, both `ba11136c…`); per team
+  (blue, orange): head count on the point `45000053…`/`ed17977a…`, conversion progress 0..1 `a01bc18b…`/`8ad4206d…`
+  (0 again on capture), points fraction `8bd541a7…`/`ba4a488e…` and raw `c3c1c808…`/`5aa67dae…` (created with the
+  first point, 0 again in the next team room), scoring now `4f8aa683…`/`df542064…` (owner and no enemy on it); lock
+  count `eb40dd00…` (45 → 0); rounds won `72c15861…`/`b546f3ac…` and last round's winner `c5c2fc48…`. The owner stays
+  until the volume reset 5 s before the next round (we reset it there now, the points in the team room).
+- Level vars from client events: a client's filter-5 `ComponentEvent`s (door triggers `9e9111c2…`/`9f9111c2…`, area
+  enter/leave `c06471ff…`/`c16471ff…`, the war room objects' `e2ac5ced…`/`ac06d3b3…`) make native set level vars at
+  once, the same value every time. Learned per map (≥ 80% of occurrences, ≥ 2) into
+  `data/combat_<map>_reflex.txt`; barrier vars (0 while their barrier is down) into
+  `data/combat_<map>_barrier_vars.txt`.
+
+### Done
+
+- `tools/gen_combat_vars.py` writes each map's baseline (native's first full message + the late-created vars the
+  server drives, value 0), reflexes and barrier vars. `combat_<map>_rep_s1.hex` removed (native has no stream 1).
+- `combat.rs`: `Script` (reflexes, barrier vars), the match and capture vars above (`vars()`, `capture_vars()`),
+  `client_event()`, `set_barriers_down()` (from `Gear::barriers_down()`); the end sequence now sends both states of
+  `post_match_celebration` and `personal_stats` (enter, then update).
+- `session.rs`: combat vars go out when changed, all of them twice a second; client filter-5 events in combat feed
+  `client_event`.
+- 94 tests pass; Windows + Linux built, `dist/` and zips updated. Nothing committed since v0.1.4.
+
+### Not done / unknown
+
+- Payload maps' HUD vars (Fission, Gauss: `8ba9857e…`/`a8fc5db5…` contested symbol, `70abe536…` payload state
+  symbol, `a1570bd3…`/`5faf3b26…`, `d52dae83…` direction, `a989e608…` a counter 1..4, `c38d974a…`, `185651ce…`,
+  `e68b8118…` a 20 s count) are not driven yet; their baselines are native's now.
+- The "orb" the user could use: not identified. Candidates are the war room objects behind `e2ac5ced`/`ac06d3b3`
+  (handles 0x94/0x95/0x97 on Dyson, vars `282ba8fe…`, `3653a99d…`, `6fcbc7fb…`) and the team room flag; both are now
+  sent as native does. Needs the user's next test.
+- Per-player vars (keys with the slot in their high bits: `f6b7893b…` slot 1, `9bc38757…` 2, `71d285d5…` 3,
+  `a5b08065…` 4; floats decaying from ~0.5) are not sent.
+
+## Combat pass 5 (2026-11-17): barriers, war room, round wins, stats and XP
+- Barrier break (Dyson/Gauss recordings): `DealDamage` 0 in the hit's frame; +1 frame (10 ms) the `ff27…` event and
+  `DealDamage` 0; +1 frame the level script's own event again (logged `c2s -1`: the server's loopback, not a client).
+  Respawn: event + full health, the echo event 7 ms later. Ours sent all four in one frame (`gear.rs` now queues them).
+- Respawn time: every barrier with the damageable row's +36 flag respawns after 30 s; +32 is not seconds (Dyson's 101-hp
+  barriers have 1 there and came back after 30.0 s). `gen_combat_maps.py` fixed, Dyson's table patched; the generator no
+  longer writes `rep_s*.hex` (gen_combat_vars.py owns them).
+- War room targets are in space `0bef8d109eafa108`: native answers only `LocallyTrackedDamage` in that space to the
+  shooter (6 x 1.4 head, from the EchoCombat damage table). Matches now use the combat weapon table, and in a match no
+  tracked-damage markers for player hits (native sends none). Shot ordnance takes damage from 9999.
+- Not done: explosions damaging barriers (needs barrier positions); Gauss's 415-hp template target `d263e3b2…`.
+- Game state actor (module `60b50669f21b4186` on the wire; handle Dyson 0xaf, Combustion 0xaa, Fission 0xee, Gauss
+  0x15b), filter 5: round won [blue `6f5d5174…`, orange `b9bbd8fc…`] + another round [`892b8089…`, `6f54f84f…`] or the
+  match [`5f7f837e…`, `65663a60…`]; payload end = match won + `6d6e4517…`; checkpoints `b4448190…`, `0af13979…` (Gauss
+  cp1 also `bb9a590a…`, `e093402c…` on module `1a03e276b299753e`). Team room cue `7459b7ca…` (module/handle all ones)
+  3.07 s and 4.05 s into a between-rounds team room. Unsent: Gauss `8c9fbdd6…` 21.4 s after cp1.
+- The end events (round over A/B, celebration, personal stats, return) already matched native.
+- Combat stats (`stats::CombatStats`): every 3 s, at a round's win and at the end, `ReliableStatUpdate` per slot with
+  running totals (CombatObjectiveDamage, Eliminations, ObjectiveEliminations, ObjectiveTime, Kills, Assists, Deaths,
+  Damage) and `ReliableTeamStatUpdate` per team: 8 records `[sym][m i32][e i32][players i32]`, value m*2^e (reals on a
+  1/64 grid, whole reals with factors of 2 in e). Objective = in the capture volume / within 3.5 m of the payload while
+  playing. Assists: damage in the last 10 s (guess; native Dyson had none).
+- Awards: MVP from the winning team (score guessed); tier rewards one per player, gold→silver→bronze over
+  Eliminations, ObjectiveEliminations, ObjectiveTime (150/100/50 XP). XP (fits all four recordings): win 1200, loss
+  1000 if present for half the match, +100 MVP, + tier XP. `SNSRefreshProfileFromServer` `[platform][account][json]`
+  with the stats under combat/daily_/weekly_. Native's "Level" add (21 for the MVP, 3-5 others) is not derivable: not sent.
+- Kept: built-in lobby → `Store::apply_stats` ({cnt, op, val}); nakama → native `SNSUserServerProfileUpdateRequest`
+  `[xpid][{"matchtype": echo_combat, "sessionid", "update": {"stats": {"combat": {op, val, cnt}}}}]` on its socket (both
+  bridges; nakama3 `userServerProfileUpdateRequest` → statistics boards, XP forced to add); EchoRelay → its login service.
+- Launcher updates now come from `echo-vrce/Echo-RS`.
+- Contested (fixed after the user's test): `SR15NetCaptureVolumeUpdate` byte 18 (after the possession u16) is a flags
+  byte, bit 0 = both teams on the point; the client's contested announcer/effects key off it. Its other bits and byte
+  19 are uninitialised in native (that is why it looked random). The `eae1d95d…` event every frame was already sent.
+
+## Combat pass 6 (2026-11-17): barrier splash, barrier visuals, war room dummies
+
+- **A broken barrier is hidden by a level var, not by its events.** Native's level script answers its own break event
+  (the "c2s -1" loopback) by setting one var per barrier 1 -> 0 a frame later (back on respawn); clients draw what the
+  var says. **The var is a CSymbol64 of a name holding the barrier's net handle in hex, 34 characters before its end**:
+  two barriers' vars differ by exactly the CRC (linear) of their handles' differing hex digits. So one recorded var
+  gives every barrier's (`barrier_var` in `gen_combat_vars.py`, which asserts each result is a baseline var at 1 and
+  equals every recorded one). All 13 of Dyson's (0xb8..0xc4) and 9 of Gauss's (0x164..0x16c) are in
+  `combat_<map>_barrier_vars.txt`; Fission and Combustion have no level barriers (their damageable tables).
+- **Splash on barriers** (native Dyson dets): per barrier reached, `DealDamage` with the new health, then
+  `ExplosionPlayerDamage` with victim `ffff…` at the barrier's point nearest the blast; the break follows as for bullets.
+  Damage x the damage table's `barrier` (det 2.15: 65 → 140 breaks a 101; rocket_aoe 2; scout_aoe 0). Det reach 2.5 m,
+  full to 1 m then down to 40% (native left one 2 m off with 97 taken). Barriers are boxes now:
+  `combat_<map>_barriers.txt` carries each actor's place and rotation (level names table) and a box by health
+  (`BARRIER_BOXES` in `gen_combat_maps.py`, from recorded bullet hit points; Dyson 101s: half 1.34 x 0.7, z 0..0.26 —
+  native's blast points sit on those edges).
+- **War room dummies**: the war room level (`0bef8d109eafa108`) has 12 damageables (7 HP), pool slots 0..11, world
+  places from its names table (blue and orange war rooms; bullets hit them 1.2–1.4 m above). In a match explosions
+  reach them; the marker goes in the war room's space naming `[slot u32][1]`.
+- **Body parts** (native war room markers, BLASTER and COMET): 0/1 legs, 2/3 arms, 4 torso, 5 head. We had only 2 = arm,
+  so legs and part 3 took torso damage (players too). Gauss's SMG gave 1.0 on 2/3 then: its table had arm 1 at the time.
+
+## Combat pass 7 (2026-11-17): the payload, from the Gauss and Fission server recordings
+
+- **Claiming is a hand on the payload, not being near it.** `SR15NetTouchStateEvent` (mailbox, c2s):
+  `[space u32][slot u16][u16][sequence 10 bits][hand 7 bits][hand 7 bits]`, each hand the touch entry it holds
+  (none = the level's entry count: Gauss 110, Fission 109). The payload is entry 105 on both maps. Every attacker /
+  defender count change in `UpdateMiscState` is 1-2 ms after that player's touch state with a hand going on or off
+  105 (a player standing on the cart flipped it 1, 0, 1 without moving). Dead players do not count (Fission 238.52).
+  The session keeps `on_payload` per peer; `Combat::set_payload_holders`. The old 3.5 m radius is gone from the claim
+  (it is still what the match stats' objective time uses: what native counts there is not recorded).
+- **The payload's dynamics are the engine's** (`echovr.exe` server update at 0x140d84ff0, `CR15NetPayloadCS`), with the
+  level's `CR15NetPayloadCR` row (type `3850c0283892236e`, 64 bytes after the 0x40 header, the same on Gauss and Fission:
+  +0x10 flags 0x20 SlowReverse, +0x1c 1.0, +0x20 6.0, +0x24.. 1/1.2/1.3/1.35, +0x34 1.0, +0x38 0.1, +0x3c 0.2):
+  - an inner speed moves toward its target by 1.0 m/s each second (+0x1c);
+  - attackers alone: target = max speed x `payload_speed_multi_attacker_N` (N capped at 4), idle timer 0;
+  - both teams, paused (a celebration) or autodrive: stopped at once, idle timer 0;
+  - nobody: the idle timer runs and it is stopped; past 6.0 s (+0x20), or with a defender's hand on it at once, target =
+    -(1.0 + 0.1 x defenders) x max speed (+0x34, +0x38); stopped where it cannot go back (the floor);
+  - a negative inner speed moves the cart x 0.2 (+0x3c): 0.25 m/s at 1.25, 0.15 on Gauss's 0.75 stretch (both recorded);
+  - the direction byte is the speed's sign; the state word is the component's flags (1 paused, 2 autodrive,
+    4 irreversible, 8, 16).
+  `ResetMaxMPS` (0x140d3ef90) puts the settings' speed back; a level script's `SetMaxMPS` changes it.
+- **Gauss's speed**: 1.25 m/s from the start through checkpoint 1 up to trackpoint 87 (85.49 m), then 0.75 m/s
+  (`s02_payload_speed_multiplier`, taken as m/s: 1.25 x 0.75 was not what native ran), slowing at 1 m/s each second.
+  `s01_payload_speed_multiplier` (1.7) showed nowhere in section 1. The level script is `e9a57ec0c6890cb1.dll`
+  (`section01_first_speed_update`, `section02_bottom_ramp`, `section03_post_tunnel`, `section03_final_push`): its
+  triggers are not trackpoints (no script holds a trackpoint's actor id). **Not known**: where section 3's speeds
+  (pre tunnel 1.0, post tunnel 1.25, final push 1.0) apply: the recorded match ended at 110 m. Past 85.49 m the server
+  stays at 0.75 m/s.
+- **State 16**: an empty payload that rolls back onto its last checkpoint reports the trackpoint before it,
+  state 16, direction 0 (Gauss 521.04); a hand on it puts it on the checkpoint's trackpoint again at once. Native
+  cleared 16 when a later push back ended (561.99; one sample each way).
+- Scripts: `bin/win10/scripts/<module>.dll` are the level and mode scripts, compiled node graphs named by their module
+  symbol (`6fa8cc9cd721a563` the match, `45e8df51b7524e20` `mp_combat_gamemode_payload`, `adf5c8a958dbf153` the
+  payload's lights and sounds). The native servers' own balance blocks are in the recordings
+  (`SR15NetBalanceSettingsMassUpdate`): the det has no radius or damage there, only its `barrier` 2.1538462.
+- Still not from native: barrier box sizes for the 180 and 230 HP barriers (bullet-hit extents, few hits), a det's
+  falloff on barriers (one partial sample: 97 of 140 about 2 m off), `CAPTURE_ROUNDS_TO_WIN` (both native capture
+  matches ended 2-0: first to two fits, a 1-1 was never seen; the rule is in the match script).

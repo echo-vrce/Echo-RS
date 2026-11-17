@@ -8,6 +8,7 @@
 //! it wakes at 100 Hz for retransmits and at 20 Hz for the server frame.
 
 pub mod balance;
+pub mod combat;
 pub mod gear;
 pub mod filter;
 pub mod goal;
@@ -88,10 +89,26 @@ fn session_info(c: &pb::LobbySessionCreateMessage) -> SessionInfo {
     };
     let mode = num("gametype").filter(|m| *m != 0).unwrap_or(msg::SOCIAL_MODES[0]);
     let arena_modes = ["echo_arena", "echo_arena_private", "echo_arena_tournament", "echo_arena_public_ai", "mpl_tutorial_arena"];
-    let level = num("level").filter(|l| *l != 0 && *l != u64::MAX).unwrap_or_else(|| {
-        if arena_modes.iter().any(|m| crate::sns::symbol(m) == mode) { msg::LEVEL_ARENA } else { msg::LEVEL_SOCIAL }
-    });
+    let combat_modes = ["echo_combat", "echo_combat_private", "echo_combat_tournament"];
+    let combat = combat_modes.iter().any(|m| crate::sns::symbol(m) == mode);
+    let level = num("level").filter(|l| *l != 0 && *l != u64::MAX);
+    let level = match level {
+        // A combat session needs a combat map: EchoRelay's public combat queue
+        // sends none, which used to land players in the social lobby as combat
+        // players. Pick one of the maps this server hosts.
+        _ if combat && !level.is_some_and(|l| combat::LEVELS.contains(&l)) => combat_map(mode),
+        Some(l) => l,
+        None if arena_modes.iter().any(|m| crate::sns::symbol(m) == mode) => msg::LEVEL_ARENA,
+        None => msg::LEVEL_SOCIAL,
+    };
     SessionInfo { lobby, mode, level }
+}
+
+/// A random combat map this server hosts for `mode` (any, if it hosts none).
+fn combat_map(mode: u64) -> u64 {
+    let ok: Vec<u64> = combat::LEVELS.iter().copied().filter(|&l| filter::allows(mode, l)).collect();
+    let from = if ok.is_empty() { combat::LEVELS.to_vec() } else { ok };
+    from[rand::random::<usize>() % from.len()]
 }
 
 async fn run(idx: u32, socket: UdpSocket, url: String, mut stop: watch::Receiver<bool>, cfg: EngineConfig) {
@@ -391,5 +408,30 @@ fn on_fleet(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(settings: &str) -> SessionInfo {
+        session_info(&pb::LobbySessionCreateMessage { settings_json: settings.into(), ..Default::default() })
+    }
+
+    #[test]
+    fn combat_sessions_get_a_combat_map() {
+        let combat = crate::sns::symbol("echo_combat") as i64;
+        // EchoRelay's public combat queue: no map, or the social lobby's.
+        for s in [format!(r#"{{"gametype":{combat}}}"#), format!(r#"{{"gametype":{combat},"level":{}}}"#, msg::LEVEL_SOCIAL as i64)] {
+            assert!(combat::LEVELS.contains(&info(&s).level), "{s}");
+        }
+        // A combat map asked for is kept.
+        let s = format!(r#"{{"gametype":{combat},"level":{}}}"#, combat::LEVEL_FISSION as i64);
+        assert_eq!(info(&s).level, combat::LEVEL_FISSION);
+        // Social and arena unchanged.
+        assert_eq!(info("{}").level, msg::LEVEL_SOCIAL);
+        let arena = crate::sns::symbol("echo_arena") as i64;
+        assert_eq!(info(&format!(r#"{{"gametype":{arena}}}"#)).level, msg::LEVEL_ARENA);
     }
 }
