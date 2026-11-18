@@ -68,9 +68,57 @@ use rad_protocol::symbol::MatSym;
 use serde_json::Value;
 
 use super::msg::{
-    ST_MAIN_LOOP_ENTER, ST_MATCH_END, ST_PLAYING, ST_PRE_MATCH, ST_PRE_MATCH_DONE, ST_ROUND_START, Val, VAR_BLUE_SCORE,
-    VAR_CELEBRATION, VAR_COUNTDOWN, VAR_GAME_CLOCK, VAR_GAME_STATE, VAR_RED_SCORE,
+    ST_MAIN_LOOP_ENTER, ST_MATCH_END, ST_PLAYING, ST_PRE_MATCH, ST_PRE_MATCH_DONE, ST_ROUND_START, Val, VAR_BLUE_READY,
+    VAR_BLUE_SCORE, VAR_CELEBRATION, VAR_COUNTDOWN, VAR_GAME_CLOCK, VAR_GAME_STATE, VAR_ORANGE_READY, VAR_RED_SCORE,
 };
+
+// ── Private matches ─────────────────────────────────────────────────────────
+// `echo_combat_private`: native waits in `pre_match_wait_for_ready` until
+// every team with players has pressed its terminal's ready (an empty team does
+// not hold the other up), then plays as a public match does. A payload map
+// plays two halves: orange attacks, the payload's furthest point is kept as a
+// marker, the teams swap sides (blue becomes orange and attacks) and the new
+// attackers win by getting the payload as far; if their time runs out short
+// of it, the first attackers win. (No native private combat recording: the
+// halves follow the game's own rules as players describe them; the marker
+// vars are the level's names from the symbol dictionary, unverified.)
+const ST_WAIT_FOR_READY: u64 = 0x1c79_024a_0c34_e549;
+const VAR_FURTHEST_ROUND: [u64; 2] = [0x00e5_031f_be4a_d639, 0x00e5_031f_be4a_d63a];
+const VAR_TEAM_DISTANCE: [u64; 2] = [0xe19b_4f91_8bf8_7b83, 0xdefa_0c74_7357_0171];
+const VAR_TEAM_A_MARKER_POS: u64 = 0x07e7_3ff9_4812_9a0a;
+const VAR_TEAM_A_MARKER_SHOWN: u64 = 0x107e_ce0c_1520_cc7d;
+const VAR_PROGRESS_MARKER_POS: u64 = 0xe873_948c_32c9_94a0;
+const VAR_PROGRESS_MARKER_SHOWN: u64 = 0x89fb_46c6_d1b1_293b;
+const VAR_DEFENDING_TEAM: u64 = 0xf881_55a6_6a6b_05f8;
+const VAR_TOTAL_ROUNDS: u64 = 0x9042_518a_de2d_74b2;
+const VAR_ROUNDS_PLAYED: u64 = 0x50ba_16e5_7e95_8204;
+
+// ── Payload HUD (native Gauss and Fission server recordings, 2026-11-16) ────
+/// Who holds the payload: `Unclaimed`, `attackerPossessed`, `contested` (a
+/// defender alone stays `Unclaimed`). Each level keeps a copy of its own.
+const VAR_CLAIM_STATE: u64 = 0x8ba9_857e_5c38_d27d;
+const VAR_CLAIM_STATE_FISSION: u64 = 0x24ee_4033_c210_54ed;
+const VAR_CLAIM_STATE_GAUSS: u64 = 0xa8fc_5db5_1329_d7ad;
+const CLAIM_NONE: u64 = 0xf558_bbb6_0dc3_bb9a;
+const CLAIM_ATTACKERS: u64 = 0x8b67_f8fc_b701_88a4;
+const CLAIM_CONTESTED: u64 = 0xba11_136c_4dd2_e646;
+/// The payload's motion (`still`, `forward`, `backward`), its direction
+/// (`backward` only while it rolls back) and moving (1, 0, -1).
+const VAR_PAYLOAD_MOTION: u64 = 0x70ab_e536_3113_cdf7;
+const VAR_PAYLOAD_DIRECTION: u64 = 0xc78a_fe76_b073_4e3a;
+const VAR_PAYLOAD_MOVING: u64 = 0xd52d_ae83_702e_6fb3;
+const MOTION_STILL: u64 = 0xe32d_c7c9_cd86_48bc;
+const MOTION_FORWARD: u64 = 0x2fd1_808d_4975_458e;
+const MOTION_BACKWARD: u64 = 0x34ec_971c_3efe_9662;
+/// Attackers on it (0/1, and the same as a flag byte), defenders on it (count).
+const VAR_ATTACKER_CLAIM: u64 = 0xa157_0bd3_e2ea_aac7;
+const VAR_ATTACKER_FLAG: u64 = 0x5faf_3b26_2449_647a;
+const VAR_DEFENDER_CLAIM: u64 = 0x21e8_feec_3e84_4a3d;
+/// `overtime_progress`: 1.0 from the attackers' first claim on (both maps).
+const VAR_OVERTIME_PROGRESS: u64 = 0x9d89_a48a_426b_a48f;
+/// Gauss's door at its first checkpoint: whole seconds left, 20 down to 0.
+const VAR_GAUSS_DOOR: u64 = 0xe68b_8118_ed84_d0de;
+const GAUSS_DOOR_SECS: f32 = 20.0;
 
 /// Someone on a team: team (0 blue, 1 orange), alive, body position, slot.
 pub type Player = (u8, bool, Option<[f32; 3]>, u8);
@@ -324,6 +372,9 @@ pub enum Out {
     Unlock,
     /// Every barrier back up (a capture map's next round).
     RestoreBarriers,
+    /// A private payload match's half time: every blue player goes orange
+    /// and every orange player blue.
+    SwapTeams,
 }
 
 /// What native's level scripts do that the server repeats: a client's
@@ -616,6 +667,62 @@ struct Payload {
     /// The misc state (0, `PAYLOAD_CELEBRATING`, ...).
     state: u16,
     sent: Option<(u16, u8, u8, i8)>,
+    /// The furthest it got (metres).
+    furthest: f32,
+    /// For the HUD: attackers and defenders on it, moving (1, 0, -1; 0
+    /// while held or driving itself), claimed by attackers yet.
+    hud: (u8, u8, i8),
+    claimed_once: bool,
+    /// Gauss's door count, from its first checkpoint.
+    door: Option<f32>,
+}
+
+impl Payload {
+    fn new(track: Track) -> Self {
+        // Native never announces the starting trackpoint (Fission's first is 0x1c).
+        let first = track.points.first().map_or(0, |e| e.0);
+        Self {
+            // The payload is the net component right after the track points.
+            handle: 0x1b + track.points.len() as u16,
+            track,
+            dist: 0.0,
+            best_tp: first,
+            cur_tp: first,
+            next: 0,
+            idle: 0.0,
+            speed: 0.0,
+            max_mps: None,
+            hold: 0.0,
+            autodrive_to: None,
+            auto_for: 0.0,
+            state: 0,
+            sent: None,
+            furthest: 0.0,
+            hud: (0, 0, 0),
+            claimed_once: false,
+            door: None,
+        }
+    }
+}
+
+/// `data/combat_<map>_track_vars.txt` (`tools/gen_track_vars.py`): level vars
+/// native's scripts set as the payload first reaches a trackpoint (the
+/// checkpoint counter and symbol, the level's load progression, ...):
+/// (trackpoint, var, value, value before the match).
+fn track_vars(level: u64) -> Vec<(u16, u64, u64, u64)> {
+    let text = match level {
+        LEVEL_GAUSS => include_str!("data/combat_gauss_track_vars.txt"),
+        LEVEL_FISSION => include_str!("data/combat_fission_track_vars.txt"),
+        _ => return Vec::new(),
+    };
+    let hex = |x: &str| u64::from_str_radix(x, 16).ok();
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            Some((hex(w.first()?)? as u16, hex(w.get(1)?)?, hex(w.get(2)?)?, hex(w.get(3)?)?))
+        })
+        .collect()
 }
 
 pub struct Combat {
@@ -662,6 +769,18 @@ pub struct Combat {
     /// Capture maps: the points vars exist (native creates them with the
     /// first point, then resets them in the next team room).
     points_shown: bool,
+    /// A private match (see the notes at the top): teams ready up.
+    private: bool,
+    ready: [bool; 2],
+    /// The match-load events went out (a private match waiting for ready).
+    loaded: bool,
+    /// Private payload: the half (1, 2) and the first attackers' furthest
+    /// point, which the second must reach.
+    half: u8,
+    to_beat: Option<f32>,
+    track_vars: Vec<(u16, u64, u64, u64)>,
+    /// Level vars from `track_vars` set so far.
+    track_set: Vec<(u64, Val)>,
 }
 
 fn f(v: &Value, path: &str, def: f32) -> f32 {
@@ -675,27 +794,7 @@ impl Combat {
         if !LEVELS.contains(&level) {
             return None;
         }
-        let payload = Track::of(level).map(|track| {
-            // Native never announces the starting trackpoint (Fission's first is 0x1c).
-            let first = track.points.first().map_or(0, |e| e.0);
-            Payload {
-                // The payload is the net component right after the track points.
-                handle: 0x1b + track.points.len() as u16,
-                track,
-                dist: 0.0,
-                best_tp: first,
-                cur_tp: first,
-                next: 0,
-                idle: 0.0,
-                speed: 0.0,
-                max_mps: None,
-                hold: 0.0,
-                autodrive_to: None,
-                auto_for: 0.0,
-                state: 0,
-                sent: None,
-            }
-        });
+        let payload = Track::of(level).map(Payload::new);
         let mut c = Self {
             level,
             phase: Phase::Waiting,
@@ -729,6 +828,13 @@ impl Combat {
             celebrating: false,
             last_round_winner: None,
             points_shown: false,
+            private: false,
+            ready: [false; 2],
+            loaded: false,
+            half: 1,
+            to_beat: None,
+            track_vars: track_vars(level),
+            track_set: Vec::new(),
         };
         c.clock = c.round_secs();
         c.countdown = f(&c.rules, "/round_rules/pre_match_wait_time", 30.0);
@@ -776,8 +882,123 @@ impl Combat {
             }
             v.extend(self.capture_vars(c));
         }
+        if let Some(p) = &self.payload {
+            v.extend(self.payload_vars(p));
+        }
+        if self.private {
+            v.push((VAR_BLUE_READY, Val::Lo8(u8::from(self.ready[0]))));
+            v.push((VAR_ORANGE_READY, Val::Lo8(u8::from(self.ready[1]))));
+        }
         self.script.vars(&mut v);
+        v.extend(self.track_set.iter().copied());
         v
+    }
+
+    /// The payload's HUD vars (see their notes), and a private match's
+    /// halves.
+    fn payload_vars(&self, p: &Payload) -> Vec<(u64, Val)> {
+        let (att, def, moving) = p.hud;
+        let claim = match (att > 0, def > 0) {
+            (true, true) => CLAIM_CONTESTED,
+            (true, false) => CLAIM_ATTACKERS,
+            _ => CLAIM_NONE,
+        };
+        // Native Fission: a self-driving payload stays `forward`.
+        let motion = match moving {
+            1 => MOTION_FORWARD,
+            -1 => MOTION_BACKWARD,
+            _ if p.autodrive_to.is_some() => MOTION_FORWARD,
+            _ => MOTION_STILL,
+        };
+        let mut v = vec![
+            (VAR_CLAIM_STATE, Val::Raw(claim)),
+            (VAR_PAYLOAD_MOTION, Val::Raw(motion)),
+            (VAR_PAYLOAD_DIRECTION, Val::Raw(if moving < 0 { MOTION_BACKWARD } else { MOTION_FORWARD })),
+            (VAR_PAYLOAD_MOVING, Val::Lo32(moving as i32 as u32)),
+            (VAR_ATTACKER_CLAIM, Val::Lo32(u32::from(att > 0))),
+            (VAR_ATTACKER_FLAG, Val::Lo8(u8::from(att > 0))),
+            (VAR_DEFENDER_CLAIM, Val::Lo32(u32::from(def))),
+            (VAR_OVERTIME_PROGRESS, Val::F32(if p.claimed_once { 1.0 } else { 0.0 })),
+        ];
+        match self.level {
+            LEVEL_FISSION => v.push((VAR_CLAIM_STATE_FISSION, Val::Raw(claim))),
+            LEVEL_GAUSS => v.push((VAR_CLAIM_STATE_GAUSS, Val::Raw(claim))),
+            _ => {}
+        }
+        if let Some(d) = p.door {
+            v.push((VAR_GAUSS_DOOR, Val::Lo32(d.max(0.0).ceil() as u32)));
+        }
+        if self.private {
+            // Team a: the first attackers (orange in the first half).
+            let first = self.to_beat.unwrap_or(p.furthest);
+            let second = if self.to_beat.is_some() { p.furthest } else { 0.0 };
+            v.extend([
+                (VAR_TOTAL_ROUNDS, Val::Lo32(2)),
+                (VAR_ROUNDS_PLAYED, Val::Lo32(u32::from(self.half - 1))),
+                (VAR_DEFENDING_TEAM, Val::Lo32(0)),
+                (VAR_FURTHEST_ROUND[0], Val::F32(first)),
+                (VAR_FURTHEST_ROUND[1], Val::F32(second)),
+                (VAR_TEAM_DISTANCE[0], Val::F32(first)),
+                (VAR_TEAM_DISTANCE[1], Val::F32(second)),
+            ]);
+            if let Some(d) = self.to_beat {
+                let shown = Val::Lo8(1);
+                v.extend([
+                    (VAR_TEAM_A_MARKER_POS, Val::F32(d)),
+                    (VAR_TEAM_A_MARKER_SHOWN, shown),
+                    (VAR_PROGRESS_MARKER_POS, Val::F32(d)),
+                    (VAR_PROGRESS_MARKER_SHOWN, shown),
+                ]);
+            }
+        }
+        v
+    }
+
+    /// A private match: teams ready up before it starts.
+    pub fn set_private(&mut self) {
+        self.private = true;
+        self.state = ST_WAIT_FOR_READY;
+    }
+
+    pub fn is_private(&self) -> bool {
+        self.private
+    }
+
+    /// A private match's team (0 blue, 1 orange) pressed ready: true if that
+    /// counts (still waiting, not ready yet).
+    pub fn team_ready(&mut self, team: usize) -> bool {
+        if !self.private || self.phase != Phase::Waiting || team > 1 || self.ready[team] {
+            return false;
+        }
+        self.ready[team] = true;
+        true
+    }
+
+    /// The level vars a trackpoint's first reach sets (all those passed, in
+    /// order).
+    fn reach_track_vars(&mut self, from: u16, to: u16) {
+        for &(tp, var, value, _) in &self.track_vars {
+            if tp > from && tp <= to {
+                upsert(&mut self.track_set, var, Val::Raw(value));
+            }
+        }
+    }
+
+    /// Back to the start of the track (a private match's second half): the
+    /// level vars as before the match, the payload where it began.
+    fn reset_payload(&mut self) -> Vec<Out> {
+        for &(_, var, _, before) in &self.track_vars {
+            // A var the match created keeps its type tag.
+            let v = if before == 0 { Val::Lo32(0) } else { Val::Raw(before) };
+            upsert(&mut self.track_set, var, v);
+        }
+        let Some(p) = self.payload.as_mut() else { return Vec::new() };
+        let track = std::mem::replace(&mut p.track, Track { points: Vec::new(), checkpoints: Vec::new(), autodrive: Vec::new() });
+        *p = Payload::new(track);
+        let mut b = p.handle.to_le_bytes().to_vec();
+        b.extend_from_slice(&p.cur_tp.to_le_bytes());
+        p.sent = Some((0, 0, 0, 0));
+        vec![Out::Reliable(PAYLOAD_POS, b), Out::Reliable(PAYLOAD_MISC, misc(p.handle, (0, 0, 0, 0)))]
     }
 
     /// The capture point's script vars (native Dyson and Combustion, to the
@@ -889,6 +1110,25 @@ impl Combat {
             self.state = s;
         }
         match self.phase {
+            Phase::Waiting if self.private => {
+                if !players.is_empty() && !self.loaded {
+                    self.loaded = true;
+                    out.push(self.event(EV_LOAD_A));
+                    out.push(self.event(EV_LOAD_B));
+                }
+                let on = |t: u8| players.iter().any(|p| p.0 == t);
+                let (b, o) = (on(0), on(1));
+                if (b || o) && (!b || self.ready[0]) && (!o || self.ready[1]) {
+                    tracing::info!("private combat match: all teams ready");
+                    // Straight on to the team room, as a public match after
+                    // its pre-match wait.
+                    self.phase = Phase::TeamRoom;
+                    self.to_states(&ST_TEAM_ROOM);
+                    self.subphase = Some(SUB_TEAM_ROOM);
+                    out.push(self.event(EV_TEAM_ROOM));
+                    self.countdown = f(&self.rules, "/round_rules/team_room_wait_time", 15.0);
+                }
+            }
             Phase::Waiting => {
                 if players.len() >= PRE_MATCH_PLAYERS {
                     self.phase = Phase::PreMatch;
@@ -899,7 +1139,7 @@ impl Combat {
             }
             Phase::PreMatch | Phase::TeamRoom | Phase::RoundStart | Phase::RoundOver if players.is_empty() => {
                 // Everyone left before the round began: start over.
-                self.phase = Phase::Waiting;
+                let was = self.phase;
                 self.states.clear();
                 self.rounds_won = [0; 2];
                 self.round = 1;
@@ -909,7 +1149,7 @@ impl Combat {
                 if let Some(c) = self.capture.as_mut() {
                     c.reset();
                 }
-                self.state = ST_PRE_MATCH;
+                self.state = if self.private { ST_WAIT_FOR_READY } else { ST_PRE_MATCH };
                 self.countdown = f(&self.rules, "/round_rules/pre_match_wait_time", 30.0);
                 self.subphase = None;
                 self.team_room = true;
@@ -917,6 +1157,15 @@ impl Combat {
                 self.last_round_winner = None;
                 self.points_shown = false;
                 self.cues_left = 0;
+                self.ready = [false; 2];
+                self.loaded = false;
+                if self.payload.is_some() && (self.half > 1 || was == Phase::RoundOver) {
+                    // Left at half time: the next match starts from the start.
+                    out.extend(self.reset_payload());
+                }
+                self.phase = Phase::Waiting;
+                self.half = 1;
+                self.to_beat = None;
             }
             Phase::PreMatch => {
                 self.countdown -= dt;
@@ -1014,6 +1263,25 @@ impl Combat {
         v
     }
 
+    /// A private payload match's first half is over (time up, or the payload
+    /// home): its furthest point is the mark to beat; the round over runs as
+    /// a capture map's does, then the teams swap.
+    fn end_half(&mut self) -> Vec<Out> {
+        self.phase = Phase::RoundOver;
+        self.over_for = 0.0;
+        self.end_step = 0;
+        self.in_overtime = false;
+        self.overtime = 0.0;
+        self.clock = 0.0;
+        let Some(p) = self.payload.as_mut() else { return Vec::new() };
+        self.to_beat = Some(p.furthest);
+        tracing::info!(furthest = p.furthest, "private payload: first half over, teams swap");
+        p.state = PAYLOAD_OVER;
+        let (_, att, def, dir) = p.sent.unwrap_or((0, 0, 0, 0));
+        p.sent = Some((PAYLOAD_OVER, att, def, dir));
+        vec![Out::Reliable(PAYLOAD_MISC, misc(p.handle, (PAYLOAD_OVER, att, def, dir)))]
+    }
+
     /// Native's events for who won (server recordings, 2026-11-16): orange
     /// (Dyson's rounds, Fission's payload home) OVER_C twice; blue
     /// (Combustion's rounds) TIME_UP_B twice, after TIME_UP_A when a payload's
@@ -1053,6 +1321,13 @@ impl Combat {
                 c.points = [0.0; 2];
             }
             out.extend([self.event(EV_NEXT_ROUND), Out::Unlock, self.event(EV_TEAM_ROOM), Out::RestoreBarriers]);
+            if self.payload.is_some() {
+                // A private payload match's second half: sides swap, the
+                // payload goes back to the start.
+                self.half = 2;
+                out.push(Out::SwapTeams);
+                out.extend(self.reset_payload());
+            }
             self.phase = Phase::TeamRoom;
             self.to_states(&ST_TEAM_ROOM);
             // Native: the team room flag at once, the sub-phase with the
@@ -1088,6 +1363,7 @@ impl Combat {
         let added = [f(&self.settings, "/round_timers/checkpoint_1", 120.0), f(&self.settings, "/round_timers/checkpoint_2", 120.0)];
         let mut finished = false;
         let mut reached: Option<usize> = None;
+        let mut first_reach: Option<(u16, u16)> = None;
         if let Some(p) = self.payload.as_mut() {
             let holders = &self.holders;
             let near = |team: u8| players.iter().filter(|(t, alive, _, slot)| *t == team && *alive && holders.contains(slot)).count() as u8;
@@ -1180,6 +1456,22 @@ impl Combat {
             if p.state == PAYLOAD_FLOORED && was == -1 && dir == 0 && p.dist > floor + 0.01 {
                 p.state = 0;
             }
+            // The HUD: held or driving itself it shows still (native).
+            let shown: i8 = if auto || p.hold > 0.0 {
+                0
+            } else if moving > 0.0 {
+                1
+            } else if moving < 0.0 {
+                -1
+            } else {
+                0
+            };
+            p.hud = (att, def, shown);
+            p.claimed_once |= att > 0;
+            p.furthest = p.furthest.max(p.dist);
+            if let Some(d) = p.door.as_mut() {
+                *d -= dt;
+            }
             // Native Fission: `[handle][state u16][attackers u8][defenders u8]
             // [direction i8][0]` (1 attacker + 1 defender: `0101`, stopped).
             let state = (p.state, att, def, dir);
@@ -1198,6 +1490,7 @@ impl Combat {
                 let mut b = p.handle.to_le_bytes().to_vec();
                 b.extend_from_slice(&tp.to_le_bytes());
                 if tp > p.best_tp {
+                    first_reach = Some((p.best_tp, tp));
                     p.best_tp = tp;
                     out.push(Out::Reliable(PAYLOAD_TRACKPOINT, b.clone()));
                 }
@@ -1226,13 +1519,30 @@ impl Combat {
                 p.next += 1;
             }
         }
+        if let Some((from, to)) = first_reach {
+            self.reach_track_vars(from, to);
+        }
         if let Some(i) = reached {
             out.extend(self.announce(MOD_GAME_STATE, &GS_CHECKPOINT[i.min(1)..=i.min(1)]));
             if self.level == LEVEL_GAUSS && i == 0 {
                 out.extend(self.announce(MOD_GAUSS_CHECKPOINT, &GAUSS_CHECKPOINT));
+                if let Some(p) = self.payload.as_mut() {
+                    p.door = Some(GAUSS_DOOR_SECS);
+                }
             }
         }
         let mut won = finished.then_some(Winner::Orange);
+        // A private match's second half: the new attackers (orange now) win
+        // the moment the payload is as far as the first attackers got it.
+        if let (Some(to_beat), Some(p)) = (self.to_beat, self.payload.as_ref())
+            && p.dist >= to_beat - 0.01
+            && p.dist > 0.0
+        {
+            won = Some(Winner::Orange);
+        }
+        if finished && self.private && self.half == 1 {
+            return [out, self.end_half()].concat();
+        }
         if self.capture.is_some() {
             let (o, w) = self.run_capture(dt, players);
             out.extend(o);
@@ -1261,7 +1571,9 @@ impl Combat {
             } else if self.overtime > 0.0 {
                 self.overtime -= dt;
             }
-            if self.overtime <= 0.0 {
+            if self.overtime <= 0.0 && self.private && self.payload.is_some() && self.half == 1 {
+                out.extend(self.end_half());
+            } else if self.overtime <= 0.0 {
                 let w = match &self.capture {
                     _ if self.payload.is_some() => Winner::Blue,
                     Some(c) if c.points[0] > c.points[1] => Winner::Blue,
@@ -1468,6 +1780,13 @@ fn autodrive(handle: u16, on: bool) -> Vec<u8> {
     b.extend_from_slice(&u16::from(on).to_le_bytes());
     b.extend_from_slice(&AUTODRIVE_MPS.to_le_bytes());
     b
+}
+
+fn upsert(set: &mut Vec<(u64, Val)>, var: u64, v: Val) {
+    match set.iter_mut().find(|e| e.0 == var) {
+        Some(e) => e.1 = v,
+        None => set.push((var, v)),
+    }
 }
 
 fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -1965,5 +2284,126 @@ mod tests {
         // Time runs out: blue wins.
         run(&mut c, 200.0, &away);
         assert_eq!(c.winner, Some(Winner::Blue));
+    }
+
+    /// Native Gauss: the claim state, motion and claims follow who holds it.
+    #[test]
+    fn payload_hud_follows_the_claims() {
+        let mut c = playing(gauss());
+        c.payload.as_mut().expect("p").dist = 10.0;
+        assert_eq!(var(&c, VAR_CLAIM_STATE), Some(Val::Raw(CLAIM_NONE)));
+        assert_eq!(var(&c, VAR_PAYLOAD_MOTION), Some(Val::Raw(MOTION_STILL)));
+        assert_eq!(var(&c, VAR_OVERTIME_PROGRESS), Some(Val::F32(0.0)));
+        let me = on_payload(&mut c, 1);
+        for _ in 0..5 {
+            c.step(0.1, &[me]);
+        }
+        assert_eq!(var(&c, VAR_CLAIM_STATE), Some(Val::Raw(CLAIM_ATTACKERS)));
+        assert_eq!(var(&c, VAR_CLAIM_STATE_GAUSS), Some(Val::Raw(CLAIM_ATTACKERS)));
+        assert_eq!(var(&c, VAR_PAYLOAD_MOTION), Some(Val::Raw(MOTION_FORWARD)));
+        assert_eq!(var(&c, VAR_PAYLOAD_MOVING), Some(Val::Lo32(1)));
+        assert_eq!(var(&c, VAR_ATTACKER_CLAIM), Some(Val::Lo32(1)));
+        assert_eq!(var(&c, VAR_OVERTIME_PROGRESS), Some(Val::F32(1.0)));
+        // A defender's hand too: contested, stopped.
+        c.holders = vec![0, 1];
+        let both = [me, (0u8, true, me.2, 1)];
+        c.step(0.1, &both);
+        assert_eq!(var(&c, VAR_CLAIM_STATE), Some(Val::Raw(CLAIM_CONTESTED)));
+        assert_eq!(var(&c, VAR_DEFENDER_CLAIM), Some(Val::Lo32(1)));
+        assert_eq!(var(&c, VAR_PAYLOAD_MOVING), Some(Val::Lo32(0)));
+        // The defender alone rolls it back: unclaimed, backward, -1.
+        c.holders = vec![1];
+        for _ in 0..20 {
+            c.step(0.1, &both);
+        }
+        assert_eq!(var(&c, VAR_CLAIM_STATE), Some(Val::Raw(CLAIM_NONE)));
+        assert_eq!(var(&c, VAR_PAYLOAD_DIRECTION), Some(Val::Raw(MOTION_BACKWARD)));
+        assert_eq!(var(&c, VAR_PAYLOAD_MOVING), Some(Val::Lo32(u32::MAX)));
+    }
+
+    /// Native Gauss: checkpoint 1 sets its level vars (the counter) and starts
+    /// the door's 20 s count.
+    #[test]
+    fn a_checkpoint_sets_its_level_vars_and_gauss_door() {
+        let mut c = playing(gauss());
+        c.payload.as_mut().expect("p").dist = 77.0;
+        let me = on_payload(&mut c, 1);
+        run(&mut c, 2.0, &[me]);
+        assert_eq!(var(&c, 0x1856_51ce_8e5f_1fb4), Some(Val::Raw(0x0000_022c_0000_0002)));
+        assert!(matches!(var(&c, VAR_GAUSS_DOOR), Some(Val::Lo32(19 | 20))));
+        let away = [(1u8, true, Some([500.0, 0.0, 0.0]), 0)];
+        run(&mut c, 25.0, &away);
+        assert_eq!(var(&c, VAR_GAUSS_DOOR), Some(Val::Lo32(0)));
+    }
+
+    /// A private match waits for every team with players to be ready.
+    #[test]
+    fn a_private_match_waits_for_ready() {
+        let mut c = gauss();
+        c.set_private();
+        let both = [(0u8, true, None, 0), (1u8, true, None, 1)];
+        let v = run(&mut c, 60.0, &both);
+        assert_eq!(c.phase, Phase::Waiting);
+        assert_eq!(c.state, ST_WAIT_FOR_READY);
+        assert_eq!(v.iter().filter(|o| matches!(o, Out::Event(EV_LOAD_A, ..))).count(), 1);
+        assert!(c.team_ready(1));
+        assert!(!c.team_ready(1), "once");
+        run(&mut c, 1.0, &both);
+        assert_eq!(c.phase, Phase::Waiting);
+        assert_eq!(var(&c, VAR_ORANGE_READY), Some(Val::Lo8(1)));
+        assert!(c.team_ready(0));
+        run(&mut c, 0.2, &both);
+        assert_eq!(c.phase, Phase::TeamRoom);
+        // Only orange there: orange alone is enough.
+        let mut c = fission();
+        c.set_private();
+        let orange = [(1u8, true, None, 0)];
+        c.team_ready(1);
+        run(&mut c, 0.2, &orange);
+        assert_eq!(c.phase, Phase::TeamRoom);
+        // A public match does not wait.
+        let mut c = gauss();
+        assert!(!c.team_ready(0));
+        run(&mut c, 0.2, &orange);
+        assert_eq!(c.phase, Phase::PreMatch);
+    }
+
+    /// A private payload match: orange's furthest point in the first half is
+    /// the mark; teams swap; the new attackers win by reaching it.
+    #[test]
+    fn private_payload_halves_swap_and_beat_the_mark() {
+        let mut c = playing(fission());
+        c.set_private();
+        c.state = ST_PLAYING;
+        c.payload.as_mut().expect("p").dist = 20.0;
+        c.clock = 1.0;
+        let away = [(1u8, true, Some([500.0, 0.0, 0.0]), 0)];
+        let v = run(&mut c, 2.0, &away);
+        assert_eq!(c.phase, Phase::RoundOver);
+        assert!(c.winner.is_none());
+        assert_eq!(c.to_beat, Some(20.0));
+        assert!(v.iter().any(|o| matches!(o, Out::Reliable(PAYLOAD_MISC, b) if b[2] == 8)));
+        // Round over, the team room: sides swap, the payload back at the start.
+        let v = run(&mut c, 17.0, &away);
+        assert!(v.contains(&Out::SwapTeams), "{v:?}");
+        assert_eq!(c.phase, Phase::TeamRoom);
+        assert_eq!(c.payload_dist(), Some(0.0));
+        assert_eq!(var(&c, VAR_TEAM_A_MARKER_POS), Some(Val::F32(20.0)));
+        assert_eq!(var(&c, VAR_ROUND_COUNTER), Some(Val::Lo32(2)));
+        // The second half: just short at time up loses, ...
+        let mut short = playing(std::mem::replace(&mut c, fission()));
+        short.payload.as_mut().expect("p").dist = 19.0;
+        short.clock = 0.5;
+        run(&mut short, 2.0, &away);
+        assert_eq!(short.winner, Some(Winner::Blue));
+        // ... reaching the mark wins.
+        let mut c = playing(fission());
+        c.set_private();
+        c.half = 2;
+        c.to_beat = Some(20.0);
+        c.payload.as_mut().expect("p").dist = 19.5;
+        let me = on_payload(&mut c, 1);
+        run(&mut c, 3.0, &[me]);
+        assert_eq!(c.winner, Some(Winner::Orange));
     }
 }

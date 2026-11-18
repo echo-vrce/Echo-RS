@@ -218,6 +218,8 @@ pub const EV_FX_ORANGE: u64 = 0x52ae_1390_2597_cf66;
 
 // ── Private match (echo_arena_private) ─────────────────────────────────────
 pub const MODE_ARENA_PRIVATE: u64 = 0x0999_0965_f4db_8c03;
+/// `echo_combat_private`: teams ready up at their terminals.
+pub const MODE_COMBAT_PRIVATE: u64 = 0x33bb_f684_2df9_7a3f;
 /// Module of the private-match terminal panels (rules, start/pause, restart).
 pub const MOD_RULES_PANEL: u64 = 0x6aea_99ee_b2ba_b6c4;
 pub const UI_INC_SETTING: u64 = h("SR15NetUIIncSettingMsg");

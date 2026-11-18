@@ -5,7 +5,7 @@
 //! datagram and [`Session::server_frame`] at `--frame-hz` (default 20). Relayed player traffic is
 //! forwarded as soon as it is decoded; nothing waits for the next frame.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -273,6 +273,14 @@ fn public_mercy_margin() -> u32 {
 /// clients' clocks start within a few seconds of it).
 const DISC_STAMP_LEAD_US: u64 = 60_000_000;
 
+/// In play, a holder that has sent no disc state for this long has lost the
+/// disc: the server takes it and holds it where it last was. Disc states are
+/// unreliable and never resent, and nobody else simulates the holder's disc,
+/// so without this every client flew its own copy until the next grab (up
+/// to the 12 s peer timeout). Native holders never paused over 0.2 s
+/// (two-player capture).
+const DISC_SILENCE: Duration = Duration::from_millis(1000);
+
 fn clock_us() -> u64 {
     use std::sync::OnceLock;
     static BASE: OnceLock<(Instant, u64)> = OnceLock::new();
@@ -379,6 +387,17 @@ struct Arena {
     /// Where the disc stopped in the goal; the server holds it there until
     /// the relaunch park.
     frozen: Option<(i32, i32, i32)>,
+    /// Where the server holds the disc in play after its holder went silent
+    /// or left (else its spawn). Unlike `frozen`, a player may take it.
+    parked: Option<(i32, i32, i32)>,
+    /// When the holder's last disc state (or its grant) came in.
+    disc_heard: Instant,
+    /// The disc's touch entry, from the last grab of it: (object, entry,
+    /// actor bytes). What a grant the server makes on its own must name.
+    disc_touch: Option<(u32, u32, [u8; 8])>,
+    /// The server handed an abandoned disc to another player's client and
+    /// has not heard a disc state from it yet.
+    delegated: bool,
     /// Match over: send the top awards on the next tick.
     awards_due: bool,
     /// Low nibble of the disc state word. Clients count it up themselves
@@ -459,6 +478,10 @@ impl Arena {
             disc_live: false,
             last_disc: None,
             frozen: None,
+            parked: None,
+            disc_heard: Instant::now(),
+            disc_touch: None,
+            delegated: false,
             awards_due: false,
             disc_resets: 0,
             granted: u32::MAX,
@@ -498,6 +521,12 @@ impl Arena {
 
     fn at(&mut self, frame: u64, act: Act) {
         self.schedule.push((frame, act));
+    }
+
+    /// Players may take the disc: in play, and in a private match before
+    /// Start (the disc is free to play with until the match starts).
+    fn disc_free(&self) -> bool {
+        self.phase == Phase::Playing || (self.private && self.phase == Phase::Waiting)
     }
 
     /// Paused, or counting back in after an unpause.
@@ -594,8 +623,9 @@ impl Arena {
     /// goal, else where a player last had it (spawn if never touched).
     fn pin_disc(&mut self) {
         if self.frozen.is_none() {
-            self.frozen = self.last_disc;
+            self.frozen = self.last_disc.or(self.parked);
         }
+        self.parked = None;
         self.server_disc = true;
         self.disc_live = false;
         self.last_disc = None;
@@ -607,8 +637,23 @@ impl Arena {
         self.server_disc = true;
         self.disc_live = false;
         self.frozen = None;
+        self.parked = None;
         self.last_disc = None;
         self.bump_resets();
+    }
+
+    /// The holder went silent or left in play: the server takes the disc
+    /// and holds it where the holder last had it, free to grab. The reset
+    /// count moves past the holder's, so every client snaps to that place.
+    fn park_disc(&mut self) {
+        if let Some(p) = self.last_disc.take() {
+            self.parked = Some(p);
+        }
+        self.server_disc = true;
+        self.bump_resets();
+        self.disc_owner = u32::MAX;
+        self.holder_state = None;
+        self.tracker.reset();
     }
 
     /// Move the reset count past every client's, so they snap to the
@@ -952,6 +997,11 @@ pub struct Session {
     pub udp_out: Vec<(SocketAddr, Vec<u8>)>,
     pub last_activity: Instant,
     pub ever_joined: bool,
+    /// Entrants the backend server-muted (atlas's /mute-player): their voice
+    /// is not relayed to anyone. Kept by entrant, so a mute can arrive before
+    /// the player's connection does; a rejoin gets a new entrant id, and the
+    /// backend mutes that one again.
+    muted: HashSet<Uuid>,
 }
 
 fn env(m: Em) -> pb::Envelope {
@@ -992,6 +1042,40 @@ const COMBAT_ASSIST_WINDOW: Duration = Duration::from_secs(10);
 
 /// A profile's period stat groups: `daily_YYYY_MM_DD` and `weekly_` + its
 /// Monday (native on 2026-11-16, a Monday: both that date).
+/// One player's arena match as a server profile update: `{"stats":{"arena":
+/// {name: {"op","val","cnt"}}}}`, the shape nakama's `ArenaStatistics` reads.
+fn arena_profile_delta(s: &Stats, blue: bool, result: std::cmp::Ordering) -> serde_json::Value {
+    use std::cmp::Ordering::*;
+    let mut st = serde_json::Map::new();
+    let mut put = |k: &str, op: &str, v: serde_json::Value| {
+        st.insert(k.to_string(), serde_json::json!({"op": op, "val": v, "cnt": 1}));
+    };
+    for (i, name) in super::stats::STAT_NAMES.iter().enumerate() {
+        let n = s.v[i];
+        if n == 0 {
+            continue;
+        }
+        if i == Stat::PossessionTime as usize {
+            put(name, "add", serde_json::json!(n as f64 / frame_hz() as f64));
+        } else {
+            put(name, "add", serde_json::json!(n));
+        }
+    }
+    for (name, stat) in [("HighestPoints", Stat::Points), ("HighestSaves", Stat::Saves), ("HighestStuns", Stat::Stuns)] {
+        if s.get(stat) > 0 {
+            put(name, "max", serde_json::json!(s.get(stat)));
+        }
+    }
+    let outcome = match (result, blue) {
+        (Equal, _) => "ArenaTies",
+        (Greater, true) | (Less, false) => "ArenaWins",
+        _ => "ArenaLosses",
+    };
+    put(outcome, "add", serde_json::json!(1));
+    put("GamesPlayed", "add", serde_json::json!(1));
+    serde_json::json!({ "stats": { "arena": st } })
+}
+
 fn profile_periods(unix: u64) -> (String, String) {
     let days = (unix / 86_400) as i64;
     let date = |d: i64| {
@@ -1067,7 +1151,12 @@ impl Session {
         if private && let Some(c) = baseline(info.level, info.mode).and_then(|b| var_raw(&b[0], VAR_COUNTDOWN)) {
             arena.countdown = f32::from_bits(c as u32);
         }
-        let combat = combat_for(info.level);
+        let mut combat = combat_for(info.level);
+        if info.mode == MODE_COMBAT_PRIVATE
+            && let Some(c) = combat.as_mut()
+        {
+            c.set_private();
+        }
         let mut gear = super::gear::Gear::new();
         if combat.is_some() {
             gear.set_match(info.level);
@@ -1106,7 +1195,22 @@ impl Session {
             udp_out: Vec::new(),
             last_activity: Instant::now(),
             ever_joined: false,
+            muted: HashSet::new(),
         }
+    }
+
+    /// Mutes or unmutes the entrants' voice; returns how many changed.
+    pub fn set_muted(&mut self, entrants: &[Uuid], muted: bool) -> usize {
+        entrants
+            .iter()
+            .filter(|e| !e.is_nil())
+            .filter(|e| if muted { self.muted.insert(**e) } else { self.muted.remove(*e) })
+            .count()
+    }
+
+    /// Whether the peer at this address is server-muted.
+    fn is_muted(&self, from: SocketAddr) -> bool {
+        !self.muted.is_empty() && self.peers.get(&from).is_some_and(|p| self.muted.contains(&p.entrant_id))
     }
 
     pub fn player_count(&self) -> usize {
@@ -1379,6 +1483,9 @@ impl Session {
     }
 
     fn on_mailbox(&mut self, from: SocketAddr, ty: u64, key: u64, d: &[u8]) {
+        if ty == VOIP && self.is_muted(from) {
+            return; // server-muted: nobody hears them
+        }
         if ty == PLAYER_STATE || ty == PHYSICS {
             if d.len() >= 4 {
                 let (slot, generation) = (u16_at(d, 0), u16_at(d, 2));
@@ -1427,10 +1534,33 @@ impl Session {
                     // until they had grabbed it themselves. Non-holders send
                     // none in native; while the server holds it, nothing.
                     let holder = self.peers.get(&from).is_some_and(|p| p.slot == Some(usize::from(owner)));
-                    if holder && self.arena.frozen.is_none() {
+                    // A state the server did not take the disc from (a stale
+                    // holder's, after the server took it back) is not
+                    // forwarded: with the server's count it would pull
+                    // everyone off the server's disc.
+                    if holder && self.arena.frozen.is_none() && !self.arena.server_disc {
+                        self.arena.disc_heard = Instant::now();
+                        if std::mem::take(&mut self.arena.delegated) {
+                            info!(slot = owner, "abandoned disc: the player's client took it over and simulates it");
+                        }
                         let mut f = d.to_vec();
                         f[24] = (f[24] & 0xf0) | (self.arena.disc_resets & 0xf) as u8;
-                        self.relay_mailbox(from, ty, key, &f);
+                        // In flight it goes out at once, in a packet of its
+                        // own: waiting for the next server frame made every
+                        // disc state up to a frame late (4 ms on average at
+                        // 120 Hz). In a hand (state byte 2) it stays with the
+                        // frame, beside the holder's own state.
+                        if f[25] & 0xf == 2 {
+                            self.relay_mailbox(from, ty, key, &f);
+                        } else {
+                            let mut pkts = Vec::new();
+                            for (a, p) in self.peers.iter_mut() {
+                                if *a != from && p.stage == Stage::Joined {
+                                    p.t.mailbox_now(ty, key, &f, &mut pkts);
+                                    self.udp_out.extend(pkts.drain(..).map(|d| (*a, d)));
+                                }
+                            }
+                        }
                         self.arena.holder_state = Some(f);
                     }
                     return;
@@ -1677,7 +1807,9 @@ impl Session {
                 req[2..].copy_from_slice(&p.generation.unwrap_or(0).to_le_bytes());
                 p.deferred.push((2, LOADOUT_REQUEST, req.to_vec()));
             }
-            p.deferred.push((2, NEW_UNLOCKS, captured().new_unlocks.clone()));
+            // No SR15NetNewUnlocks on join. The native server sends it only for unlocks the player
+            // is missing ("grant missing unlocks"); replaying the captured 227-item list marked every
+            // one of them as a new unlock on each join, so clearing notifications never stuck.
             p.deferred.push((2, REFRESH_PROFILE, captured().refresh_profile.clone()));
             p.join_tail_in = Some(3);
             p.owner_resend_in = Some(3);
@@ -1733,7 +1865,10 @@ impl Session {
         let target_ok = release || ((new_owner & 0xffff) < MAX_SLOTS as u32 && (new_owner >> 16) != 0xffff);
         // Before play (and between points) the disc is the server's: native
         // keeps it parked at centre and nobody can take it.
-        let locked = self.arena_level && !release && self.arena.phase != Phase::Playing;
+        // A private match before Start is free play: declined there, every
+        // grab went by the disc states alone, whose reset count never moved,
+        // so a second player's disc was ignored by the others.
+        let locked = self.arena_level && !release && !self.arena.disc_free();
         // An object whose owner has left (props in a lobby, mostly) would stay
         // owned by a ghost: nobody's view of the owner or stamp could ever
         // match again. The server takes it back for whoever asks next.
@@ -1761,7 +1896,11 @@ impl Session {
                 // other bits), so it can't order two clients' requests, and
                 // the owner's own requests (a throw: still its, no longer
                 // exclusive) must always pass, as native grants them.
-                believed == e.owner
+                // Arena: when nobody owns the disc (the server took it
+                // back, or its holder left) a requester that still believes
+                // in the last holder is granted too; declined, it showed the
+                // disc in its hand and then lost it again.
+                believed == e.owner || (self.arena_level && e.owner == u32::MAX)
             };
         debug!(%from, grant, actor = format_args!("{actor_id:016x}"), entry_id, owner = e.owner, new_owner, believed, stamp, owner_stamp = e.stamp, exclusive, locked, "touch decision");
         let mut reply = [0u8; 0x20];
@@ -1781,6 +1920,9 @@ impl Session {
             };
             if self.arena_level && !release {
                 self.arena.granted = new_owner;
+                self.arena.disc_heard = Instant::now();
+                self.arena.disc_touch = Some((object, entry_id, actor.try_into().expect("8 bytes")));
+                self.arena.delegated = false;
                 // Native (headbutt of the parked disc, 2026-11-16): the server
                 // stops sending its own disc at the grant; the next disc state
                 // the others get is the grantee's, under the new count. Ours
@@ -1818,6 +1960,54 @@ impl Session {
             reply[0x18..0x1a].copy_from_slice(&u16::from(e.generation & 0xf).to_le_bytes());
             self.reliable_to(from, TOUCH_DECLINED, &reply);
         }
+    }
+
+    /// The disc's holder left or went silent while the disc was still in
+    /// play. This server cannot simulate it (no level geometry), but every
+    /// client can: hand it to another player's client with a grant that
+    /// player did not ask for, not held, so it keeps flying and bouncing
+    /// there and everyone else follows that client's disc.
+    ///
+    /// Whether a client takes a grant it did not request is NOT known from
+    /// any recording (native never needs to: its server simulates). If the
+    /// chosen client sends no disc state within `DISC_SILENCE`, the server
+    /// parks the disc as before. False: nobody to hand it to.
+    fn delegate_disc(&mut self, holder: u32) -> bool {
+        let Some((object, entry_id, actor)) = self.arena.disc_touch else { return false };
+        // A player on a team (not a spectator), the best connection first.
+        let Some((to, handle)) = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.stage == Stage::Joined && (p.team == TEAM_BLUE || p.team == TEAM_ORANGE))
+            .filter_map(|(a, p)| Some((*a, (u32::from(p.generation.unwrap_or(0)) << 16) | p.slot? as u32, p.t.stalled())))
+            .filter(|(_, h, stalled)| *h != holder && !stalled)
+            .min_by_key(|(_, h, _)| h & 0xffff)
+            .map(|(a, h, _)| (a, h))
+        else {
+            return false;
+        };
+        let key = (u64::from(object), entry_id);
+        let generation = ((self.arena.disc_resets + 1) % DISC_COUNTS) as u8;
+        self.arena.disc_resets = u32::from(generation);
+        self.arena.granted = handle;
+        self.arena.disc_heard = Instant::now();
+        self.arena.delegated = true;
+        self.arena.tracker.reset();
+        let e = self.touch.entry(key).or_insert(TouchEntry { owner: u32::MAX, stamp: 0, generation: 0, held: false });
+        e.owner = handle;
+        e.generation = generation;
+        e.held = false;
+        let seq = self.touch_seq.get(&((handle & 0xffff) as usize, u64::from(object))).copied().unwrap_or(0);
+        let mut reply = [0u8; 0x20];
+        reply[0..8].copy_from_slice(&touch_object(object, self.info.level).to_le_bytes());
+        reply[0x08..0x0c].copy_from_slice(&handle.to_le_bytes());
+        reply[0x0c..0x10].copy_from_slice(&entry_id.to_le_bytes());
+        reply[0x10..0x18].copy_from_slice(&actor);
+        reply[0x18..0x1a].copy_from_slice(&u16::from(generation & 0xf).to_le_bytes());
+        reply[0x1a..0x1c].copy_from_slice(&seq.to_le_bytes());
+        self.reliable_to(to, TOUCH_GRANTED, &reply);
+        info!(from = holder, to = handle, resets = self.arena.disc_resets, "abandoned disc: handed to another player's client to simulate");
+        true
     }
 
     /// A player handle (`gen << 16 | slot`) still names a joined player.
@@ -1861,12 +2051,21 @@ impl Session {
             return;
         }
         let handle = (u32::from(owner_gen) << 16) | u32::from(owner);
-        // A player who moved the disc without a grab (a headbutt, a punch)
+        // A player who moved the disc without a grab (a headbutt)
         // now simulates it, but the reset count has not moved, so the others
         // would ignore that player's disc: move it past the player's own.
-        if self.arena.phase == Phase::Playing && !self.arena.server_disc && handle != self.arena.disc_owner && handle != self.arena.granted {
+        // The same when it is the server's disc that was taken (parked in
+        // play): the others hold the server's disc at the server's count.
+        // The touch table follows, or the others' grabs from this player
+        // (whom they now see as the owner) would all be declined.
+        if self.arena.disc_free() && handle != self.arena.granted && (self.arena.server_disc || handle != self.arena.disc_owner) {
             self.arena.disc_resets = (client_count + 1) % DISC_COUNTS;
             self.arena.granted = handle;
+            self.arena.disc_heard = Instant::now();
+            for e in self.touch.values_mut() {
+                e.owner = handle;
+                e.held = false;
+            }
             info!(slot = owner, resets = self.arena.disc_resets, "disc taken without a grab (headbutt?): others snap to it");
         }
         self.arena.client_resets = Some(client_count);
@@ -1876,6 +2075,8 @@ impl Session {
             info!(slot = owner, "player took the disc; server stops publishing it");
         }
         if self.arena.phase != Phase::Playing {
+            // Free play: where the disc is, should its holder leave.
+            self.arena.last_disc = Some((x, y, depth));
             return;
         }
         let prev = self.arena.last_disc.replace((x, y, depth));
@@ -1893,16 +2094,19 @@ impl Session {
             self.arena.goal_touch[i] = hit.is_some();
         }
         let now = self.now_us();
-        // Client disc state word: second byte 2 while held, 4 once free.
+        // Client disc state word, second byte (native 2026-11-11): 2 in a
+        // hand, 0 after a throw, 4 after a hit (a headbutt; from
+        // the grant of a request with the hit bit to the next grab).
         let st = u32::from_le_bytes([d[24], d[25], d[26], d[27]]);
-        let held = match (st >> 8) & 0xf {
-            2 => Some(true),
-            4 => Some(false),
-            _ => None,
+        let (held, hit) = match (st >> 8) & 0xf {
+            2 => (Some(true), false),
+            0 => (Some(false), false),
+            4 => (Some(false), true),
+            _ => (None, false),
         };
         if owner_team == TEAM_BLUE || owner_team == TEAM_ORANGE {
             let client_us = u32::from_le_bytes([d[8], d[9], d[10], d[11]]);
-            self.arena.tracker.sample(now, Some(client_us), owner, owner_team, [x, y, depth], held);
+            self.arena.tracker.sample(now, Some(client_us), owner, owner_team, [x, y, depth], held, hit);
         }
         self.apply_credits();
         if !self.arena.goals_armed {
@@ -1911,7 +2115,10 @@ impl Session {
         let Some((goal_idx, hit)) = entered else { return };
         // Orange's goal (index 1) is where blue scores.
         let blue_scored = goal_idx == 1;
-        let own_goal = (owner_team == TEAM_BLUE) != blue_scored;
+        // A bumper shot (thrown at an opponent who headbutts it into their
+        // own goal) is the thrower's goal, not an own goal.
+        let scoring_team = if blue_scored { TEAM_BLUE } else { TEAM_ORANGE };
+        let own_goal = (owner_team == TEAM_BLUE) != blue_scored && !self.arena.tracker.bumper(scoring_team);
         // Own goals: public matches follow mp_arena_rules (stock: never), private ones the RULES screen.
         let self_goals = if self.arena.private { self.arena.rules.self_goaling() } else { super::msg::arena_public().self_goals };
         if own_goal && !self_goals {
@@ -1924,13 +2131,14 @@ impl Session {
         rec[0..2].copy_from_slice(&u16::from(!blue_scored).to_le_bytes());
         rec[2..4].copy_from_slice(&(g.points as u16).to_le_bytes());
         rec[4..6].copy_from_slice(&g.goal_type.to_le_bytes());
-        rec[6..10].copy_from_slice(&self.arena.disc_owner.to_le_bytes());
-        let assister = g
-            .assister
-            .and_then(|s| self.slot_addr.get(usize::from(s)).copied().flatten())
-            .and_then(|a| self.peers.get(&a))
-            .map(|p| (u32::from(p.generation.unwrap_or(0)) << 16) | p.slot.unwrap_or(0) as u32)
-            .unwrap_or(u32::MAX);
+        let handle_of = |s: Option<u16>| {
+            s.and_then(|s| self.slot_addr.get(usize::from(s)).copied().flatten())
+                .and_then(|a| self.peers.get(&a))
+                .map(|p| (u32::from(p.generation.unwrap_or(0)) << 16) | p.slot.unwrap_or(0) as u32)
+        };
+        let scorer = handle_of(g.scorer).unwrap_or(self.arena.disc_owner);
+        rec[6..10].copy_from_slice(&scorer.to_le_bytes());
+        let assister = handle_of(g.assister).unwrap_or(u32::MAX);
         rec[10..14].copy_from_slice(&assister.to_le_bytes());
         // Native: disc speed (m/s), release-to-goal distance (m), seconds of
         // play this round.
@@ -1943,6 +2151,7 @@ impl Session {
         // Native: the server takes the disc and pins it where it entered the
         // goal box, bumping the reset count so clients snap to it.
         self.arena.frozen = Some((hit[0], hit[1], hit[2]));
+        self.arena.parked = None;
         self.arena.bump_resets();
         self.arena.server_disc = true;
         // Native (hoster match, goal at 324.257 s): the server's first disc
@@ -2289,6 +2498,7 @@ impl Session {
         // The Fury, while it flies, goes out 40 times a second.
         if self.social {
             self.props.step(Instant::now());
+            self.props.expire(Instant::now());
         }
         let every = if self.props.active() { frame_hz() / 40 } else { frame_hz() / 10 };
         if self.social && self.frame % every.max(1) == 0 {
@@ -2346,6 +2556,7 @@ impl Session {
                         self.send_gear(from, o);
                     }
                 }
+                super::combat::Out::SwapTeams => self.swap_teams(),
                 super::combat::Out::Unlock => {
                     if self.join_locked {
                         self.join_locked = false;
@@ -2369,6 +2580,34 @@ impl Session {
                     }
                 }
             }
+        }
+    }
+
+    /// Half time in a private payload match: blue and orange trade places
+    /// (each keeps its team slot), as an `EntrantTeamChanged` each.
+    fn swap_teams(&mut self) {
+        let mut changed = Vec::new();
+        for p in self.peers.values_mut().filter(|p| p.stage == Stage::Joined) {
+            let (Some(slot), old) = (p.slot, p.team) else { continue };
+            let team = match old {
+                TEAM_BLUE => TEAM_ORANGE,
+                TEAM_ORANGE => TEAM_BLUE,
+                _ => continue,
+            };
+            p.team = team;
+            p.requested_team = Some(team);
+            p.team_changed_at = Some(Instant::now());
+            changed.push(team_changed(slot, team, Some(old)));
+        }
+        info!(players = changed.len(), "private combat match: teams swap sides");
+        for tc in &changed {
+            for a in self.joined() {
+                self.reliable_to(a, ENTRANT_TEAM_CHANGED, tc);
+            }
+        }
+        if !changed.is_empty() {
+            self.roster_dirty = true;
+            self.publish_owner_state();
         }
     }
 
@@ -2524,6 +2763,7 @@ impl Session {
                             info!(resets = self.arena.disc_resets, "goal pin released: disc to its spawn");
                         }
                         self.arena.frozen = None;
+                        self.arena.parked = None;
                         self.arena.server_disc = true;
                         self.arena.disc_live = false;
                     }
@@ -2548,6 +2788,7 @@ impl Session {
                     a.set_flag(VAR_MERCY_WIN, 0);
                     // Out of the goal and onto the spawn for the walk.
                     a.frozen = None;
+                    a.parked = None;
                     a.bump_resets();
                     a.tracker.reset();
                     info!(round = a.rounds_played + 1, "next round");
@@ -2579,6 +2820,7 @@ impl Session {
         if std::mem::take(&mut self.arena.awards_due) {
             self.send_stats();
             self.send_top_awards();
+            self.send_arena_profile_updates();
         }
         if self.arena.countdown_running && !frozen {
             self.arena.countdown = (self.arena.countdown - dt).max(0.0);
@@ -2637,7 +2879,34 @@ impl Session {
         // the server's disc as newer than its own last one. Ours ran ~2.8 s
         // behind, and after a goal the last holder ignored the server's disc
         // (pin and relaunch) and kept flying its own.
-        self.arena.disc_us = self.started.elapsed().as_micros() as u64 + DISC_STAMP_LEAD_US;
+        // Kept to 32 bits, as the clients' own stamps are (native's high
+        // word was 0 in every capture): about 70 minutes into a session the
+        // u64 passed 2^32, and a non-zero high word makes every holder's
+        // disc look older than the server's last one for good.
+        self.arena.disc_us = (self.started.elapsed().as_micros() as u64 + DISC_STAMP_LEAD_US) & 0xffff_ffff;
+        // A holder that left or went silent in play loses the disc to the
+        // server (not during a pause: time stands still for the holder too).
+        if self.arena.disc_free() && !self.arena.server_disc {
+            if frozen {
+                self.arena.disc_heard = Instant::now();
+            } else {
+                let holder = if self.arena.granted != u32::MAX { self.arena.granted } else { self.arena.disc_owner };
+                let gone = holder != u32::MAX && !self.handle_present(holder);
+                let silent = self.arena.disc_heard.elapsed();
+                // Free play nobody has touched yet: leave the disc alone.
+                let untouched = holder == u32::MAX && self.arena.phase != Phase::Playing;
+                if !untouched && (gone || silent > DISC_SILENCE) && !self.arena.delegated && self.delegate_disc(holder) {
+                    // Another client simulates it now; if that client
+                    // says nothing either, the server parks it next time.
+                } else if !untouched && (gone || silent > DISC_SILENCE) {
+                    if std::mem::take(&mut self.arena.delegated) {
+                        info!("abandoned disc: the client it was handed to sent nothing");
+                    }
+                    self.arena.park_disc();
+                    info!(holder, gone, silent_ms = silent.as_millis() as u64, at = ?self.arena.parked, resets = self.arena.disc_resets, "disc holder gone or silent: server holds the disc there");
+                }
+            }
+        }
         if self.arena.server_disc && !self.server_disc_was {
             // The server took the disc back: clients treat it as unowned
             // (their next grab says believed = none), so the table must too,
@@ -2670,7 +2939,7 @@ impl Session {
                 1
             };
             d[24..28].copy_from_slice(&((hi << 4) | (self.arena.disc_resets & 0xf)).to_le_bytes());
-            let (x, y, depth) = match self.arena.frozen {
+            let (x, y, depth) = match self.arena.frozen.or(self.arena.parked) {
                 Some(p) => p,
                 None => {
                     let base = baseline(self.info.level, self.info.mode).and_then(|b| var_raw(&b[0], VAR_DISC_SPAWN)).unwrap_or(2);
@@ -3067,6 +3336,32 @@ impl Session {
         }
     }
 
+    /// An arena match is over: each player's totals, win or loss, to the
+    /// backend as an `SNSUserServerProfileUpdateRequest` (nakama adds them to
+    /// its statistics boards, as it does a combat match's). Native's game
+    /// server reports arena stats in post-match remote logs over a login
+    /// session of its own, which this server does not have.
+    fn send_arena_profile_updates(&mut self) {
+        let a = &self.arena;
+        let result = if a.private && a.blue_rounds != a.red_rounds { a.blue_rounds.cmp(&a.red_rounds) } else { a.blue.cmp(&a.red) };
+        let mut out = Vec::new();
+        for p in self.peers.values().filter(|p| p.stage == Stage::Joined && matches!(p.team, TEAM_BLUE | TEAM_ORANGE)) {
+            let Some([platform, account]) = p.xpid else { continue };
+            let delta = arena_profile_delta(&p.stats, p.team == TEAM_BLUE, result);
+            out.push(env(Em::UserServerProfileUpdateRequest(pb::SnsUserServerProfileUpdateRequestMessage {
+                user_id: Some(pb::XPlatformId { id: crate::sns::XpId { platform, account }.token() }),
+                payload: serde_json::json!({
+                    "matchtype": crate::sns::symbol("echo_arena") as i64,
+                    "sessionid": self.info.lobby.to_string(),
+                    "update": delta,
+                })
+                .to_string(),
+            })));
+        }
+        info!(players = out.len(), "arena profile updates");
+        self.fleet_out.extend(out);
+    }
+
     /// Native, at match over: `SR15NetTopAwardsMsg` = `[count u8]`, then
     /// arrays of `count`: award ids, stat hashes, values (u64 each), slots
     /// (u64), handles (u32), teams (u16), names (32 bytes), and a u16 each.
@@ -3098,13 +3393,16 @@ impl Session {
                 Some((slot, handle, u16::from(p.team == TEAM_ORANGE), name, p.stats))
             })
             .collect();
-        let best = |s: Stat| players.iter().filter(|p| p.4.get(s) > 0).max_by_key(|p| (p.4.get(s), p.4.get(Stat::Points)));
-        let mut picks = Vec::new();
+        // One award a player (native: every recorded award list names each
+        // slot once): the MVP first, then each stat's best among those
+        // still without one.
+        let mut picks: Vec<Pick> = Vec::new();
         if let Some(p) = players.iter().max_by_key(|p| (p.4.get(Stat::Points), p.4.get(Stat::PossessionTime))) {
             picks.push(Pick { id: AWARD_MVP_ID, stat: AWARD_MVP_STAT, value: u64::from(p.4.get(Stat::Points).max(1)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
         }
         for (id, s) in [(AWARD_GOALS_ID, Stat::Goals), (AWARD_PASSES_ID, Stat::Passes), (AWARD_CATCHES_ID, Stat::Catches)] {
-            if let Some(p) = best(s) {
+            let best = players.iter().filter(|p| p.4.get(s) > 0 && picks.iter().all(|k| k.slot != p.0)).max_by_key(|p| (p.4.get(s), p.4.get(Stat::Points)));
+            if let Some(p) = best {
                 picks.push(Pick { id, stat: TEAM_STATS[s as usize], value: u64::from(p.4.get(s)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
             }
         }
@@ -3433,6 +3731,17 @@ impl Session {
         }
         let sym = u64::from_le_bytes(d[0..8].try_into().expect("8"));
         let module = u64::from_le_bytes(d[8..16].try_into().expect("8"));
+        if let Some(c) = self.combat.as_mut()
+            && c.is_private()
+            && matches!(sym, BTN_READY_BLUE | BTN_READY_ORANGE)
+        {
+            // A private combat match's terminal: the team is ready.
+            let team = usize::from(sym == BTN_READY_ORANGE);
+            if c.team_ready(team) {
+                info!(%from, team, "private combat match: team ready");
+            }
+            return;
+        }
         if self.combat.is_some() {
             // Native relays a client's filter-13 events (the war room, doors,
             // barriers: the level scripts each client runs) to the others,
@@ -3667,4 +3976,100 @@ fn team_changed(slot: usize, team: u8, old: Option<u8>) -> [u8; 16] {
     b[8..10].copy_from_slice(&u16::from(team).to_le_bytes());
     b[10..12].copy_from_slice(&old.map_or(u16::MAX, u16::from).to_le_bytes());
     b
+}
+
+#[cfg(test)]
+mod server_mute_tests {
+    use super::*;
+    use crate::engine::transport::SessionCrypto;
+
+    fn joined_peer(entrant: Uuid) -> Peer {
+        let c = SessionCrypto {
+            out_flags: 0,
+            out_aes: [0; 32],
+            out_mac: [0; 32],
+            out_rnd: [0; 32],
+            out_seq: 0,
+            in_flags: 0,
+            in_aes: [0; 32],
+            in_mac: [0; 32],
+            in_rnd: [0; 32],
+            in_seq: 0,
+        };
+        let mut p = Peer::new(Transport::new(&c));
+        p.stage = Stage::Joined;
+        p.entrant_id = entrant;
+        p
+    }
+
+    /// A server-muted peer's voice reaches nobody; others still hear each
+    /// other, and lifting the mute lets it through again.
+    #[test]
+    fn a_muted_peers_voice_is_not_relayed() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
+        let mut s = Session::new(info, 1);
+        let (a, b): (SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap());
+        let (ea, eb) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        s.peers.insert(a, joined_peer(ea));
+        s.peers.insert(b, joined_peer(eb));
+        let heard = |s: &Session, at: SocketAddr| s.peers[&at].t.queued_mailbox.iter().filter(|m| m.0 == VOIP).count();
+
+        assert_eq!(s.set_muted(&[ea], true), 1);
+        assert_eq!(s.set_muted(&[ea], true), 0, "muting twice changes nothing");
+        s.on_mailbox(a, VOIP, 0, &[1, 2, 3]);
+        assert_eq!(heard(&s, b), 0, "muted voice dropped");
+        s.on_mailbox(b, VOIP, 0, &[1, 2, 3]);
+        assert_eq!(heard(&s, a), 1, "the muted player still hears others");
+
+        assert_eq!(s.set_muted(&[ea], false), 1);
+        s.on_mailbox(a, VOIP, 0, &[1, 2, 3]);
+        assert_eq!(heard(&s, b), 1, "lifted mute relays again");
+    }
+
+    /// A mute can arrive before the entrant's peer exists; it applies once
+    /// that entrant joins.
+    #[test]
+    fn a_mute_before_join_applies_on_join() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
+        let mut s = Session::new(info, 1);
+        let ea = Uuid::from_u128(7);
+        s.set_muted(&[ea], true);
+        let (a, b): (SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap());
+        s.peers.insert(a, joined_peer(ea));
+        s.peers.insert(b, joined_peer(Uuid::from_u128(8)));
+        s.on_mailbox(a, VOIP, 0, &[9]);
+        assert!(s.peers[&b].t.queued_mailbox.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod arena_profile_tests {
+    use super::*;
+
+    /// The arena update is what nakama's `ArenaStatistics` reads: each stat an
+    /// `{op, val, cnt}`, the result, a game played.
+    #[test]
+    fn arena_profile_delta_has_natives_stat_shape() {
+        let mut s = Stats::default();
+        s.add(Stat::Goals, 2);
+        s.add(Stat::Saves, 3);
+        let d = arena_profile_delta(&s, true, std::cmp::Ordering::Greater);
+        let a = &d["stats"]["arena"];
+        assert_eq!(a["Goals"], serde_json::json!({"op": "add", "val": 2, "cnt": 1}));
+        assert_eq!(a["HighestSaves"]["op"], "max");
+        assert_eq!(a["ArenaWins"]["val"], 1);
+        assert_eq!(a["GamesPlayed"]["val"], 1);
+        assert!(a.get("Stuns").is_none(), "zeros left out");
+        let lost = arena_profile_delta(&s, false, std::cmp::Ordering::Greater);
+        assert_eq!(lost["stats"]["arena"]["ArenaLosses"]["val"], 1);
+        let tie = arena_profile_delta(&s, false, std::cmp::Ordering::Equal);
+        assert_eq!(tie["stats"]["arena"]["ArenaTies"]["val"], 1);
+    }
+
+    #[test]
+    fn nakama_url_gets_the_save_loadout_feature() {
+        assert_eq!(crate::upstream::with_features_for_test("ws://h/ws?a=1"), "ws://h/ws?a=1&features=save_loadout,server_mute");
+        assert_eq!(crate::upstream::with_features_for_test("ws://h/ws"), "ws://h/ws?features=save_loadout,server_mute");
+        assert_eq!(crate::upstream::with_features_for_test("ws://h/ws?features=x"), "ws://h/ws?features=x");
+    }
 }

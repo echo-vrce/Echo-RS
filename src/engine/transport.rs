@@ -520,8 +520,35 @@ impl Transport {
             }
         }
 
-        // Mailbox: unreliable, latest state wins on the receiver.
-        while frame && !self.queued_mailbox.is_empty() {
+        if frame {
+            self.flush_mailbox(now, out);
+        }
+
+        if out.len() > start {
+            self.ack_owed = false;
+        } else if self.ack_owed && frame {
+            self.ack_owed = false;
+            let mut plain = vec![0u8; 8];
+            let hdr = self.header(false, false, self.mb_next, self.mb_encoded);
+            Self::stamp(&mut plain, hdr);
+            self.seal(&plain, out);
+        }
+    }
+
+    /// One mailbox message in a frame of its own, sent now instead of with
+    /// the next server frame (the disc in flight: everything else queued
+    /// keeps its place and its timing).
+    pub fn mailbox_now(&mut self, ty: u64, key: u64, data: &[u8], out: &mut Vec<Vec<u8>>) {
+        let held = std::mem::replace(&mut self.queued_mailbox, vec![(ty, key, data.to_vec())]);
+        self.flush_mailbox(Instant::now(), out);
+        self.queued_mailbox = held;
+        // Its header carries the acks.
+        self.ack_owed = false;
+    }
+
+    /// Mailbox: unreliable, latest state wins on the receiver.
+    fn flush_mailbox(&mut self, now: Instant, out: &mut Vec<Vec<u8>>) {
+        while !self.queued_mailbox.is_empty() {
             if self.mb_ece_pending {
                 self.mb_encoded = true;
                 self.mb_ece_pending = false;
@@ -551,16 +578,6 @@ impl Transport {
             for plain in self.packetize(false, frame, encoded, &body) {
                 self.seal(&plain, out);
             }
-        }
-
-        if out.len() > start {
-            self.ack_owed = false;
-        } else if self.ack_owed && frame {
-            self.ack_owed = false;
-            let mut plain = vec![0u8; 8];
-            let hdr = self.header(false, false, self.mb_next, self.mb_encoded);
-            Self::stamp(&mut plain, hdr);
-            self.seal(&plain, out);
         }
     }
 

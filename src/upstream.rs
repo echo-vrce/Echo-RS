@@ -42,6 +42,9 @@ const NEVR_PROTOBUF_V1: u64 = 0x9ee5_107d_9e29_fd63;
 /// (`ERGameServerSaveLoadoutRequest`). EchoRelay uses this symbol for
 /// something else, so it only goes to nakama.
 const NAKAMA_SAVE_LOADOUT: u64 = 0x7777_7777_7777_0B00;
+/// atlas's `ERGameServerMuteEntrants`: null-terminated JSON
+/// `{"entrant_ids":[..],"muted":bool}`. It goes to the engine as a text frame.
+const NAKAMA_MUTE_ENTRANTS: u64 = 0x7777_7777_7777_0C00;
 /// `SNSUserServerProfileUpdateRequest`, sent to EchoRelay's login service.
 const PROFILE_UPDATE_REQUEST: u64 = 0xd298_6849_b36b_9c72;
 
@@ -99,6 +102,13 @@ pub struct Upstreams {
     /// registration without ever sounding like nakama gets EchoRelay's next.
     wide_registration: AtomicBool,
     registration_confirmed: AtomicBool,
+    /// Registrations that ended unanswered and switched the layout.
+    layout_flips: std::sync::atomic::AtomicU32,
+    /// The last failure only switched the layout for the first time: the
+    /// next try may follow at once.
+    layout_quick: AtomicBool,
+    /// Paces registrations with the backend.
+    pub gate: Gate,
     start: Instant,
 }
 
@@ -108,7 +118,7 @@ impl Upstreams {
             Backend::EchoRelay { url } | Backend::Nakama { url } if is_serverdb(url) => Some(login_from_serverdb(url)),
             _ => None,
         });
-        Arc::new(Self { backend, lan_ip, region: sns::symbol(region), login_url, instances: DashMap::new(), wide_registration: AtomicBool::new(true), registration_confirmed: AtomicBool::new(false), start: Instant::now() })
+        Arc::new(Self { backend, lan_ip, region: sns::symbol(region), login_url, instances: DashMap::new(), wide_registration: AtomicBool::new(true), registration_confirmed: AtomicBool::new(false), layout_flips: Default::default(), layout_quick: AtomicBool::new(false), gate: Gate::new(), start: Instant::now() })
     }
     fn state(&self, idx: u32) -> Arc<InstanceState> {
         self.instances.entry(idx).or_default().clone()
@@ -139,14 +149,24 @@ pub async fn upstream_ws(State(app): State<App>, ConnectInfo(addr): ConnectInfo<
         return (axum::http::StatusCode::FORBIDDEN, "local game servers only").into_response();
     }
     let up = app.upstreams.clone();
-    ws.on_upgrade(move |s| async move {
+    ws.on_upgrade(move |mut s| async move {
         up.set_busy(idx, false);
+        if matches!(up.backend, Backend::Builtin) {
+            return;
+        }
+        if !up.gate.enter(idx).await {
+            // Refused: the game server stays parked on this socket instead
+            // of reconnecting (and registering) over and over.
+            while let Some(Ok(_)) = s.recv().await {}
+            return;
+        }
         let r = match up.backend.clone() {
             Backend::Nakama { url } => bridge_nakama(&up, idx, s, &url).await,
             Backend::EchoRelay { url } => bridge_echorelay(&up, idx, s, &url).await,
             Backend::Builtin => Ok(()),
         };
         up.set_busy(idx, false);
+        up.gate.leave(idx, r.is_err(), up.layout_quick.swap(false, Ordering::Relaxed));
         if let Err(e) = r {
             warn!(instance = idx, error = %e, "upstream bridge closed");
         }
@@ -206,12 +226,17 @@ async fn bridge_nakama(up: &Upstreams, idx: u32, local: WebSocket, url: &str) ->
     if is_serverdb(url) {
         return bridge_echorelay(up, idx, local, url).await;
     }
-    let (remote, _) = tokio_tungstenite::connect_async(url).await.context("connecting to nakama")?;
+    let url = with_features(url);
+    let (remote, _) = tokio::time::timeout(REG_RETRY, tokio_tungstenite::connect_async(url.as_str())).await.context("nakama did not answer the connection")?.context("connecting to nakama")?;
     debug!(instance = idx, "bridged to nakama");
     let (mut rtx, mut rrx) = remote.split();
     let (mut ltx, mut lrx) = local.split();
+    let mut registered = false;
+    let unanswered = tokio::time::sleep(REG_RETRY);
+    tokio::pin!(unanswered);
     loop {
         tokio::select! {
+            _ = &mut unanswered, if !registered => bail!("no answer to the registration in {} s", REG_RETRY.as_secs()),
             m = lrx.next() => {
                 let Some(Ok(m)) = m else { break };
                 let AxMsg::Binary(mut data) = m else { if matches!(m, AxMsg::Close(_)) { break } continue };
@@ -239,7 +264,27 @@ async fn bridge_nakama(up: &Upstreams, idx: u32, local: WebSocket, url: &str) ->
                 let m = match m { Some(Ok(m)) if !matches!(m, TMsg::Close(_)) => m, other => bail!("{}", ended(other)) };
                 match m {
                     TMsg::Binary(data) => {
-                        if let Some((env, _)) = decode_any(&data) { observe(up, idx, &env); }
+                        let mutes = mute_texts(&data);
+                        if !mutes.is_empty() {
+                            for t in mutes {
+                                ltx.send(AxMsg::Text(t)).await?;
+                            }
+                            continue;
+                        }
+                        if let Some((env, _)) = decode_any(&data) {
+                            observe(up, idx, &env);
+                            match &env.message {
+                                Some(Em::GameServerRegistrationSuccess(_)) => {
+                                    registered = true;
+                                    up.gate.registered(idx);
+                                }
+                                Some(Em::Error(e)) if !registered => {
+                                    up.gate.refuse(idx, &e.message);
+                                    bail!("nakama refused the registration: {}", e.message);
+                                }
+                                _ => {}
+                            }
+                        }
                         ltx.send(AxMsg::Binary(data)).await?;
                     }
                     TMsg::Ping(p) => rtx.send(TMsg::Pong(p)).await?,
@@ -249,6 +294,36 @@ async fn bridge_nakama(up: &Upstreams, idx: u32, local: WebSocket, url: &str) ->
         }
     }
     Ok(())
+}
+
+/// The features this game server has, on nakama's URL (`features=`, which the
+/// fleet protobuf here has no field for). `save_loadout`: every loadout change
+/// goes to nakama as a GameServerSaveLoadout, so it leaves the client's own
+/// item_equipped log alone (which knows only the item, not its slot).
+/// `server_mute`: it mutes a player's voice when told to
+/// (`NAKAMA_MUTE_ENTRANTS`).
+const FEATURES: &str = "save_loadout,server_mute";
+
+/// The JSON of a server mute message, for the engine; None when unreadable.
+fn mute_text(payload: &[u8]) -> Option<String> {
+    let json = payload.strip_suffix(&[0]).unwrap_or(payload);
+    let text = std::str::from_utf8(json).ok()?;
+    serde_json::from_str::<crate::engine::MuteEntrants>(text).ok()?;
+    Some(text.to_string())
+}
+
+/// The server mutes in a frame from nakama, if it is a legacy one holding any.
+fn mute_texts(data: &[u8]) -> Vec<String> {
+    let Ok(msgs) = sns::split(data) else { return Vec::new() };
+    msgs.into_iter().filter(|(s, _)| *s == NAKAMA_MUTE_ENTRANTS).filter_map(|(_, p)| mute_text(p)).collect()
+}
+
+fn with_features(url: &str) -> String {
+    if url.contains("features=") {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}features={FEATURES}")
 }
 
 // ─── EchoRelay ServerDB ─────────────────────────────────────────────────────
@@ -366,14 +441,24 @@ fn from_echorelay(up: &Upstreams, idx: u32, symbol: u64, p: &[u8]) -> Result<Opt
 }
 
 async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str) -> Result<()> {
-    let (remote, _) = tokio_tungstenite::connect_async(url).await.context("connecting to ServerDB")?;
+    // (nakama behind a /serverdb path reads the features too; EchoRelay
+    // ignores query keys it does not know.)
+    let url = with_features(url);
+    let (remote, _) = tokio::time::timeout(REG_RETRY, tokio_tungstenite::connect_async(url.as_str())).await.context("the ServerDB did not answer the connection")?.context("connecting to ServerDB")?;
     debug!(instance = idx, "connected to EchoRelay ServerDB");
     let mut nakama = false;
     let mut registering = false;
+    let mut registered = false;
+    let unanswered = tokio::time::sleep(REG_RETRY);
+    tokio::pin!(unanswered);
     let (mut rtx, mut rrx) = remote.split();
     let (mut ltx, mut lrx) = local.split();
     loop {
         tokio::select! {
+            _ = &mut unanswered, if !registered => {
+                retry_layout(up, idx, registering, nakama);
+                bail!("no answer to the registration in {} s", REG_RETRY.as_secs())
+            }
             m = lrx.next() => {
                 let Some(Ok(m)) = m else { break };
                 let AxMsg::Binary(data) = m else { if matches!(m, AxMsg::Close(_)) { break } continue };
@@ -424,6 +509,13 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                 match m {
                     TMsg::Binary(data) => {
                         for (symbol, payload) in sns::split(&data)? {
+                            if symbol == NAKAMA_MUTE_ENTRANTS {
+                                match mute_text(payload) {
+                                    Some(t) => ltx.send(AxMsg::Text(t)).await?,
+                                    None => warn!(instance = idx, "unreadable server mute from nakama"),
+                                }
+                                continue;
+                            }
                             // Only nakama sends protobuf frames on this socket
                             // (with its registration reply).
                             if symbol == NEVR_PROTOBUF_V1 {
@@ -436,8 +528,16 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                                 // nakama explains a refusal here, not in the legacy failure message.
                                 if let Ok(env) = pb::Envelope::decode(payload) {
                                     match env.message {
+                                        Some(Em::Error(e)) if !registered => {
+                                            up.gate.refuse(idx, &e.message);
+                                            bail!("nakama refused the registration (code {}): {}", e.code, e.message);
+                                        }
                                         Some(Em::Error(e)) => warn!(instance = idx, code = e.code, reason = %e.message, "nakama reported an error"),
-                                        Some(Em::GameServerRegistrationSuccess(ok)) => info!(instance = idx, server_id = ok.server_id, external_ip = %ok.external_ip_address, "registered with nakama"),
+                                        Some(Em::GameServerRegistrationSuccess(ok)) => {
+                                            registered = true;
+                                            up.gate.registered(idx);
+                                            info!(instance = idx, server_id = ok.server_id, external_ip = %ok.external_ip_address, "registered with nakama");
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -445,6 +545,8 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                             }
                             if symbol == sym::ER_REGISTRATION_SUCCESS {
                                 up.registration_confirmed.store(true, Ordering::Relaxed);
+                                registered = true;
+                                up.gate.registered(idx);
                                 // nakama's own reply (protobuf) came first and was logged.
                                 if !nakama {
                                     info!(instance = idx, "registered with EchoRelay");
@@ -453,7 +555,16 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                             match from_echorelay(up, idx, symbol, payload) {
                                 Ok(Some(env)) => ltx.send(AxMsg::Binary(env.encode_to_vec())).await?,
                                 Ok(None) => {}
-                                Err(e) => { retry_layout(up, idx, registering, nakama); error!(instance = idx, error = %e, "ServerDB"); return Err(e) }
+                                Err(e) => {
+                                    // A refusal of the very first layout tried may only
+                                    // mean the other layout; any other refusal is final.
+                                    let flipped = retry_layout(up, idx, registering, nakama);
+                                    if symbol == sym::ER_REGISTRATION_FAILURE && flipped != Some(0) {
+                                        up.gate.refuse(idx, &e.to_string());
+                                    }
+                                    error!(instance = idx, error = %e, "ServerDB");
+                                    return Err(e);
+                                }
                             }
                         }
                     }
@@ -468,14 +579,239 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
 
 /// A registration ended without success. Unless the backend has shown it is
 /// nakama, or some registration already worked, try the other layout next.
-fn retry_layout(up: &Upstreams, idx: u32, registering: bool, nakama: bool) {
+///
+/// Returns how many times the layout had been switched before, if it was
+/// switched now. The first switch is tried at once; later ones wait their turn.
+fn retry_layout(up: &Upstreams, idx: u32, registering: bool, nakama: bool) -> Option<u32> {
     if !registering || nakama || up.registration_confirmed.load(Ordering::Relaxed) {
-        return;
+        return None;
     }
     let wide = !up.wide_registration.load(Ordering::Relaxed);
     up.wide_registration.store(wide, Ordering::Relaxed);
+    let before = up.layout_flips.fetch_add(1, Ordering::Relaxed);
+    up.layout_quick.store(before == 0, Ordering::Relaxed);
     info!(instance = idx, layout = if wide { "nakama" } else { "EchoRelay" }, "registration was not accepted; trying the other registration layout");
+    Some(before)
 }
+
+// ─── registration pacing ────────────────────────────────────────────────────
+
+use tokio::time::Instant as TInstant;
+
+/// A registration nobody answered is tried again after this long (doubling
+/// up to `REG_RETRY_MAX` while it keeps failing).
+const REG_RETRY: Duration = Duration::from_secs(10);
+const REG_RETRY_MAX: Duration = Duration::from_secs(300);
+/// Once one game server has registered, this many register at a time.
+const REG_CHUNK: usize = 5;
+
+enum Probe {
+    /// Nobody has registered yet (or the backend went away): one game
+    /// server tries, the rest wait for it.
+    Idle,
+    Running(u32),
+    Passed,
+}
+
+struct GateState {
+    probe: Probe,
+    /// The next lone try is not before this.
+    probe_after: TInstant,
+    /// The backend refused the first game server: nobody tries again.
+    refused: bool,
+    /// Game servers the backend refused after others were accepted.
+    gave_up: std::collections::HashSet<u32>,
+    fails: HashMap<u32, u32>,
+    next_at: HashMap<u32, TInstant>,
+    slots: HashMap<u32, tokio::sync::OwnedSemaphorePermit>,
+    registered: std::collections::HashSet<u32>,
+}
+
+/// Who may talk to the backend, and when. With 128 game servers each one
+/// used to reconnect and register again half a second after any failure:
+/// a backend that refused them saw thousands of requests in minutes.
+///
+/// Now one game server registers first. Refused (an error from the backend):
+/// nobody tries again until the server is restarted. No answer: the same one
+/// tries again after 10 s, then 20 s, 40 s ... Only when one has registered do
+/// the others go, five at a time; one refused then gives up on its own.
+pub struct Gate {
+    st: parking_lot::Mutex<GateState>,
+    changed: tokio::sync::Notify,
+    chunk: Arc<tokio::sync::Semaphore>,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            st: parking_lot::Mutex::new(GateState {
+                probe: Probe::Idle,
+                probe_after: TInstant::now(),
+                refused: false,
+                gave_up: Default::default(),
+                fails: HashMap::new(),
+                next_at: HashMap::new(),
+                slots: HashMap::new(),
+                registered: Default::default(),
+            }),
+            changed: tokio::sync::Notify::new(),
+            chunk: Arc::new(tokio::sync::Semaphore::new(REG_CHUNK)),
+        }
+    }
+
+    /// Waits for this game server's turn. False: it is not to try at all.
+    async fn enter(&self, idx: u32) -> bool {
+        enum Step {
+            Go,
+            GiveUp,
+            Until(TInstant),
+            Wait,
+            Slot,
+        }
+        loop {
+            let step = {
+                let mut s = self.st.lock();
+                let now = TInstant::now();
+                if s.refused || s.gave_up.contains(&idx) {
+                    Step::GiveUp
+                } else if let Some(t) = s.next_at.get(&idx).copied().filter(|t| *t > now) {
+                    Step::Until(t)
+                } else {
+                    match s.probe {
+                        Probe::Passed => Step::Slot,
+                        Probe::Running(_) => Step::Wait,
+                        Probe::Idle if s.probe_after > now => Step::Until(s.probe_after),
+                        Probe::Idle => {
+                            s.probe = Probe::Running(idx);
+                            Step::Go
+                        }
+                    }
+                }
+            };
+            match step {
+                Step::Go => return true,
+                Step::GiveUp => return false,
+                Step::Until(t) => tokio::time::sleep(t.saturating_duration_since(TInstant::now())).await,
+                Step::Wait => {
+                    tokio::select! {
+                        _ = self.changed.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                }
+                Step::Slot => {
+                    let Ok(permit) = self.chunk.clone().acquire_owned().await else { return false };
+                    let mut s = self.st.lock();
+                    if matches!(s.probe, Probe::Passed) && !s.refused {
+                        s.slots.insert(idx, permit);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The backend accepted this game server.
+    fn registered(&self, idx: u32) {
+        let mut s = self.st.lock();
+        s.fails.remove(&idx);
+        s.slots.remove(&idx);
+        s.registered.insert(idx);
+        if matches!(s.probe, Probe::Running(i) if i == idx) {
+            s.probe = Probe::Passed;
+        }
+        drop(s);
+        self.changed.notify_waiters();
+    }
+
+    /// The backend answered with an error: no more tries.
+    fn refuse(&self, idx: u32, reason: &str) {
+        let mut s = self.st.lock();
+        if matches!(s.probe, Probe::Passed) {
+            s.gave_up.insert(idx);
+            error!(instance = idx, reason, "the backend refused this game server: it will not try again (restart the server to retry)");
+        } else {
+            s.refused = true;
+            error!(instance = idx, reason, "the backend refused the first game server: none will try again (fix the setup, then restart the server)");
+        }
+        drop(s);
+        self.changed.notify_waiters();
+    }
+
+    /// The bridge ended. `failed`: the backend side went away or never
+    /// answered (not this process stopping its own game server). `quick`: try
+    /// again at once (the other registration layout).
+    fn leave(&self, idx: u32, failed: bool, quick: bool) {
+        let mut s = self.st.lock();
+        s.slots.remove(&idx);
+        let was_registered = s.registered.remove(&idx);
+        let was_probe = matches!(s.probe, Probe::Running(i) if i == idx);
+        if was_probe {
+            s.probe = Probe::Idle;
+        }
+        if failed && !s.refused && !s.gave_up.contains(&idx) {
+            let n = if was_registered { 1 } else { s.fails.get(&idx).copied().unwrap_or(0) + 1 };
+            s.fails.insert(idx, n);
+            let wait = if quick { Duration::from_secs(1) } else { (REG_RETRY * 2u32.saturating_pow((n - 1).min(8))).min(REG_RETRY_MAX) };
+            let at = TInstant::now() + wait;
+            s.next_at.insert(idx, at);
+            // The backend is not answering: back to one game server trying.
+            if was_probe || !was_registered {
+                s.probe = Probe::Idle;
+                s.probe_after = at;
+            }
+            info!(instance = idx, retry_in_secs = wait.as_secs(), "backend connection ended; this game server tries again later");
+        }
+        drop(s);
+        self.changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn one_first_then_five_at_a_time_and_a_refusal_stops_everyone() {
+        let g = Arc::new(Gate::new());
+        assert!(g.enter(0).await);
+        // The others wait for the first.
+        let waiting: Vec<_> = (1..9u32).map(|i| { let g = g.clone(); tokio::spawn(async move { g.enter(i).await }) }).collect();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(waiting.iter().all(|w| !w.is_finished()));
+        g.registered(0);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(waiting.iter().filter(|w| w.is_finished()).count(), REG_CHUNK);
+        // Each one registered lets the next in.
+        for i in 1..9 {
+            g.registered(i);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(waiting.iter().all(|w| w.is_finished()));
+
+        let g = Arc::new(Gate::new());
+        assert!(g.enter(0).await);
+        let other = { let g = g.clone(); tokio::spawn(async move { g.enter(1).await }) };
+        g.refuse(0, "banned");
+        g.leave(0, true, false);
+        assert!(!other.await.expect("task"));
+        assert!(!g.enter(0).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_answer_is_tried_again_after_ten_seconds_by_one_server() {
+        let g = Arc::new(Gate::new());
+        assert!(g.enter(0).await);
+        let other = { let g = g.clone(); tokio::spawn(async move { g.enter(1).await }) };
+        g.leave(0, true, false);
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert!(!other.is_finished());
+        // After 10 s exactly one goes; nobody else until it is answered.
+        let again = { let g = g.clone(); tokio::spawn(async move { g.enter(0).await }) };
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(usize::from(other.is_finished()) + usize::from(again.is_finished()), 1);
+    }
+}
+
 
 // ─── loadout saves ──────────────────────────────────────────────────────────
 
@@ -596,9 +932,27 @@ mod tests {
     }
 
     #[test]
+    fn server_mute_frames_reach_the_engine_as_json() {
+        let json = br#"{"entrant_ids":["00000000-0000-0000-0000-000000000001"],"muted":true}"#;
+        let mut payload = json.to_vec();
+        payload.push(0);
+        assert_eq!(mute_text(&payload).as_deref(), Some(std::str::from_utf8(json).unwrap()));
+        assert_eq!(mute_text(b"not json "), None);
+        let mut frame = Vec::new();
+        sns::frame(&mut frame, NAKAMA_MUTE_ENTRANTS, &payload);
+        sns::frame(&mut frame, NAKAMA_SAVE_LOADOUT, b"{} ");
+        assert_eq!(mute_texts(&frame).len(), 1);
+    }
+
+    #[test]
     fn login_url_sits_beside_serverdb() {
         assert_eq!(login_from_serverdb("ws://127.0.0.1:777/serverdb"), "ws://127.0.0.1:777/login");
         assert_eq!(login_from_serverdb("ws://h:80/serverdb?api_key=x&regions=a"), "ws://h:80/login");
         assert!(is_serverdb("ws://h:80/serverdb?x=1") && !is_serverdb("ws://h:7350/ws/nevr?token=t"));
     }
+}
+
+#[cfg(test)]
+pub fn with_features_for_test(url: &str) -> String {
+    with_features(url)
 }

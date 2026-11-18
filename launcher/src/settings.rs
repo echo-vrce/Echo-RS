@@ -31,56 +31,84 @@ pub enum Game {
     Arena,
 }
 
-struct Group {
-    game: Game,
+/// One page of the settings: a row of gear (`tabs`) or a single list.
+struct Section {
     title: &'static str,
-    doc: &'static str,
-    /// Where in the document this group's values are.
-    at: &'static [&'static str],
-    /// The object there holds one entry per piece of gear.
-    items: bool,
     help: &'static str,
+    /// One button per item (a piece of gear).
+    tabs: bool,
+    items: Vec<Item>,
 }
 
-const GROUPS: &[Group] = &[
-    Group { game: Game::Combat, title: "Weapons", doc: "mp_weapon_settings", at: &["weapon_properties"], items: true, help: "Fire rate, heat, spread and damage per shot." },
-    Group { game: Game::Combat, title: "Tac mods", doc: "mp_weapon_settings", at: &["ability_properties"], items: true, help: "" },
-    Group { game: Game::Combat, title: "Ordnance", doc: "mp_weapon_settings", at: &["grenade_properties"], items: true, help: "" },
-    Group { game: Game::Combat, title: "Damage", doc: "mp_weapon_settings", at: &["damage_table"], items: true, help: "Damage multiplier by the part that is hit." },
-    Group { game: Game::Combat, title: "Player", doc: "mp_weapon_settings", at: &["player_properties"], items: false, help: "" },
-    Group { game: Game::Combat, title: "Movement", doc: "mp_combat_movement", at: &[], items: false, help: "" },
-    Group { game: Game::Arena, title: "Match rules", doc: "mp_arena_rules", at: &[], items: false, help: "Public round time, pre-match wait, launch wait, mercy spread and self goals are also followed by this server's match flow." },
-    Group { game: Game::Arena, title: "Disc & grab", doc: DISC_GRAB, at: &[], items: false, help: "" },
-    Group { game: Game::Arena, title: "Movement", doc: "mp_arena_movement", at: &[], items: false, help: "Also used in the social lobby." },
-    Group { game: Game::Arena, title: "Punch", doc: "mp_arena_punch", at: &[], items: false, help: "Also used in the social lobby." },
+/// A piece of gear with everything that belongs to it, wherever the game's
+/// files keep it (the DETONATOR: its ordnance values and its damage table).
+struct Item {
+    name: String,
+    parts: Vec<Part>,
+}
+
+/// One object in a document, shown under a heading.
+struct Part {
+    heading: String,
+    doc: &'static str,
+    path: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Weapon,
+    TacMod,
+    Ordnance,
+}
+
+/// Gear in the game's own order with its in-game name, both from the game's
+/// `mp_equipment.json` (the entries it has commented out included). MEDIGUN
+/// is EchoCombat's and not in that file.
+const GEAR: &[(&str, &str, Kind)] = &[
+    ("assault", "PULSAR", Kind::Weapon),
+    ("blaster", "NOVA", Kind::Weapon),
+    ("scout", "COMET", Kind::Weapon),
+    ("rocket", "METEOR", Kind::Weapon),
+    ("magnum", "PROTOSTAR", Kind::Weapon),
+    ("smg", "QUARK", Kind::Weapon),
+    ("chain", "BLAZAR", Kind::Weapon),
+    ("rifle", "STARBURST", Kind::Weapon),
+    ("det", "DETONATOR", Kind::Ordnance),
+    ("stun", "STUN FIELD", Kind::Ordnance),
+    ("arc", "ARC MINE", Kind::Ordnance),
+    ("burst", "INSTANT REPAIR", Kind::Ordnance),
+    ("loc", "TRANSLOCATOR", Kind::Ordnance),
+    ("dot", "DOT FIELD", Kind::Ordnance),
+    ("drone", "ATTACK DRONE", Kind::Ordnance),
+    ("heal", "REPAIR MATRIX", Kind::TacMod),
+    ("sensor", "THREAT SCANNER", Kind::TacMod),
+    ("shield", "ENERGY BARRIER", Kind::TacMod),
+    ("wraith", "PHASE SHIFT", Kind::TacMod),
+    ("buff", "POWER BOOST", Kind::TacMod),
+    ("smoke", "UMBRAL VEIL", Kind::TacMod),
+    ("point", "POINT BLANK", Kind::TacMod),
+    ("medigun", "MEDIGUN", Kind::TacMod),
 ];
 
-/// Gear in the order the game shows it, with its in-game name.
-const GEAR: &[(&str, &str)] = &[
-    ("assault", "PULSAR"),
-    ("blaster", "NOVA"),
-    ("blaster_cone", "NOVA cone"),
-    ("scout", "COMET"),
-    ("scout_aoe", "COMET blast"),
-    ("rocket", "METEOR"),
-    ("rocket_aoe", "METEOR blast"),
-    ("heal", "REPAIR MATRIX"),
-    ("sensor", "THREAT SCANNER"),
-    ("shield", "ENERGY BARRIER"),
-    ("wraith", "PHASE SHIFT"),
-    ("buff", "OVERCHARGE"),
-    ("smoke", "UMBRAL VEIL"),
-    ("point", "NEUTRON"),
-    ("det", "DETONATOR"),
-    ("stun", "STUN FIELD"),
-    ("arc", "ARC MINE"),
-    ("burst", "INSTANT REPAIR"),
-    ("dot", "DOT FIELD"),
-    ("drone", "DRONE"),
-    ("loc", "Loc"),
-    ("magnum_aoe", "Magnum blast"),
-    ("smg", "SMG"),
+/// Entries that are part of another piece of gear: (entry, gear, what of it).
+/// The game's file lists them as that gear's aliases.
+const PART_OF: &[(&str, &str, &str)] = &[
+    ("blaster_cone", "blaster", "cone"),
+    ("scout_aoe", "scout", "explosion"),
+    ("rocket_aoe", "rocket", "explosion"),
+    ("magnum_aoe", "magnum", "explosion"),
 ];
+
+/// The weapon document's per-gear tables: (key, heading, the kind of gear an
+/// entry is when `GEAR` does not know it).
+const TABLES: &[(&str, &str, Kind)] = &[
+    ("weapon_properties", "Weapon", Kind::Weapon),
+    ("ability_properties", "Tac mod", Kind::TacMod),
+    ("grenade_properties", "Ordnance", Kind::Ordnance),
+    ("damage_table", "Damage by body part", Kind::Weapon),
+];
+
+const WEAPONS: &str = "mp_weapon_settings";
 
 fn defaults() -> &'static Map<String, Value> {
     static D: OnceLock<Map<String, Value>> = OnceLock::new();
@@ -88,11 +116,75 @@ fn defaults() -> &'static Map<String, Value> {
 }
 
 fn gear_name(k: &str) -> String {
-    GEAR.iter().find(|(g, _)| *g == k).map_or_else(|| words(k), |(_, n)| n.to_string())
+    GEAR.iter().find(|(g, ..)| *g == k).map_or_else(|| words(k), |(_, n, _)| n.to_string())
 }
 
 fn gear_rank(k: &str) -> usize {
-    GEAR.iter().position(|(g, _)| *g == k).unwrap_or(GEAR.len())
+    GEAR.iter().position(|(g, ..)| *g == k).unwrap_or(GEAR.len())
+}
+
+/// Every piece of gear of one kind, each with all its tables' entries.
+fn gear_items(kind: Kind) -> Vec<Item> {
+    let Some(doc) = defaults().get(WEAPONS) else { return Vec::new() };
+    let mut found: Vec<(String, Kind, Vec<Part>)> = Vec::new();
+    for (table, heading, table_kind) in TABLES {
+        let Some(entries) = doc.get(*table).and_then(Value::as_object) else { continue };
+        for key in entries.keys() {
+            let (gear, what) = PART_OF.iter().find(|(k, ..)| k == key).map_or((key.as_str(), None), |(_, g, w)| (*g, Some(*w)));
+            let heading = match what {
+                Some(w) => format!("{heading} · {w}"),
+                None => heading.to_string(),
+            };
+            let part = Part { heading, doc: WEAPONS, path: vec![table.to_string(), key.clone()] };
+            match found.iter_mut().find(|(g, ..)| g == gear) {
+                Some((.., parts)) => parts.push(part),
+                None => {
+                    let kind = GEAR.iter().find(|(g, ..)| *g == gear).map_or(*table_kind, |(.., k)| *k);
+                    found.push((gear.to_string(), kind, vec![part]));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(g, ..)| (gear_rank(g), g.clone()));
+    // A gear's own entry before its cone / explosion, table by table.
+    for (.., parts) in &mut found {
+        parts.sort_by_key(|p| (TABLES.iter().position(|(t, ..)| *t == p.path[0]), p.heading.contains(" · ")));
+    }
+    found.into_iter().filter(|(_, k, _)| *k == kind).map(|(g, _, parts)| Item { name: gear_name(&g), parts }).collect()
+}
+
+fn single(title: &'static str, doc: &'static str, at: &[&str], help: &'static str) -> Section {
+    Section { title, help, tabs: false, items: vec![Item { name: title.to_string(), parts: vec![Part { heading: String::new(), doc, path: at.iter().map(|s| s.to_string()).collect() }] }] }
+}
+
+fn sections(game: Game) -> Vec<Section> {
+    match game {
+        Game::Combat => vec![
+            Section { title: "Weapons", help: "Each gun with everything of its own: fire rate, heat, spread, its explosion and the damage each body part takes.", tabs: true, items: gear_items(Kind::Weapon) },
+            Section { title: "Tac mods", help: "", tabs: true, items: gear_items(Kind::TacMod) },
+            Section { title: "Ordnance", help: "Each ordnance with its own values and its damage.", tabs: true, items: gear_items(Kind::Ordnance) },
+            single("Player", WEAPONS, &["player_properties"], ""),
+            single("Movement", "mp_combat_movement", &[], ""),
+        ],
+        Game::Arena => vec![
+            single("Match rules", "mp_arena_rules", &[], "Public round time, pre-match wait, launch wait, mercy spread and self goals are also followed by this server's match flow."),
+            single("Disc & grab", DISC_GRAB, &[], ""),
+            single("Movement", "mp_arena_movement", &[], "Also used in the social lobby."),
+            single("Punch", "mp_arena_punch", &[], "Also used in the social lobby."),
+        ],
+    }
+}
+
+fn part_leaves(p: &Part) -> Vec<Leaf> {
+    let mut out = Vec::new();
+    if let Some(v) = defaults().get(p.doc).and_then(|d| at(d, &p.path)) {
+        leaves(p.doc, v, &mut p.path.clone(), "", &mut out);
+    }
+    out
+}
+
+fn item_leaves(it: &Item) -> Vec<Leaf> {
+    it.parts.iter().flat_map(part_leaves).collect()
 }
 
 /// `heat_per_shot` -> `Heat per shot`.
@@ -179,39 +271,30 @@ pub fn changed_count(changes: &Map<String, Value>) -> usize {
     all_leaves(None).iter().filter(|l| *current(changes, l) != l.default).count()
 }
 
-/// Every editable value, of one game or both, in page order.
+/// Every editable value, of one game or both, in page order, labelled with
+/// where it is (for the search).
 fn all_leaves(game: Option<Game>) -> Vec<Leaf> {
     let mut out = Vec::new();
-    for g in GROUPS.iter().filter(|g| game.is_none_or(|x| g.game == x)) {
-        for (key, v) in group_entries(g) {
-            let mut path: Vec<String> = g.at.iter().map(|s| s.to_string()).collect();
-            let label = match key {
-                Some(k) => {
-                    path.push(k.clone());
-                    format!("{} › {}", g.title, gear_name(&k))
+    for g in [Game::Combat, Game::Arena].into_iter().filter(|g| game.is_none_or(|x| *g == x)) {
+        for s in sections(g) {
+            for it in &s.items {
+                for p in &it.parts {
+                    let mut place = s.title.to_string();
+                    if s.tabs {
+                        place = format!("{place} › {}", it.name);
+                    }
+                    if !p.heading.is_empty() {
+                        place = format!("{place} › {}", p.heading);
+                    }
+                    for mut l in part_leaves(p) {
+                        l.label = format!("{place} › {}", l.label);
+                        out.push(l);
+                    }
                 }
-                None => g.title.to_string(),
-            };
-            let start = out.len();
-            leaves(g.doc, v, &mut path, "", &mut out);
-            for l in &mut out[start..] {
-                l.label = format!("{label} › {}", l.label);
             }
         }
     }
     out
-}
-
-/// The group's object, split into its gear entries (`items`) or as one.
-fn group_entries(g: &Group) -> Vec<(Option<String>, &'static Value)> {
-    let path: Vec<String> = g.at.iter().map(|s| s.to_string()).collect();
-    let Some(v) = defaults().get(g.doc).and_then(|d| at(d, &path)) else { return Vec::new() };
-    if !g.items {
-        return vec![(None, v)];
-    }
-    let mut items: Vec<(Option<String>, &Value)> = v.as_object().map(|m| m.iter().map(|(k, x)| (Some(k.clone()), x)).collect()).unwrap_or_default();
-    items.sort_by_key(|(k, _)| (gear_rank(k.as_deref().unwrap_or("")), k.clone()));
-    items
 }
 
 pub struct State {
@@ -345,62 +428,49 @@ pub fn page(ui: &mut egui::Ui, st: &mut State, changes: &mut Map<String, Value>)
         return;
     }
 
-    let groups: Vec<&Group> = GROUPS.iter().filter(|g| g.game == st.game).collect();
-    let group_names: Vec<(String, bool)> = groups
-        .iter()
-        .map(|g| {
-            let mut list = Vec::new();
-            for (k, v) in group_entries(g) {
-                let mut path: Vec<String> = g.at.iter().map(|s| s.to_string()).collect();
-                path.extend(k);
-                leaves(g.doc, v, &mut path, "", &mut list);
-            }
-            (g.title.to_string(), dirty(changes, &list))
-        })
-        .collect();
+    let all = sections(st.game);
+    let names: Vec<(String, bool)> = all.iter().map(|s| (s.title.to_string(), s.items.iter().any(|it| dirty(changes, &item_leaves(it))))).collect();
     let before = st.group;
-    tabs(ui, &group_names, &mut st.group);
+    tabs(ui, &names, &mut st.group);
     if st.group != before {
         st.item = 0;
     }
-    st.group = st.group.min(groups.len() - 1);
-    let g = groups[st.group];
+    st.group = st.group.min(all.len() - 1);
+    let s = &all[st.group];
     ui.add_space(8.0);
 
-    let entries = group_entries(g);
-    let entry_leaves: Vec<(Option<String>, Vec<Leaf>)> = entries
-        .into_iter()
-        .map(|(k, v)| {
-            let mut path: Vec<String> = g.at.iter().map(|s| s.to_string()).collect();
-            path.extend(k.clone());
-            let mut list = Vec::new();
-            leaves(g.doc, v, &mut path, "", &mut list);
-            (k, list)
-        })
-        .collect();
-    if g.items {
-        let names: Vec<(String, bool)> = entry_leaves.iter().map(|(k, l)| (gear_name(k.as_deref().unwrap_or("")), dirty(changes, l))).collect();
+    if s.tabs {
+        let names: Vec<(String, bool)> = s.items.iter().map(|it| (it.name.clone(), dirty(changes, &item_leaves(it)))).collect();
         egui::Frame::default().fill(FIELD).corner_radius(10).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             tabs(ui, &names, &mut st.item);
         });
         ui.add_space(8.0);
     }
-    let idx = if g.items { st.item.min(entry_leaves.len().saturating_sub(1)) } else { 0 };
-    let Some((key, list)) = entry_leaves.get(idx) else { return };
-    let title = match key {
-        Some(k) => format!("{} · {}", g.title, gear_name(k)),
-        None => g.title.to_string(),
-    };
+    let idx = if s.tabs { st.item.min(s.items.len().saturating_sub(1)) } else { 0 };
+    let Some(it) = s.items.get(idx) else { return };
+    let title = if s.tabs { format!("{} · {}", s.title, it.name) } else { s.title.to_string() };
     egui::Frame::default().fill(CARD).stroke(egui::Stroke::new(1.0_f32, BORDER)).corner_radius(12).inner_margin(egui::Margin::same(18)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new(title.to_uppercase()).size(12.0).strong().extra_letter_spacing(1.2).color(MUTED));
-        if !g.help.is_empty() {
-            hint(ui, g.help);
+        if !s.help.is_empty() {
+            hint(ui, s.help);
         }
-        ui.add_space(4.0);
-        rows(ui, &format!("rows-{}-{idx}", g.title), list, |l| l.label.clone(), changes);
-        if list.is_empty() {
+        let mut any = false;
+        for (n, p) in it.parts.iter().enumerate() {
+            let list = part_leaves(p);
+            if list.is_empty() {
+                continue;
+            }
+            any = true;
+            ui.add_space(if p.heading.is_empty() { 4.0 } else { 12.0 });
+            if !p.heading.is_empty() {
+                ui.label(RichText::new(&p.heading).strong().color(TEXT));
+                ui.add_space(2.0);
+            }
+            rows(ui, &format!("rows-{}-{idx}-{n}", s.title), &list, |l| l.label.clone(), changes);
+        }
+        if !any {
             hint(ui, "No values to change here.");
         }
     });
@@ -411,18 +481,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_parse_and_every_group_has_values() {
-        for g in GROUPS {
-            let n: usize = group_entries(g)
-                .into_iter()
-                .map(|(_, v)| {
-                    let mut out = Vec::new();
-                    leaves(g.doc, v, &mut Vec::new(), "", &mut out);
-                    out.len()
-                })
-                .sum();
-            assert!(n > 0, "{} has no values", g.title);
+    fn defaults_parse_and_every_section_has_values() {
+        for g in [Game::Combat, Game::Arena] {
+            for s in sections(g) {
+                assert!(!s.items.is_empty(), "{} has no items", s.title);
+                for it in &s.items {
+                    assert!(!it.parts.is_empty(), "{} › {}", s.title, it.name);
+                }
+                assert!(s.items.iter().any(|it| !item_leaves(it).is_empty()), "{} has no values", s.title);
+            }
         }
+    }
+
+    /// Everything of a piece of gear is on its own page, under the game's name.
+    #[test]
+    fn gear_pages_hold_all_of_a_gears_values() {
+        let combat = sections(Game::Combat);
+        let ordnance = combat.iter().find(|s| s.title == "Ordnance").expect("ordnance");
+        let det = ordnance.items.iter().find(|it| it.name == "DETONATOR").expect("detonator");
+        let paths: Vec<Vec<String>> = det.parts.iter().map(|p| p.path.clone()).collect();
+        assert_eq!(paths, [["grenade_properties", "det"], ["damage_table", "det"]]);
+        let weapons = combat.iter().find(|s| s.title == "Weapons").expect("weapons");
+        let names: Vec<&str> = weapons.items.iter().map(|it| it.name.as_str()).collect();
+        assert_eq!(&names[..8], ["PULSAR", "NOVA", "COMET", "METEOR", "PROTOSTAR", "QUARK", "BLAZAR", "STARBURST"]);
+        let comet = weapons.items.iter().find(|it| it.name == "COMET").expect("comet");
+        let headings: Vec<&str> = comet.parts.iter().map(|p| p.heading.as_str()).collect();
+        assert_eq!(headings, ["Weapon", "Weapon · explosion", "Damage by body part", "Damage by body part · explosion"]);
+        let tac: Vec<&str> = combat.iter().find(|s| s.title == "Tac mods").expect("tac").items.iter().map(|it| it.name.as_str()).collect();
+        assert!(tac.contains(&"POWER BOOST") && tac.contains(&"POINT BLANK"), "{tac:?}");
+
+        // Nothing lost or shown twice: every value of the per-gear tables once.
+        let mut want = Vec::new();
+        for (table, ..) in TABLES {
+            let v = &defaults()[WEAPONS][*table];
+            leaves(WEAPONS, v, &mut vec![table.to_string()], "", &mut want);
+        }
+        let mut want: Vec<Vec<String>> = want.into_iter().map(|l| l.path).collect();
+        let mut got: Vec<Vec<String>> = combat.iter().filter(|s| s.tabs).flat_map(|s| s.items.iter().flat_map(item_leaves)).map(|l| l.path).collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
