@@ -93,6 +93,33 @@ const VAR_DEFENDING_TEAM: u64 = 0xf881_55a6_6a6b_05f8;
 const VAR_TOTAL_ROUNDS: u64 = 0x9042_518a_de2d_74b2;
 const VAR_ROUNDS_PLAYED: u64 = 0x50ba_16e5_7e95_8204;
 
+// The private terminal and match restarts, from the stock match script
+// (`mp_combat_server_state`, 6fa8cc9cd721a563, lifted 2026-11-19):
+// - ready: each press flips the team's `*_team_ready` flag (only while
+//   waiting for ready). Once every team with players is ready (an empty team
+//   does not hold the others up): `nevt_round_restart`, 3 s later
+//   `nevt_match_ready`, 0.2 s later `round_start`, then the team room.
+// - restart request: sets the team's `*_team_restart_request` flag (a second
+//   press does nothing). Once every team with players asked, in the team
+//   room, pre-launch or play: the match restarts (as a rematch does).
+// - rematch (`nevt_match_restart_request`, in the post-match celebration or
+//   personal stats): `nevt_game_restart_confirmed`, `nevt_round_restart`,
+//   `nevt_game_restart`, the stats reset and sent, `nevt_mpl_refresh_
+//   scoreboard2`, and 0.2 s later back to waiting for ready.
+// - A private match does not go back to the lobby by itself after the
+//   personal stats (a public one does); the lobby button
+//   (`nevt_return_to_lobby_request`) sends everyone back.
+const EV_MATCH_READY: u64 = 0xa25c_369c_8347_706f;
+const EV_GAME_RESTART_CONFIRMED: u64 = 0x449e_f6be_2f77_41e2;
+const EV_GAME_RESTART: u64 = 0x8b7d_7cb9_c1b3_9fe4;
+const EV_REFRESH_SCOREBOARD: u64 = 0xc35b_4c6c_3ffd_3a2a;
+const VAR_RESTART_REQUEST: [u64; 2] = [0xef31_e81d_7ccf_9310, 0x0b64_c6bf_815b_9764];
+/// After every team is ready: `nevt_match_ready`, then `round_start`.
+const READY_TO_MATCH_READY: f32 = 3.0;
+const READY_TO_ROUND_START: f32 = 3.2;
+/// A rematch or restart: back to waiting for ready this long after.
+const RESTART_TO_WAITING: f32 = 0.2;
+
 // ── Payload HUD (native Gauss and Fission server recordings, 2026-11-16) ────
 /// Who holds the payload: `Unclaimed`, `attackerPossessed`, `contested` (a
 /// defender alone stays `Unclaimed`). Each level keeps a copy of its own.
@@ -375,6 +402,8 @@ pub enum Out {
     /// A private payload match's half time: every blue player goes orange
     /// and every orange player blue.
     SwapTeams,
+    /// A private match restarts: every player's stats back to 0, and sent.
+    ResetStats,
 }
 
 /// What native's level scripts do that the server repeats: a client's
@@ -772,6 +801,12 @@ pub struct Combat {
     /// A private match (see the notes at the top): teams ready up.
     private: bool,
     ready: [bool; 2],
+    /// Seconds since every team was ready (the start is under way).
+    starting: Option<f32>,
+    /// The teams' restart requests.
+    restart_req: [bool; 2],
+    /// Seconds until a rematch or restart goes back to waiting for ready.
+    restarting: Option<f32>,
     /// The match-load events went out (a private match waiting for ready).
     loaded: bool,
     /// Private payload: the half (1, 2) and the first attackers' furthest
@@ -830,6 +865,9 @@ impl Combat {
             points_shown: false,
             private: false,
             ready: [false; 2],
+            starting: None,
+            restart_req: [false; 2],
+            restarting: None,
             loaded: false,
             half: 1,
             to_beat: None,
@@ -888,6 +926,8 @@ impl Combat {
         if self.private {
             v.push((VAR_BLUE_READY, Val::Lo8(u8::from(self.ready[0]))));
             v.push((VAR_ORANGE_READY, Val::Lo8(u8::from(self.ready[1]))));
+            v.push((VAR_RESTART_REQUEST[0], Val::Lo8(u8::from(self.restart_req[0]))));
+            v.push((VAR_RESTART_REQUEST[1], Val::Lo8(u8::from(self.restart_req[1]))));
         }
         self.script.vars(&mut v);
         v.extend(self.track_set.iter().copied());
@@ -964,14 +1004,116 @@ impl Combat {
         self.private
     }
 
-    /// A private match's team (0 blue, 1 orange) pressed ready: true if that
-    /// counts (still waiting, not ready yet).
-    pub fn team_ready(&mut self, team: usize) -> bool {
-        if !self.private || self.phase != Phase::Waiting || team > 1 || self.ready[team] {
+    /// A private match's team (0 blue, 1 orange) pressed ready: native flips
+    /// the flag (a second press un-readies). `Some(now ready)` if it counted
+    /// (waiting for ready, the start not under way yet).
+    pub fn team_ready(&mut self, team: usize) -> Option<bool> {
+        if !self.private || self.phase != Phase::Waiting || team > 1 || self.starting.is_some() || self.restarting.is_some() {
+            return None;
+        }
+        self.ready[team] = !self.ready[team];
+        Some(self.ready[team])
+    }
+
+    /// A private match's team asked for a restart: true if the flag went up
+    /// (native sets it, a second press does nothing).
+    pub fn restart_request(&mut self, team: usize) -> bool {
+        if !self.private || team > 1 || self.restart_req[team] {
             return false;
         }
-        self.ready[team] = true;
+        self.restart_req[team] = true;
         true
+    }
+
+    /// A private match's rematch button: in the post-match celebration or
+    /// the personal stats, the match starts over (back to waiting for ready).
+    pub fn rematch(&mut self) -> Vec<Out> {
+        let at_end = self.phase == Phase::Over && (self.state == ST_MATCH_END[3] || self.state == ST_MATCH_END[5]);
+        if !self.private || !at_end || self.restarting.is_some() {
+            return Vec::new();
+        }
+        self.restart()
+    }
+
+    /// The lobby button: everyone goes back to the lobby (native's
+    /// `ReturnToLobby`: `nevt_return_to_lobby`, waiting_to_return_to_lobby).
+    pub fn return_to_lobby(&mut self) -> Vec<Out> {
+        if self.state == ST_MATCH_END[6] {
+            return Vec::new();
+        }
+        self.states.clear();
+        self.state = ST_MATCH_END[6];
+        self.post_match = false;
+        vec![self.event(EV_RETURN_TO_LOBBY)]
+    }
+
+    /// Native's match restart (rematch, or both teams' restart requests):
+    /// its events and the stats reset now, waiting for ready 0.2 s later.
+    fn restart(&mut self) -> Vec<Out> {
+        tracing::info!("private combat match: restart");
+        self.restarting = Some(RESTART_TO_WAITING);
+        vec![
+            self.event(EV_GAME_RESTART_CONFIRMED),
+            self.event(EV_NEXT_ROUND),
+            self.event(EV_GAME_RESTART),
+            Out::ResetStats,
+            self.event(EV_REFRESH_SCOREBOARD),
+        ]
+    }
+
+    /// Every team with players (`on`: blue, orange) has `flags` set, and
+    /// at least one is set (native's test, an empty team does not count).
+    fn all_teams(flags: [bool; 2], on: (bool, bool)) -> bool {
+        (flags[0] || flags[1]) && (!on.0 || flags[0]) && (!on.1 || flags[1])
+    }
+
+    /// Back to the start: waiting for players (public) or for ready
+    /// (private), the payload back at the start when `reset_payload`.
+    fn reset_to_waiting(&mut self, reset_payload: bool) -> Vec<Out> {
+        let mut out = Vec::new();
+        self.states.clear();
+        self.rounds_won = [0; 2];
+        self.round = 1;
+        self.capture_reset_sent = false;
+        self.early_lock = false;
+        self.clock = self.round_secs();
+        if let Some(c) = self.capture.as_mut() {
+            c.reset();
+        }
+        self.state = if self.private { ST_WAIT_FOR_READY } else { ST_PRE_MATCH };
+        self.countdown = f(&self.rules, "/round_rules/pre_match_wait_time", 30.0);
+        self.subphase = None;
+        self.team_room = true;
+        self.round_over = false;
+        self.last_round_winner = None;
+        self.points_shown = false;
+        self.cues_left = 0;
+        self.ready = [false; 2];
+        self.loaded = false;
+        if reset_payload {
+            // Left at half time, or a restart: from the start of the track.
+            out.extend(self.reset_payload());
+        }
+        self.phase = Phase::Waiting;
+        self.half = 1;
+        self.to_beat = None;
+        self.starting = None;
+        self.restart_req = [false; 2];
+        out
+    }
+
+    /// A private match's restart lands: everything as at the start, the
+    /// end sequence and the winner cleared, the payload at the start.
+    fn reset_match(&mut self) -> Vec<Out> {
+        self.winner = None;
+        self.over_for = 0.0;
+        self.end_step = 0;
+        self.post_match = false;
+        self.celebrating = false;
+        self.in_overtime = false;
+        self.overtime = 0.0;
+        let reset_payload = self.payload.is_some();
+        self.reset_to_waiting(reset_payload)
     }
 
     /// The level vars a trackpoint's first reach sets (all those passed, in
@@ -1109,6 +1251,24 @@ impl Combat {
         if let Some(s) = self.states.pop_front() {
             self.state = s;
         }
+        let on = (players.iter().any(|p| p.0 == 0), players.iter().any(|p| p.0 == 1));
+        if let Some(left) = self.restarting.as_mut() {
+            *left -= dt;
+            if *left <= 0.0 {
+                self.restarting = None;
+                out.extend(self.reset_match());
+            }
+            return out;
+        }
+        // Native's midgame restart: every team with players asked, in the
+        // team room, pre-launch or play.
+        if self.private
+            && matches!(self.phase, Phase::TeamRoom | Phase::RoundStart | Phase::Playing)
+            && Self::all_teams(self.restart_req, on)
+        {
+            out.extend(self.restart());
+            return out;
+        }
         match self.phase {
             Phase::Waiting if self.private => {
                 if !players.is_empty() && !self.loaded {
@@ -1116,12 +1276,22 @@ impl Combat {
                     out.push(self.event(EV_LOAD_A));
                     out.push(self.event(EV_LOAD_B));
                 }
-                let on = |t: u8| players.iter().any(|p| p.0 == t);
-                let (b, o) = (on(0), on(1));
-                if (b || o) && (!b || self.ready[0]) && (!o || self.ready[1]) {
+                if self.starting.is_none() && Self::all_teams(self.ready, on) {
                     tracing::info!("private combat match: all teams ready");
-                    // Straight on to the team room, as a public match after
-                    // its pre-match wait.
+                    self.starting = Some(0.0);
+                    out.push(self.event(EV_NEXT_ROUND));
+                }
+                let Some(t) = self.starting.as_mut() else { return out };
+                let was = *t;
+                *t += dt;
+                let now = *t;
+                if was < READY_TO_MATCH_READY && now >= READY_TO_MATCH_READY {
+                    out.push(self.event(EV_MATCH_READY));
+                }
+                if now >= READY_TO_ROUND_START {
+                    self.starting = None;
+                    // round_start, then the team room, as a public match
+                    // after its pre-match wait.
                     self.phase = Phase::TeamRoom;
                     self.to_states(&ST_TEAM_ROOM);
                     self.subphase = Some(SUB_TEAM_ROOM);
@@ -1139,33 +1309,8 @@ impl Combat {
             }
             Phase::PreMatch | Phase::TeamRoom | Phase::RoundStart | Phase::RoundOver if players.is_empty() => {
                 // Everyone left before the round began: start over.
-                let was = self.phase;
-                self.states.clear();
-                self.rounds_won = [0; 2];
-                self.round = 1;
-                self.capture_reset_sent = false;
-                self.early_lock = false;
-                self.clock = self.round_secs();
-                if let Some(c) = self.capture.as_mut() {
-                    c.reset();
-                }
-                self.state = if self.private { ST_WAIT_FOR_READY } else { ST_PRE_MATCH };
-                self.countdown = f(&self.rules, "/round_rules/pre_match_wait_time", 30.0);
-                self.subphase = None;
-                self.team_room = true;
-                self.round_over = false;
-                self.last_round_winner = None;
-                self.points_shown = false;
-                self.cues_left = 0;
-                self.ready = [false; 2];
-                self.loaded = false;
-                if self.payload.is_some() && (self.half > 1 || was == Phase::RoundOver) {
-                    // Left at half time: the next match starts from the start.
-                    out.extend(self.reset_payload());
-                }
-                self.phase = Phase::Waiting;
-                self.half = 1;
-                self.to_beat = None;
+                let moved = self.payload.is_some() && (self.half > 1 || self.phase == Phase::RoundOver);
+                out.extend(self.reset_to_waiting(moved));
             }
             Phase::PreMatch => {
                 self.countdown -= dt;
@@ -1739,6 +1884,10 @@ impl Combat {
                     self.to_states(&ST_MATCH_END[4..6]);
                     out.push(self.event(EV_PERSONAL_STATS));
                     self.countdown = stats;
+                }
+                _ if self.private => {
+                    // Native: a private match stays on the personal stats
+                    // until a rematch or the lobby button.
                 }
                 _ => {
                     self.state = ST_MATCH_END[6];
@@ -2336,7 +2485,10 @@ mod tests {
         assert_eq!(var(&c, VAR_GAUSS_DOOR), Some(Val::Lo32(0)));
     }
 
-    /// A private match waits for every team with players to be ready.
+    /// A private match waits for every team with players to be ready
+    /// (native mp_combat_server_state): a press flips the flag, and once
+    /// all are ready, round restart, 3 s later match ready, 0.2 s later the
+    /// round starts.
     #[test]
     fn a_private_match_waits_for_ready() {
         let mut c = gauss();
@@ -2346,26 +2498,95 @@ mod tests {
         assert_eq!(c.phase, Phase::Waiting);
         assert_eq!(c.state, ST_WAIT_FOR_READY);
         assert_eq!(v.iter().filter(|o| matches!(o, Out::Event(EV_LOAD_A, ..))).count(), 1);
-        assert!(c.team_ready(1));
-        assert!(!c.team_ready(1), "once");
+        assert_eq!(c.team_ready(1), Some(true));
+        assert_eq!(c.team_ready(1), Some(false), "a second press un-readies");
+        assert_eq!(c.team_ready(1), Some(true));
         run(&mut c, 1.0, &both);
         assert_eq!(c.phase, Phase::Waiting);
         assert_eq!(var(&c, VAR_ORANGE_READY), Some(Val::Lo8(1)));
-        assert!(c.team_ready(0));
-        run(&mut c, 0.2, &both);
+        assert_eq!(c.team_ready(0), Some(true));
+        let v = run(&mut c, 0.1, &both);
+        assert!(v.iter().any(|o| matches!(o, Out::Event(EV_NEXT_ROUND, ..))), "{v:?}");
+        assert_eq!(c.team_ready(0), None, "locked in once starting");
+        let v = run(&mut c, 2.8, &both);
+        assert!(!v.iter().any(|o| matches!(o, Out::Event(EV_MATCH_READY, ..))));
+        assert_eq!(c.phase, Phase::Waiting);
+        let v = run(&mut c, 0.2, &both);
+        assert!(v.iter().any(|o| matches!(o, Out::Event(EV_MATCH_READY, ..))), "{v:?}");
+        assert_eq!(c.phase, Phase::Waiting);
+        run(&mut c, 0.3, &both);
         assert_eq!(c.phase, Phase::TeamRoom);
         // Only orange there: orange alone is enough.
         let mut c = fission();
         c.set_private();
         let orange = [(1u8, true, None, 0)];
         c.team_ready(1);
-        run(&mut c, 0.2, &orange);
+        run(&mut c, 3.5, &orange);
         assert_eq!(c.phase, Phase::TeamRoom);
         // A public match does not wait.
         let mut c = gauss();
-        assert!(!c.team_ready(0));
+        assert_eq!(c.team_ready(0), None);
         run(&mut c, 0.2, &orange);
         assert_eq!(c.phase, Phase::PreMatch);
+    }
+
+    /// Native: a private match stays on the personal stats; a rematch goes
+    /// back to waiting for ready with the stats reset; the lobby button
+    /// sends everyone back.
+    #[test]
+    fn a_private_match_end_waits_for_rematch_or_lobby() {
+        let mut c = playing(gauss());
+        c.set_private();
+        c.state = ST_PLAYING;
+        let away = [(0u8, true, Some([500.0, 0.0, 0.0]), 0), (1u8, true, Some([500.0, 0.0, 0.0]), 1)];
+        c.finish(Winner::Orange);
+        let v = run(&mut c, 120.0, &away);
+        assert_eq!(c.phase, Phase::Over);
+        assert!(!v.iter().any(|o| matches!(o, Out::Event(EV_RETURN_TO_LOBBY, ..))), "private: no return");
+        assert_eq!(c.state, ST_MATCH_END[5]);
+        let v = c.rematch();
+        assert!(v.iter().any(|o| matches!(o, Out::Event(EV_GAME_RESTART_CONFIRMED, ..))));
+        assert!(v.iter().any(|o| matches!(o, Out::Event(EV_GAME_RESTART, ..))));
+        assert!(v.contains(&Out::ResetStats));
+        assert!(c.rematch().is_empty(), "once");
+        run(&mut c, 0.3, &away);
+        assert_eq!(c.phase, Phase::Waiting);
+        assert_eq!(c.state, ST_WAIT_FOR_READY);
+        assert!(c.winner.is_none());
+        assert_eq!(c.payload_dist(), Some(0.0));
+        assert_eq!(c.team_ready(0), Some(true), "ready again");
+        // The lobby button.
+        let v = c.return_to_lobby();
+        assert!(v.iter().any(|o| matches!(o, Out::Event(EV_RETURN_TO_LOBBY, ..))));
+        assert_eq!(c.state, ST_MATCH_END[6]);
+        // A public match goes back by itself and has no rematch.
+        let mut c = playing(gauss());
+        c.finish(Winner::Orange);
+        let v = run(&mut c, 120.0, &away);
+        assert!(v.iter().any(|o| matches!(o, Out::Event(EV_RETURN_TO_LOBBY, ..))));
+        assert!(c.rematch().is_empty());
+    }
+
+    /// Native: every team with players asks for a restart, in play: the
+    /// match restarts. One team alone does not.
+    #[test]
+    fn private_restart_requests_restart_the_match() {
+        let mut c = playing(fission());
+        c.set_private();
+        c.state = ST_PLAYING;
+        let both = [(0u8, true, None, 0), (1u8, true, None, 1)];
+        assert!(c.restart_request(0));
+        assert!(!c.restart_request(0), "a second press does nothing");
+        run(&mut c, 0.1, &both);
+        assert_eq!(c.phase, Phase::Playing);
+        assert_eq!(var(&c, VAR_RESTART_REQUEST[0]), Some(Val::Lo8(1)));
+        assert!(c.restart_request(1));
+        let v = run(&mut c, 0.1, &both);
+        assert!(v.iter().any(|o| matches!(o, Out::Event(EV_GAME_RESTART, ..))), "{v:?}");
+        run(&mut c, 0.3, &both);
+        assert_eq!(c.phase, Phase::Waiting);
+        assert_eq!(var(&c, VAR_RESTART_REQUEST[0]), Some(Val::Lo8(0)));
+        assert_eq!(c.payload_dist(), Some(0.0));
     }
 
     /// A private payload match: orange's furthest point in the first half is

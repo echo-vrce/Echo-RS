@@ -1547,7 +1547,7 @@ impl Session {
             REPLICATED_ACK => {
                 if let Some(p) = self.peers.get_mut(&from) {
                     if p.acks_logged < 12 || p.acks_logged % 200 == 0 {
-                        info!(%from, slot = ?p.slot, n = p.acks_logged, body = %hex_str(d), "replicated ack");
+                        debug!(%from, slot = ?p.slot, n = p.acks_logged, body = %hex_str(d), "replicated ack");
                     }
                     p.acks_logged += 1;
                     p.rep_acked = true;
@@ -1615,7 +1615,7 @@ impl Session {
             // room, where no gear-station message is ever sent. Punching
             // outside it came from clients left in combat mode by stations
             // that were never freed.)
-            STUN if { info!(%from, reliable, body = %hex_str(d), "stun message"); false } => {}
+            STUN if { debug!(%from, reliable, body = %hex_str(d), "stun message"); false } => {}
             STUN if reliable && self.stun_victim_is_spectator(d) => {
                 debug!(%from, body = %hex_str(d), "stun on a spectator (not relayed)");
             }
@@ -2007,7 +2007,7 @@ impl Session {
         self.send_entrant_data_on_join(addr);
         if let Some(p) = self.peers.get_mut(&addr) {
             p.joined_at = Some(Instant::now());
-            p.t.trace = true;
+            p.t.trace = tracing::enabled!(tracing::Level::DEBUG);
         }
         info!(%addr, slot, team, players = self.player_count(), "player joined");
     }
@@ -2771,7 +2771,7 @@ impl Session {
                         let mut v: Vec<_> = p.t.sent_types.drain().collect();
                         v.sort_by(|a, b| b.1.cmp(&a.1));
                         let list: Vec<String> = v.iter().take(96).map(|((t, m, l), n)| format!("{t:#x}/{}/{l}B x{n}", if *m { "mb" } else { "rel" })).collect();
-                        info!(slot = s, "server sent: {}", list.join(" "));
+                        debug!(slot = s, "server sent: {}", list.join(" "));
                     }
                     if p.joined_at.is_some_and(|t| t.elapsed() > Duration::from_secs(90)) {
                         p.t.trace = false;
@@ -2901,6 +2901,11 @@ impl Session {
         c.set_payload_holders(holders);
         let outs = c.step(dt, &players);
         self.combat_stats(dt, now);
+        self.combat_outs(outs);
+    }
+
+    /// Carry out what the combat mode asked for.
+    fn combat_outs(&mut self, outs: Vec<super::combat::Out>) {
         for o in outs {
             match o {
                 super::combat::Out::Reliable(ty, body) => {
@@ -2924,6 +2929,13 @@ impl Session {
                     }
                 }
                 super::combat::Out::SwapTeams => self.swap_teams(),
+                super::combat::Out::ResetStats => {
+                    // Native: R15NetResetPlayerStatsNode, then the stats to clients.
+                    for p in self.peers.values_mut() {
+                        p.cstats = CombatStats::default();
+                    }
+                    self.send_combat_stats();
+                }
                 super::combat::Out::Unlock => {
                     if self.join_locked {
                         self.join_locked = false;
@@ -4221,13 +4233,37 @@ impl Session {
         let module = u64::from_le_bytes(d[8..16].try_into().expect("8"));
         if let Some(c) = self.combat.as_mut()
             && c.is_private()
-            && matches!(sym, BTN_READY_BLUE | BTN_READY_ORANGE)
+            && matches!(sym, BTN_READY_BLUE | BTN_READY_ORANGE | BTN_RESTART_BLUE | BTN_RESTART_ORANGE)
         {
-            // A private combat match's terminal: the team is ready.
-            let team = usize::from(sym == BTN_READY_ORANGE);
-            if c.team_ready(team) {
-                info!(%from, team, "private combat match: team ready");
+            // A private combat match's terminal (native mp_combat_server_state:
+            // a team's own players, spectators and moderators may press its
+            // buttons, and the press goes on to everyone else).
+            let team = usize::from(matches!(sym, BTN_READY_ORANGE | BTN_RESTART_ORANGE));
+            let sender = self.peers.get(&from).map_or(TEAM_SPECTATOR, |p| p.team);
+            if !(usize::from(sender) == team || matches!(sender, TEAM_SPECTATOR | TEAM_MODERATOR)) {
+                info!(%from, team, sender, "private combat match: the other team's button, ignored");
+                return;
             }
+            let counted = if matches!(sym, BTN_READY_BLUE | BTN_READY_ORANGE) {
+                c.team_ready(team).inspect(|now| info!(%from, team, ready = now, "private combat match: team ready")).is_some()
+            } else {
+                c.restart_request(team) && {
+                    info!(%from, team, "private combat match: team asked for a restart");
+                    true
+                }
+            };
+            if counted {
+                self.relay_reliable(from, COMPONENT_EVENT, d, false);
+            }
+            return;
+        }
+        if let Some(c) = self.combat.as_mut()
+            && c.is_private()
+            && matches!(sym, BTN_REMATCH | BTN_LOBBY)
+        {
+            let outs = if sym == BTN_REMATCH { c.rematch() } else { c.return_to_lobby() };
+            info!(%from, rematch = sym == BTN_REMATCH, n = outs.len(), "private combat match: end button");
+            self.combat_outs(outs);
             return;
         }
         if self.combat.is_some() {

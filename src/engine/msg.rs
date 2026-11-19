@@ -236,7 +236,9 @@ pub const EV_GOAL_A_ORANGE: u64 = 0xf7b1_de94_6009_b29e;
 pub const EV_GOAL_B: u64 = 0xfa94_15c1_1a6a_3b6c;
 /// Announcer goal calls (filter 13): native sent the first for a 2-point
 /// goal and the second for a 3-point goal.
+#[cfg(test)]
 pub const EV_ANNOUNCER_GOAL_2: u64 = 0x66f4_61df_61ae_a120;
+#[cfg(test)]
 pub const EV_ANNOUNCER_GOAL_3: u64 = 0x6cfb_6cd1_5bd1_90a7;
 /// Disc light/FX in orange, used for the relaunch after blue scores (the
 /// disc goes to orange).
