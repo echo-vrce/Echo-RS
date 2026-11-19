@@ -297,7 +297,9 @@ const SLOW_REVERSE: f32 = 0.2;
 /// level script) the max speed is `s02_payload_speed_multiplier` (0.75) m/s:
 /// 1.25 m/s up to it (checkpoint 1 at 77.8 m included), slowing by 1 m/s each
 /// second from it, 0.75 m/s after. Section 1 ran at 1.25 throughout
-/// (`s01_payload_speed_multiplier` 1.7 showed nowhere).
+/// (`s01_payload_speed_multiplier` 1.7 showed nowhere). Its section 3 goes
+/// 1.0 (pre-tunnel, from checkpoint 2's door), then 1.25 (post-tunnel) and
+/// 1.0 (final push) at triggers not known yet (no recording got that far).
 const GAUSS_S02_FROM: f32 = 85.49;
 /// Misc state: an empty payload rolled back onto its last checkpoint (native
 /// Gauss 521.042, with the trackpoint before the checkpoint's); it stays set
@@ -1504,6 +1506,7 @@ impl Combat {
             _ => f(&self.settings, "/payload/payload_speed_multi_attacker_4", 1.35),
         };
         let s02 = (self.level == LEVEL_GAUSS).then(|| f(&self.settings, "/payload/s02_payload_speed_multiplier", 0.75));
+        let s03 = (self.level == LEVEL_GAUSS).then(|| f(&self.settings, "/payload/s03_payload_speed_multiplier_pre_tunnel", 1.0));
         let celebrate = [f(&self.settings, "/payload/c1_celebration_timer", 15.0), f(&self.settings, "/payload/c2_celebration_timer", 10.0)];
         let added = [f(&self.settings, "/round_timers/checkpoint_1", 120.0), f(&self.settings, "/round_timers/checkpoint_2", 120.0)];
         let mut finished = false;
@@ -1552,6 +1555,14 @@ impl Combat {
                 p.idle = 0.0;
                 if p.hold <= 0.0 {
                     p.state = 0;
+                    // Native Gauss: checkpoint 2's door opening
+                    // (`checkpoint_3_entrance_door_opened`) sets the speed to
+                    // `s03_payload_speed_multiplier_pre_tunnel`.
+                    if let Some(v) = s03
+                        && p.next == 2
+                    {
+                        p.max_mps = Some(v);
+                    }
                 }
                 None
             } else if att > 0 && def > 0 {
@@ -2346,6 +2357,28 @@ mod tests {
         assert!(v.contains(&Out::Awards));
         assert!(v.contains(&Out::Event(EV_RETURN_TO_LOBBY, MOD_COMBAT_MATCH, 0x17a, FILTER_ALL)));
         assert_eq!(c.state, ST_MATCH_END[6]);
+    }
+
+    /// Native Gauss's level script: checkpoint 2 holds it (20 s), then its
+    /// door opens and section 3 runs at `s03_payload_speed_multiplier_pre_tunnel`.
+    #[test]
+    fn gauss_section_3_speed_from_checkpoint_2s_door() {
+        let mut c = playing(gauss());
+        let cp = Track::gauss().checkpoints[1];
+        {
+            let p = c.payload.as_mut().expect("p");
+            p.dist = cp - 0.05;
+            p.next = 1;
+            p.max_mps = Some(0.75);
+        }
+        c.set_payload_holders(vec![0]);
+        let me = [(1u8, true, Some(Track::gauss().pos(cp)), 0)];
+        run(&mut c, 1.0, &me);
+        assert_eq!(c.payload.as_ref().expect("p").next, 2);
+        run(&mut c, 18.0, &me);
+        assert_eq!(c.payload.as_ref().expect("p").max_mps, Some(0.75), "still held");
+        run(&mut c, 2.5, &me);
+        assert_eq!(c.payload.as_ref().expect("p").max_mps, Some(1.0));
     }
 
     /// Native Gauss 411.5-412.9: slot 2's touch states as the attacker count
