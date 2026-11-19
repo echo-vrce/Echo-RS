@@ -151,13 +151,25 @@ It prints where each client was placed. It also prints a `nevr-test-client` comm
 
   **Stats.** Every 3 s of play, each player gets an `SR15NetReliableStatUpdate` (`[slot u32]` plus JSON `add` deltas), and each team an `SR15NetReliableTeamStatUpdate`. The team update holds 12 records of `[hash][mantissa][exponent][count]`, with possession in 2^-6 s. Points, goals, shots on goal and possession are tracked.
 
-  **Awards.** At match over, `SR15NetTopAwardsMsg` names the MVP (the player with the most points) for the end-of-match board.
+  **Awards.** At match over, `SR15NetTopAwardsMsg` names the MVP (the player with the most points) for the end-of-match board. Each player gets at most one award.
+
+  **Mercy.** A goal that reaches the mercy margin (12 in public, the private rule otherwise) ends the match at once, outside overtime.
+
+  **Overtime (sudden death).** Public time up with the score tied follows native's sequence (from a recorded public overtime): `round_over`, then `pre_sudden_death` (`sudden_death_active` 1, hold, the draw call), then `sudden_death_new_round`. Everyone is sent back to the launchers, the overtime round is announced in `pre_launch` (`MP_ANNOUNCER_OT_ROUND_<n>`), and play relaunches on a 2:00 clock. The next goal ends the match after its celebration. A scoreless overtime round starts another. The timings come from the round rules (`enable_sudden_death`, `sudden_death_round_time`, `sudden_death_round_over_time`).
+
+  **Disc at time up.** The disc stays live when the clock runs out: the holder keeps simulating it and grabs are still granted. Only a goal pins it. The next round takes it back for the server.
 
   **The match ends** with the seven-state post-match tail, plus native's end-doors, celebration and round-score flags. If a team empties before launch, the match goes back to waiting.
+- **Social lobby.**
+  - **Cease fire per entrant.** Every entrant (slot, generation) has its own cease-fire replicated var, and a client obeys only its own. The server sends every joined entrant's var to everyone, in the snapshot and whenever one changes (`msg::entrant_hold_var`). The cease fire is lifted only for a player whose tracked position is inside the brawler room. The combat area (gun range) keeps it on, and the server drops stuns from a player under a cease fire. The var name for two-digit slots or generations is unknown, so slots 10 to 15 have no cease fire yet, and generations wrap mod 10.
+  - **Quarter court.** A disc passing through the goal ring from the front scores 2 points, or 3 when it was thrown from outside the bubble in front of the goal. The server sends native's game-state change, scoring event and `PostScoreUpdate`.
+  - **Combat room.** All 11 barriers hide when broken and respawn after 30 s. The ability station and the room's other switches are replicated vars set from the clients' events.
+  - **Joining.** Others' body state reaches a newcomer only after the newcomer's first equipment update, which is when native starts sending it too. After it, the newcomer gets everyone's latest equipment. The server publishes each entrant's lobby data (`afk`, `spawned`, `mm|status`) and relays the clients' level-script events. Replicated vars carry the lobby frame as their sequence and go out every frame.
+- **Combat explosions** follow native's query and falloff. A victim not on blue or orange is never hit, and the owner's teammates are skipped, but the owner is hit by their own blast. Damage is scored per body part (fixed offsets below the tracked head) with the damage table, and the best part counts.
 - **Component events are addressed to real handles.** The arena IdsResponse we send (native's own) assigns the match graph handle `0xa02d` and the disc-FX handle `0xa01b`, so round-start, scoring and announcer events go to those handles, as native does. The handles come from whatever IdsResponse the server sends: a different native session used `0x002f`/`0x001b`.
 - **Arena baseline.** The replicated-variable baseline is native's own pre-match set from a fresh public match. An older baseline taken mid-match carried flag values that made the client run pre-match like a private match, with the tunnels open.
 - **Session end.** A session ends 3 s after its last player leaves (90 s if nobody joined), and the server is reported free to its backend (EchoRelay gets `EndSession`). EchoRelay itself marks a server Locked when its player count reaches 0, so ending quickly keeps that window short. Servers then stay registered, blank and idle.
-- **Captured data.** The level object ids, balance settings and replicated-variable baselines (`src/engine/data`) are captured protocol data the client needs byte for byte. They exist for `mpl_lobby_b2` (social) and `mpl_arena_a` (arena). Combat levels have no captured baseline yet.
+- **Captured data.** The level object ids, balance settings and replicated-variable baselines (`src/engine/data`) are captured protocol data the client needs byte for byte. They exist for `mpl_lobby_b2` (social), `mpl_arena_a` (arena) and the four combat maps (Combustion, Dyson, Fission, Gauss), with each combat map's barriers, reflexes and payload track vars.
 
 ## Recording a native game
 
@@ -173,7 +185,7 @@ The recorder needs no libpcap: loopback traffic never reaches a capture driver o
 
 - **Codec.** Every encoder and decoder matches byte for byte the vectors from nakama's `server/evr` Go implementation (`cargo test`).
 - **Built-in mode, own engine.** Probe login and placement, then the test client's raw ping, encrypted handshake, key claim, `SNSLobbyJoinRequestv4`, backend accept and join batch, all against `src/engine`.
-- **Not yet re-verified on the new engine:** a full game-client session (loading in, arena flow, multiplayer).
+- **Game clients on the new engine.** Social lobbies, public and private arena matches and combat matches have been played with real clients, multiplayer included.
 - **Load (previous engine).** 60 concurrent clients were packed into 5 full lobbies of 12. With 64 game servers up, the process used **47 MB RAM and 0.4 s of CPU in total**.
 - **EchoRelay mode (previous engine).** Tested against a live EchoRelay through every step:
   1. Registration with the ServerDB
@@ -181,7 +193,7 @@ The recorder needs no libpcap: loopback traffic never reaches a capture driver o
   3. Session start
   4. UDP join
   5. PlayersAccepted
-- **Not tested.** nakama mode has not been run against a live nakama.
+- **nakama mode** runs against a live nakama (Atlas): registration, matchmaking, profile and stats updates.
 
 ## Notes
 
