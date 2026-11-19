@@ -122,6 +122,8 @@ const HISTORY: usize = 48;
 /// and after (m/s), turns by more than this (cosine; about 25 degrees).
 const BOUNCE_MIN_SPEED: f32 = 1.0;
 const BOUNCE_COS: f32 = 0.9;
+/// Turns are ignored for this many samples after the release (see `Flight::free`).
+const BOUNCE_AFTER: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -142,6 +144,11 @@ struct Flight {
     hit: bool,
     /// It has come off a wall since.
     bounced: bool,
+    /// Samples since the release. A turn only counts as a bounce once both
+    /// velocity steps it compares are past the release: the first ones still
+    /// span the hand's last positions, and a throw's flick turned them enough
+    /// to call most inside shots bounce shots (pub, 2026-11-19).
+    free: u8,
 }
 
 /// What the tracker reports about a goal.
@@ -282,7 +289,7 @@ impl DiscTracker {
         }
         if held == Some(false) && self.flight.is_none() {
             // Just released: the flight starts at the last held position.
-            self.flight = Some(Flight { thrower: owner, start: release.unwrap_or(p), on_goal: false, hit, bounced: false });
+            self.flight = Some(Flight { thrower: owner, start: release.unwrap_or(p), on_goal: false, hit, bounced: false, free: 0 });
             self.shot_credited = false;
         }
         let turned = match (self.velocity(0), self.velocity(1)) {
@@ -292,12 +299,13 @@ impl DiscTracker {
             _ => false,
         };
         if let Some(f) = self.flight.as_mut() {
+            f.free = f.free.saturating_add(1);
             if hit && !f.hit {
                 // Headbutted on in flight: native still measures from the
                 // release (its long headbutt goal: thrown, then hit 2.4 s
                 // later, reported 8.86 m). The hit's own turn is no bounce.
                 f.hit = true;
-            } else if turned {
+            } else if turned && f.free > BOUNCE_AFTER {
                 f.bounced = true;
             }
         }
@@ -306,7 +314,8 @@ impl DiscTracker {
                 // Released: the flight starts where the straight line began.
                 let n = self.hist.len();
                 let start = self.hist[n.saturating_sub(4)].p;
-                self.flight = Some(Flight { thrower: owner, start, on_goal: false, hit, bounced: false });
+                // Already straight for three steps: turns count from here.
+                self.flight = Some(Flight { thrower: owner, start, on_goal: false, hit, bounced: false, free: BOUNCE_AFTER });
                 self.shot_credited = false;
             }
             let on_goal = self.flight.as_ref().is_some_and(|f| f.thrower == owner) && self.heading_into_goal(team);
@@ -626,6 +635,21 @@ mod held_tests {
         t.sample(416_000, None, 5, 1, [0, 0, 33_300], Some(true), false);
         assert!(!t.bumper(0));
         assert_eq!(t.goal(700_000, [0, 0, 36_000], 0).goal_type, GOAL_SELF);
+    }
+
+    #[test]
+    fn a_flicked_release_is_an_inside_shot_not_a_bounce() {
+        let mut t = DiscTracker::new();
+        // The hand sweeps sideways at 4 m/s, then the disc leaves it straight
+        // at the goal: a 90 degree turn across the release.
+        for i in 0..6u64 {
+            t.sample(i * 8_000, None, 0, 0, [i as i32 * 32, 0, 33_000], Some(true), false);
+        }
+        for i in 1..30u64 {
+            t.sample((5 + i) * 8_000, None, 0, 0, [160, 0, 33_000 + i as i32 * 80], Some(false), false);
+        }
+        let g = t.goal(400_000, [160, 0, 36_000], 0);
+        assert_eq!((g.points, g.goal_type), (2, GOAL_INSIDE_SHOT), "{g:?}");
     }
 
     #[test]
