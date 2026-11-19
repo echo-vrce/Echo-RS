@@ -144,6 +144,9 @@ pub struct Transport {
     dstid: u8,
     pub queued_reliable: Vec<(u64, Vec<u8>)>,
     pub queued_mailbox: Vec<(u64, u64, Vec<u8>)>,
+    /// Join trace: every message type queued to this peer (type, mailbox, len) -> count.
+    pub trace: bool,
+    pub sent_types: HashMap<(u64, bool, usize), u32>,
     ack_owed: bool,
     /// Smoothed reliable RTT for the resend timer.
     srtt: Duration,
@@ -210,6 +213,8 @@ impl Transport {
             dstid: 0xff,
             queued_reliable: Vec::new(),
             queued_mailbox: Vec::new(),
+            trace: false,
+            sent_types: HashMap::new(),
             ack_owed: false,
             srtt: Duration::from_millis(30),
             packets_out: 0,
@@ -406,10 +411,16 @@ impl Transport {
     }
 
     pub fn queue_reliable(&mut self, ty: u64, data: &[u8]) {
+        if self.trace {
+            *self.sent_types.entry((ty, false, data.len())).or_default() += 1;
+        }
         self.queued_reliable.push((ty, data.to_vec()));
     }
 
     pub fn queue_mailbox(&mut self, ty: u64, key: u64, data: &[u8]) {
+        if self.trace {
+            *self.sent_types.entry((ty, true, data.len())).or_default() += 1;
+        }
         self.queued_mailbox.push((ty, key, data.to_vec()));
     }
 

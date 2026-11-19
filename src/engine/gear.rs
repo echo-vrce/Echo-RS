@@ -465,6 +465,8 @@ pub struct Gear {
     later: Vec<(Instant, SocketAddr, Out)>,
     /// Each player's slot and body position (metres).
     bodies: HashMap<SocketAddr, (u16, [f32; 3])>,
+    /// Each player's team (0 blue, 1 orange, else not playing), kept by the session.
+    pub teams: HashMap<SocketAddr, u8>,
     /// Where each player's thrown ordnance is.
     thrown_at: HashMap<SocketAddr, [f32; 3]>,
     fields: Vec<Field>,
@@ -537,6 +539,7 @@ impl Gear {
             mags: HashMap::new(),
             later: Vec::new(),
             bodies: HashMap::new(),
+            teams: HashMap::new(),
             thrown_at: HashMap::new(),
             fields: Vec::new(),
             bubbles: Vec::new(),
@@ -580,11 +583,12 @@ impl Gear {
         self.inside.contains(&from)
     }
 
-    /// Whether this player may fight: in the combat area, or (from their
-    /// body's position) in the brawler room. Native lifts the lobby's cease
-    /// fire (`VAR_HOLD` 0) for them there; without it they cannot punch.
+    /// Whether this player may stun and block (arena style): in the lobby only
+    /// inside the brawler room, from their body's position. The combat area
+    /// (gun range) keeps the cease fire (`VAR_HOLD` 1): its gear works with it
+    /// on, and lifting it there let players stun and block outside the room.
     pub fn may_fight(&self, who: SocketAddr) -> bool {
-        self.in_combat(&who) || self.bodies.get(&who).is_some_and(|(_, p)| in_brawler_room(*p))
+        self.bodies.get(&who).is_some_and(|(_, p)| in_brawler_room(*p))
     }
 
     /// The player's last body position, if known.
@@ -640,15 +644,49 @@ impl Gear {
         outs.into_iter().map(|o| Out { to: To::Others, ..o }).collect()
     }
 
-    /// Everything an explosion at `at` reaches: (victim id, reported position, distance, player).
-    fn victims(&self, at: [f32; 3], radius: f32) -> Vec<Hit> {
+    /// Whether `by` may hurt (or stun) `victim`, as native's explosion query
+    /// (`SR15VolumeQueryUtils::RunQuery`, libr15.so 0x13bf318): a victim not on
+    /// blue or orange is never a target (team mask `& 3` zero), and a victim
+    /// sharing the owner's team is skipped unless it is the owner itself (the
+    /// owner's own blast counts, at `owner_damage_modifier`). The owner's own
+    /// team is not checked. Unknown teams are not limited.
+    fn may_hurt(&self, by: Option<SocketAddr>, victim: SocketAddr) -> bool {
+        let Some(&vt) = self.teams.get(&victim) else { return true };
+        if vt > 1 {
+            return false;
+        }
+        match by.filter(|a| *a != victim).and_then(|a| self.teams.get(&a)) {
+            Some(&bt) => bt != vt,
+            None => true,
+        }
+    }
+
+    /// Native's explosion damage on a player (`ApplyAreaDamage`, libr15.so
+    /// 0x22469e4): every body part the blast reaches is scored as
+    /// `falloff(distance to that part) x the part's damage table multiplier`
+    /// (`CalculateTotalDamage`), and the best part is the hit. Only the head is
+    /// tracked here, so the parts stand at fixed heights below it.
+    fn part_damage(&self, who: SocketAddr, at: [f32; 3], falloff: &dyn Fn(f32) -> f32, table: &str) -> (f32, &'static str) {
+        let Some((_, head)) = self.bodies.get(&who) else { return (falloff(f32::MAX), "torso") };
+        let w = if self.in_match { combat_weapons() } else { weapons() };
+        let mult = |part: &str| w.pointer(&format!("/damage_table/{table}/{part}")).and_then(Value::as_f64).map_or(1.0, |m| m as f32);
+        BODY_PARTS
+            .iter()
+            .map(|(part, drop)| (falloff(dist(at, [head[0], head[1] - drop, head[2]])) * mult(part), *part))
+            .fold((0.0, "torso"), |best, x| if x.0 > best.0 { x } else { best })
+    }
+
+    /// Everything an explosion at `at` from `by` reaches: (victim id, reported position, distance, player).
+    fn victims(&self, at: [f32; 3], radius: f32, by: Option<SocketAddr>) -> Vec<Hit> {
         let mut v = Vec::new();
         for (a, (slot, p)) in &self.bodies {
             // Only players in the combat area can be hit (no stun or damage in the lobby).
-            if !self.in_combat(a) {
+            if !self.in_combat(a) || !self.may_hurt(by, *a) {
                 continue;
             }
-            let d = dist(at, *p);
+            // The tracked position is the head: a blast at the feet is measured
+            // to the body below it, not to the head 1.5 m up.
+            let d = body_dist(at, *p);
             if d <= radius + BODY_RADIUS {
                 let mut id = PLAYER_ID;
                 id[0] ^= *slot as u8;
@@ -878,6 +916,9 @@ impl Gear {
         let slot = self.slot_of(&who);
         let killer = by.map_or(slot, |a| self.slot_of(&a));
         let health = self.lives.get(&who).map_or(FULL_HEALTH, |l| l.health);
+        if !self.may_hurt(by, who) {
+            return Vec::new();
+        }
         let amount = self.after_overcharge(who, amount, health, Instant::now());
         let life = self.lives.entry(who).or_default();
         if life.dead || amount <= 0.0 {
@@ -907,9 +948,9 @@ impl Gear {
     }
 
     /// One explosion: `ExplosionPlayerDamage` per victim, else `NothingHit`.
-    fn explode(&self, kind: [u8; 8], id: [u8; 8], at: [f32; 3], radius: f32) -> (Vec<Out>, Vec<Hit>) {
+    fn explode(&self, kind: [u8; 8], id: [u8; 8], at: [f32; 3], radius: f32, by: SocketAddr) -> (Vec<Out>, Vec<Hit>) {
         let space = self.space;
-        let hits = self.victims(at, radius);
+        let hits = self.victims(at, radius, Some(by));
         info!(kind = %hex8(kind), x = at[0], y = at[1], z = at[2], radius, hits = hits.len(), "explosion");
         if hits.is_empty() {
             let b = [space.as_slice(), &kind, &id].concat();
@@ -1158,12 +1199,15 @@ impl Gear {
                     (r, MARK_SCOUT, Box::new(move |dd: f32| (top * (1.0 - dd / (r + BODY_RADIUS))).max(least)))
                 } else if kind == EX_ROCKET {
                     let (far, near, full) = (wp("rocket_aoe", "explosion_radius_far", 1.75), wp("rocket_aoe", "explosion_radius_near", 1.0), wp("rocket_aoe", "explosion_damage", 40.0));
-                    let f = move |dd: f32| full * if dd <= near { 1.0 } else { (1.0 - (dd - near) / (far + BODY_RADIUS - near).max(0.01)).clamp(0.0, 1.0) };
+                    // Native: t = clamp((d - near) / (far - near)), damage =
+                    // near_dmg (1 - t^e) + far_dmg t^e. The level gives far_dmg 0
+                    // and e 1 unless its data says otherwise (not in the binaries).
+                    let f = move |dd: f32| full * (1.0 - ((dd - near) / (far - near).max(0.01)).clamp(0.0, 1.0));
                     (far, MARK_ROCKET, Box::new(f))
                 } else {
                     (1.0, MARK_ROCKET, Box::new(|_| 0.0))
                 };
-                let (mut v, hits) = self.explode(kind, id, at, radius);
+                let (mut v, hits) = self.explode(kind, id, at, radius, from);
                 // Rockets break barriers too (rocket_aoe's barrier 2); COMET's
                 // blast does not (scout_aoe's 0).
                 let table = if comet { "scout_aoe" } else { "rocket_aoe" };
@@ -1174,7 +1218,11 @@ impl Gear {
                 v.extend(walls);
                 for (_, pos, dd, who, code) in hits {
                     let own = who == Some(from);
-                    let amount = damage(dd) * if own { own_scale } else { 1.0 };
+                    let base = match who {
+                        Some(a) if !comet => self.part_damage(a, at, &*damage, table).0,
+                        _ => damage(dd),
+                    };
+                    let amount = base * if own { own_scale } else { 1.0 };
                     // Native marks hits on others; a self-hit only costs health.
                     if !own {
                         v.push(out(To::Sender, TRACKED_DAMAGE, &marker(&space, mark, amount, pos, code)));
@@ -1204,7 +1252,7 @@ impl Gear {
                         // One blast event, at the nearest victim: one per victim
                         // drew several blasts.
                         let radius = weapons().pointer("/grenade_properties/det/radius").and_then(Value::as_f64).unwrap_or(DET_RADIUS) as f32;
-                        let (mut o, mut hits) = self.explode(EX_DET, id, at, radius);
+                        let (mut o, mut hits) = self.explode(EX_DET, id, at, radius, thrower);
                         hits.sort_by(|x, y| x.2.total_cmp(&y.2));
                         if !hits.is_empty() {
                             o.truncate(0);
@@ -1347,7 +1395,7 @@ impl Gear {
         for f in &mut fields {
             while f.next <= now && f.next < f.until {
                 f.next += f.every;
-                let hits = self.victims(f.at, f.radius);
+                let hits = self.victims(f.at, f.radius, Some(f.thrower));
                 if f.kind == EX_DOT {
                     let tick = weapons().pointer("/grenade_properties/dot/damage_per_tick").and_then(Value::as_f64).unwrap_or(4.0) as f32;
                     for (victim, pos, _, who, code) in &hits {
@@ -1466,6 +1514,19 @@ fn hex8(b: [u8; 8]) -> String {
 fn f3(d: &[u8], o: usize) -> [f32; 3] {
     let f = |i: usize| f32::from_le_bytes(d[o + 4 * i..o + 4 * i + 4].try_into().expect("4"));
     [f(0), f(1), f(2)]
+}
+
+/// How far below the tracked head a body reaches (to the feet).
+const BODY_HEIGHT: f32 = 1.4;
+/// A player's body parts, by how far below the tracked head their centres sit
+/// (metres), for native's best-part explosion damage.
+const BODY_PARTS: [(&str, f32); 4] = [("head", 0.0), ("arm", 0.45), ("torso", 0.5), ("leg", 1.1)];
+
+/// Distance from `at` to a player's body: the vertical segment from the
+/// tracked head `head` down `BODY_HEIGHT`.
+fn body_dist(at: [f32; 3], head: [f32; 3]) -> f32 {
+    let y = at[1].clamp(head[1] - BODY_HEIGHT, head[1]);
+    dist(at, [head[0], y, head[2]])
 }
 
 fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -1620,6 +1681,27 @@ mod tests {
     }
 
     #[test]
+    fn only_opponents_on_blue_or_orange_are_hurt() {
+        let mut g = Gear::new();
+        let (a, b, c) = (SocketAddr::from(([10, 0, 0, 1], 1)), SocketAddr::from(([10, 0, 0, 2], 2)), SocketAddr::from(([10, 0, 0, 3], 3)));
+        g.teams.extend([(a, 0), (b, 0), (c, 3)]);
+        assert!(!g.may_hurt(Some(a), b), "teammate");
+        assert!(!g.may_hurt(Some(a), c), "social player");
+        assert!(!g.may_hurt(Some(c), c), "social player's own blast");
+        assert!(g.may_hurt(Some(a), a), "own blast on a team");
+        g.teams.insert(b, 1);
+        assert!(g.may_hurt(Some(a), b), "opponent");
+        assert!(g.may_hurt(Some(c), b), "native does not check the owner's own team");
+    }
+
+    #[test]
+    fn blasts_are_measured_to_the_whole_body() {
+        let head = [0.0, 1.6, 0.0];
+        assert!((body_dist([0.0, 0.2, 0.5], head) - 0.5).abs() < 1e-5, "at the feet");
+        assert!((body_dist([0.0, 2.0, 0.0], head) - 0.4).abs() < 1e-5, "above the head");
+    }
+
+    #[test]
     fn any_slot_enters_the_area_and_only_those_inside_may_stun() {
         // (`body` is defined below.)
         let mut g = Gear::new();
@@ -1635,6 +1717,20 @@ mod tests {
         assert_eq!(freed.len(), 8);
         assert_eq!(freed[1], out(To::All, SET_BITS, &[0xfc, 0xff, 0xff, 0xff, 20, 0, 0, 0]));
         assert!(!g.stun_allowed(who, &[]));
+    }
+
+    #[test]
+    fn only_the_brawler_room_lifts_the_cease_fire() {
+        let mut g = Gear::new();
+        let who = addr();
+        // In the combat area (gun range): gear, but no arena stun or block.
+        g.observe_physics(who, &body(1, [32_515, 1_557, -20_608]));
+        g.on_message(who, SET_OWNER, &[1, 0, 0, 0, 76, 0, 0, 0], Instant::now());
+        assert!(g.stun_allowed(who, &[]));
+        assert!(!g.may_fight(who));
+        // In the brawler room.
+        g.observe_physics(who, &body(1, [26_500, 0, 14_150]));
+        assert!(g.may_fight(who));
     }
 
     #[test]

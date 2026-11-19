@@ -966,3 +966,40 @@ simulates it" or "...sent nothing". If it never works, remove `delegate_disc`. T
   loadout itself (`save_loadouts` / `loadout_save`). Tests:
   `nakama_url_gets_the_save_loadout_feature`,
   `arena_profile_delta_has_natives_stat_shape`.
+
+## Native explosion, equipment and cease fire (2026-11-18, ReVault `echovr`, libr15.so)
+
+ReVault is reached over HTTP with `EchoCombat/.mcp.json` (read-only use; nothing written back).
+
+- **Explosion targets** (`SR15VolumeQueryUtils::RunQuery` 0x13bf318, from `CR15NetExplosionCS::CollectTargets`
+  0x22461f0): query radius = max(near, far). A victim whose team mask `& 3` is 0 (not blue/orange: social,
+  spectator) is never a target. Mode 2 (flag bit 7): a victim on the owner's team is skipped unless it is the
+  owner itself; mode 1 skips the owner too; mode 0 (flags 0x1200) hits only the owner's team. The owner's own
+  team is not checked. `kExplosionImmune` property modifiers are skipped. `Gear::may_hurt` follows mode 2.
+- **Distance**: per player physics body (body part), the blast centre to the part's AABB centre (or, with
+  `UsesExhaustiveVolumeCheck`, the nearest hull vertex inside the radius), after an occlusion check
+  (`FUN_013cedc4`). Min distance kept per part.
+- **Damage** (`ApplyAreaDamage` 0x22469e4): `t = clamp((d - near) / (far - near), 0, 1)`,
+  `dmg = near_dmg (1 - t^e) + far_dmg t^e` (`powf`), per part through `CalculateTotalDamage` (damage table
+  multiplier); the best part is the hit. `ApplyTargetDamage` 0x2245354: the owner takes `dmg x
+  owner_damage_modifier` (instance +0x14). Instance floats come from `SR15NetExplosionCD::SProperties`
+  +0x20..+0x34 (`neardamageradius`, `fardamageradius`, `neardamage`, `fardamage`, `damagefalloffexponent`,
+  owner modifier); scripts only set the two radii (`R15NetExplosionSetNear/FarDamageRadiusNode`). far_dmg and
+  the exponent are actor data, not in any binary: ours assume 0 and 1. Flag bit 6: only the nearest target.
+  Server side only the head is tracked, so `BODY_PARTS` places head/arm/torso/leg at fixed drops below it.
+- **Equipment** (`CR15NetPlayerEquipmentCS`): `SR15NetPlayerEquipmentUpdate` = `[user id u32 (slot | gen<<16)]
+  [0 u32][weapon u64 @8][@16][grenade @24][weapon arm u32 @32]...` (56 B). The hand swap is `SetWeaponArm`
+  -> this message. Receivers drop it unless the generation matches their table for the slot. Native relays it
+  to the others and, after a newcomer's first one, sends the newcomer everyone else's latest (all four combat
+  server recordings): `Session::on_equipment`.
+- **Cease fire**: stuns from a player under `VAR_HOLD` (lobby outside the combat area / brawler room, arena
+  hold during goals and round ends) are dropped by the server (`cease_fire_for`).
+- **Barrier hide vars**: set by the barrier actor script (`fb4b399d3cbd15f2.dll`: `local_barrier_active`,
+  `ext_kill_barrier`, `barrier_deactivated`); each level's instance hashes differently, so the lobby's need one
+  recorded lobby barrier break (none in `captures/`).
+
+- **Brawler room vs combat area (2026-11-18, user correction)**: the brawler room is the arena-style stun
+  and block; the combat area (gun range) is combat gear only. `Gear::may_fight` (the per-player `VAR_HOLD`
+  lift) is the brawler room only now; lifting it in the combat area let players stun and block outside the
+  room (the host's log: slot 1 "lifted" at (32.5, 1.6, -20.6), the gun range). Guns worked before v0.1.4 with
+  `VAR_HOLD` never lifted. The server still relays stuns from the combat area (its stun ordnance, unverified).

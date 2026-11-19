@@ -123,6 +123,8 @@ struct Peer {
     entrant_header: Option<Vec<u8>>,
     entrant_latest: Option<Vec<u8>>,
     entrant_states: u32,
+    /// This entrant's lobby data as everyone gets it (key, server -> client body).
+    entrant_data: Vec<(u64, Vec<u8>)>,
     loadout: Option<Vec<u8>>,
     /// The player's platform id (platform, account), from their entrant state.
     xpid: Option<[u64; 2]>,
@@ -165,9 +167,36 @@ struct Peer {
     last_stun: Option<Instant>,
     /// Lobby: the cease fire last sent to this player (true = lifted).
     fight_sent: Option<bool>,
+    /// Lobby: every entrant's cease fire var as last sent to this player.
+    holds_sent: Option<Vec<(u64, u64)>>,
+    /// This player's latest `SR15NetPlayerEquipmentUpdate` (guns, tac mod,
+    /// ordnance, weapon arm), for players who join later.
+    equipment: Option<Vec<u8>>,
+    /// When the player joined: other players' bodies wait for its spawn.
+    joined_at: Option<Instant>,
+    /// Replicated-var acks logged so far (join trace).
+    acks_logged: u32,
+}
+
+const SPAWN_WAIT_MAX: Duration = Duration::from_secs(45);
+
+/// The other players' body traffic, held back until a newcomer spawns.
+fn is_body_state(ty: u64) -> bool {
+    ty == PHYSICS || ty == PLAYER_STATE || ty == super::combat::TOUCH_STATE
 }
 
 impl Peer {
+    /// Native (netrec-lobby-native-20261118, a late joiner): no other
+    /// player's equipment, physics, state or touch reaches a newcomer before
+    /// its own first equipment update (its spawn); they start 50-150 ms
+    /// after. Ours sent them from the join, before its own body existed, and
+    /// a late joiner's client then let it stun and block anywhere in the
+    /// lobby and during arena goals. A client that never sends one (a
+    /// spectator, if any) gets them after `SPAWN_WAIT_MAX`.
+    fn spawned(&self) -> bool {
+        self.equipment.is_some() || self.joined_at.is_some_and(|t| t.elapsed() > SPAWN_WAIT_MAX)
+    }
+
     fn new(t: Transport) -> Self {
         Self {
             t,
@@ -183,6 +212,7 @@ impl Peer {
             entrant_header: None,
             entrant_latest: None,
             entrant_states: 0,
+            entrant_data: Vec::new(),
             loadout: None,
             xpid: None,
             jersey: None,
@@ -204,6 +234,10 @@ impl Peer {
             on_payload: false,
             last_stun: None,
             fight_sent: None,
+            holds_sent: None,
+            equipment: None,
+            joined_at: None,
+            acks_logged: 0,
             ping_dirty: false,
             echo_ages: VecDeque::with_capacity(ECHO_SAMPLES),
             echo_logged: Instant::now(),
@@ -268,6 +302,24 @@ const ECHO_SAMPLES: usize = 450;
 fn public_mercy_margin() -> u32 {
     super::msg::arena_public().mercy_margin
 }
+
+/// `sudden_death_active` (the arena mode graph's overtime var; low byte 0/1).
+/// Native's arena baseline has it at 0. `VAR_OVERTIME` is combat's.
+const VAR_SUDDEN_DEATH: u64 = 0xee2e_44f7_38a3_0c35;
+/// The arena graph's sudden death states (CSymbol64 of the state names, as
+/// every other `game_state`): `pre_sudden_death_enter/_update`,
+/// `sudden_death_new_round_enter/_update`, `post_sudden_death_enter/_update`.
+const ST_PRE_SUDDEN_DEATH: [u64; 2] = [0xe1c6_8408_2c60_875c, 0xfc23_4970_54cb_cbcf];
+const ST_SD_NEW_ROUND: [u64; 2] = [0xb0e1_b685_58db_a498, 0x9393_13b4_1be2_7085];
+const ST_POST_SUDDEN_DEATH: [u64; 2] = [0x9d35_6995_6c5e_79a0, 0xf09c_446f_72b8_6057];
+/// Match events native sends at a tied time up (names unknown;
+/// captures/netrec-pub-ot-20261119): two with round_over_enter, one with
+/// pre_sudden_death_enter, one after the draw call.
+const EV_SD_ROUND_OVER: [u64; 2] = [0x086e_4889_749a_9aa4, 0x46dd_ece9_1562_f5d4];
+const EV_SD_ENTER: u64 = 0xe283_ccf7_d47e_142b;
+const EV_SD_CALLED: u64 = 0x0ae9_dc18_2d5a_c591;
+/// Native sits in sudden_death_new_round this long before the team-room walk.
+const SD_NEW_ROUND_SECS: f32 = 5.0;
 
 /// How far the server's disc timestamp runs ahead of session time (the
 /// clients' clocks start within a few seconds of it).
@@ -454,6 +506,11 @@ struct Arena {
     round_live: bool,
     /// Tied at time up with overtime on: the next goal ends the round.
     overtime: bool,
+    /// Overtime rounds so far (the announcer's "overtime round N").
+    ot_rounds: u32,
+    /// Time ran out with the disc out of the goals: it stays in play (thrown,
+    /// held, grabbed) until the next round's walk or the end of the match.
+    disc_loose: bool,
     rounds_played: u32,
     /// The disc's last move touched each goal box ([blue goal, orange
     /// goal]); a goal is the move that starts touching it.
@@ -514,6 +571,8 @@ impl Arena {
             restart_req: [false; 2],
             round_live: false,
             overtime: false,
+            ot_rounds: 0,
+            disc_loose: false,
             rounds_played: 0,
             goal_touch: [false; 2],
         }
@@ -526,7 +585,18 @@ impl Arena {
     /// Players may take the disc: in play, and in a private match before
     /// Start (the disc is free to play with until the match starts).
     fn disc_free(&self) -> bool {
-        self.phase == Phase::Playing || (self.private && self.phase == Phase::Waiting)
+        self.phase == Phase::Playing || (self.private && self.phase == Phase::Waiting) || self.disc_loose
+    }
+
+    /// A round or match ended: after a goal the disc stays pinned in the
+    /// goal; at time up it stays free (user, 2026-11-19: native lets it fly
+    /// on, and players can still grab and throw it).
+    fn end_disc(&mut self) {
+        if self.frozen.is_some() {
+            self.pin_disc();
+        } else {
+            self.disc_loose = true;
+        }
     }
 
     /// Paused, or counting back in after an unpause.
@@ -625,6 +695,16 @@ impl Arena {
         if self.frozen.is_none() {
             self.frozen = self.last_disc.or(self.parked);
         }
+        // A player's client was simulating the disc (time up mid-play): move
+        // the reset count past theirs so every client, the holder too, snaps
+        // to the pinned disc. Without it the holder kept flying its own copy
+        // while everyone else saw the pin, frozen in the air.
+        if !self.server_disc {
+            self.bump_resets();
+            self.disc_owner = u32::MAX;
+            self.holder_state = None;
+            self.tracker.reset();
+        }
         self.parked = None;
         self.server_disc = true;
         self.disc_live = false;
@@ -634,6 +714,7 @@ impl Arena {
     /// The server takes the disc back to its spawn; the reset count bump
     /// makes clients snap their copy to it.
     fn take_disc(&mut self) {
+        self.disc_loose = false;
         self.server_disc = true;
         self.disc_live = false;
         self.frozen = None;
@@ -792,11 +873,100 @@ impl Arena {
         g + 1 + (self.celebration_secs() * frame_hz() as f32) as u64
     }
 
+    /// Time up, tied, with overtime on: sudden death, as native sequenced
+    /// it in a public match (captures/netrec-pub-ot-20261119, t = time up):
+    ///   0      round_over_enter, not playing, disc spawn centre, two match events
+    ///   +1 fr  pre_sudden_death_enter/_update, sudden_death_active 1, hold,
+    ///          "draw" (MP_ANNOUNCER_0100?_DRAW), clock to 2:00 (stopped)
+    ///   +2 fr  sudden_death_new_round_enter/_update, 5 s
+    ///   +5 s   round restart + round start, gates shut, transition_to_launch
+    ///          (team-room cue, again 3 s later), 4.5 s count, hold off at 4 s
+    ///   +9.5 s pre_launch, "overtime round N" (MP_ANNOUNCER_OT_ROUND_N)
+    ///   +10.5 s disc restart, round_start, the usual 15 s launch, play.
+    /// The next goal wins (`end_round` then goes through post_sudden_death).
+    /// A scoreless overtime round (public: the 2:00 clock) goes again with
+    /// the next "overtime round" call. Private has no clock: it stays at 0:00.
+    fn start_sudden_death(&mut self, f: u64) {
+        let rules = super::msg::arena_public();
+        let ev = |s| Act::Event(s, MOD_MATCH, FILTER_ALL);
+        let say = |s| Act::Event(s, MOD_ANNOUNCER, FILTER_ALL_ALT);
+        self.schedule.clear();
+        self.soon.clear();
+        self.overtime = true;
+        self.ot_rounds += 1;
+        self.round_live = true;
+        self.goals_armed = false;
+        self.phase = Phase::Goal;
+        // Whoever holds the disc drops it; the server brings it to centre.
+        self.take_disc();
+        self.disc_owner = u32::MAX;
+        self.holder_state = None;
+        self.tracker.reset();
+        self.clock = if self.private { 0.0 } else { rules.sd_round_secs };
+        if !self.private {
+            self.round_clock = self.clock;
+        }
+        self.at(f, Act::State(ST_MATCH_END[0]));
+        self.at(f, Act::Flag(VAR_NOT_PLAYING, 1));
+        self.at(f, Act::Flag(VAR_DISC_SPAWN, 2));
+        self.at(f, Act::Flag(VAR_LAUNCH_GATES, 0));
+        for e in EV_SD_ROUND_OVER {
+            self.at(f, ev(e));
+        }
+        self.at(f + 1, Act::State(ST_PRE_SUDDEN_DEATH[0]));
+        self.at(f + 1, Act::Flag(VAR_SUDDEN_DEATH, 1));
+        self.at(f + 1, Act::Flag(VAR_HOLD, 1));
+        self.at(f + 1, ev(EV_SD_ENTER));
+        self.at(f + 1, Act::State(ST_PRE_SUDDEN_DEATH[1]));
+        let draw = ["A", "B", "C", "D", "E", "F"][rand::random::<usize>() % 6];
+        self.at(f + 1, say(crate::sns::symbol(&format!("MP_ANNOUNCER_0100{draw}_DRAW"))));
+        self.at(f + 1, ev(EV_SD_CALLED));
+        self.at(f + 2, Act::State(ST_SD_NEW_ROUND[0]));
+        self.at(f + 3, Act::State(ST_SD_NEW_ROUND[1]));
+        self.at(f + 3, Act::Countdown(SD_NEW_ROUND_SECS));
+        // Then everyone goes back to the launchers, as after a goal.
+        let c = f + 3 + (SD_NEW_ROUND_SECS * frame_hz() as f32) as u64;
+        self.at(c, ev(EV_ROUND_RESTART));
+        self.at(c, ev(EV_ROUND_START));
+        self.at(c + 1, Act::Flag(VAR_LAUNCH_GATES, 0));
+        self.at(c + 2, Act::State(ST_GOAL[6])); // transition_to_launch_enter
+        self.at(c + 2, Act::Event(EV_REALLY_RESTART, u64::MAX, FILTER_ALL));
+        self.at(c + 2, Act::State(ST_GOAL[7])); // transition_to_launch_update
+        self.at(c + 2, Act::Countdown(HOLD_SECS));
+        self.at(c + 2 + 3 * frame_hz(), Act::Event(EV_REALLY_RESTART, u64::MAX, FILTER_ALL));
+        let e = c + 2 + (HOLD_SECS * frame_hz() as f32) as u64;
+        self.at(e - frame_hz() / 2, Act::Flag(VAR_HOLD, 0));
+        self.at(e, Act::State(ST_PRE_LAUNCH_ENTER));
+        let n = self.ot_rounds.clamp(1, 15);
+        self.at(e, say(crate::sns::symbol(&format!("MP_ANNOUNCER_OT_ROUND_{n}"))));
+        let l = e + frame_hz();
+        self.at(l, ev(EV_RESTART_DISC));
+        self.schedule_launch(l, (EV_LIGHT_WHITE, EV_FX_WHITE));
+    }
+
+    /// After the overtime goal's celebration: native's goal tail
+    /// (states 2-3, restart B), then post_sudden_death with
+    /// sudden_death_active off, then whatever ends the round. Returns the
+    /// frame that comes next.
+    fn leave_sudden_death(&mut self, f: u64) -> u64 {
+        self.at(f, Act::State(ST_GOAL[2]));
+        self.at(f, Act::State(ST_GOAL[3]));
+        self.at(f, Act::Event(EV_RESTART_B, MOD_MATCH, FILTER_ALL));
+        self.at(f + 1, Act::State(ST_POST_SUDDEN_DEATH[0]));
+        self.at(f + 2, Act::State(ST_POST_SUDDEN_DEATH[1]));
+        self.at(f + 2, Act::Flag(VAR_SUDDEN_DEATH, 0));
+        f + 3
+    }
+
     /// A private round ended (time up, mercy or an overtime goal): credit the
     /// winner, then the next round, or the match end once it is decided.
     fn end_round(&mut self, f: u64, mercy: bool) {
         self.round_live = false;
-        self.overtime = false;
+        let was_overtime = std::mem::replace(&mut self.overtime, false);
+        self.ot_rounds = 0;
+        if !was_overtime {
+            self.set_flag(VAR_SUDDEN_DEATH, 0);
+        }
         match self.blue.cmp(&self.red) {
             std::cmp::Ordering::Greater => self.blue_rounds += 1,
             std::cmp::Ordering::Less => self.red_rounds += 1,
@@ -806,13 +976,18 @@ impl Arena {
         let majority = self.rules.best_of() && (self.blue_rounds >= need || self.red_rounds >= need);
         let decided = majority || self.rounds_played + 1 >= self.total_rounds;
         self.set_flag(VAR_MERCY_WIN, u8::from(mercy));
+        // Out of overtime: native's post_sudden_death comes first.
+        let start = if was_overtime { f + 3 } else { f };
         if decided {
             // The round counter (the HUD shows it + 1) stays on the last
             // round: "round 2 of 2", not "3 of 2".
-            self.end_match(f);
+            self.end_match(start);
         } else {
             self.rounds_played += 1;
-            self.next_round(f);
+            self.next_round(start);
+        }
+        if was_overtime {
+            self.leave_sudden_death(f);
         }
     }
 
@@ -824,8 +999,9 @@ impl Arena {
         self.goals_armed = false;
         self.phase = Phase::Goal;
         // The disc stays where the round ended (in the goal after a mercy
-        // or overtime goal) until the next round's walk takes it to spawn.
-        self.pin_disc();
+        // or overtime goal; free at time up) until the next round's walk
+        // takes it to spawn.
+        self.end_disc();
         self.at(f, Act::State(ST_MATCH_END[0]));
         self.at(f, ev(EV_ROUND_OVER));
         self.at(f, Act::Flag(VAR_LAUNCH_GATES, 0));
@@ -873,6 +1049,7 @@ impl Arena {
     /// 2.5 s, then the winner (or a draw) at 4.5 s.
     fn announce_result(&mut self, f: u64, blue_vs_orange: std::cmp::Ordering) {
         let say = |s| Act::Event(s, MOD_ANNOUNCER, FILTER_ALL_ALT);
+        // Mercy ends too: "That wraps up the round..." (user-confirmed).
         self.at(f + frame_hz() * 5 / 2, say(EV_ANNOUNCER_ROUND_OVER));
         let line = match blue_vs_orange {
             std::cmp::Ordering::Greater => EV_ANNOUNCER_BLUE_WINS,
@@ -889,8 +1066,9 @@ impl Arena {
         self.phase = Phase::Over;
         self.awards_due = true;
         // The disc stays where the match ended (in the goal after the
-        // deciding goal); the spawn flag below only matters for a restart.
-        self.pin_disc();
+        // deciding goal; free at time up); the spawn flag below only matters
+        // for a restart.
+        self.end_disc();
         let ev = |s| Act::Event(s, MOD_MATCH, FILTER_ALL);
         let hold = 15 * frame_hz();
         let steps = [0, 1, hold, hold + 3 * frame_hz(), hold + 13 * frame_hz(), hold + 13 * frame_hz() + 1, hold + 28 * frame_hz()];
@@ -1296,8 +1474,9 @@ impl Session {
     }
 
     fn relay_mailbox(&mut self, from: SocketAddr, ty: u64, key: u64, data: &[u8]) {
+        let body_state = is_body_state(ty);
         for (a, p) in self.peers.iter_mut() {
-            if *a != from && p.stage == Stage::Joined {
+            if *a != from && p.stage == Stage::Joined && (!body_state || p.spawned()) {
                 p.t.queue_mailbox(ty, key, data);
             }
         }
@@ -1338,6 +1517,10 @@ impl Session {
             CLIENT_PING_RESPONSE => self.on_ping_response(from, d),
             REPLICATED_ACK => {
                 if let Some(p) = self.peers.get_mut(&from) {
+                    if p.acks_logged < 12 || p.acks_logged % 200 == 0 {
+                        info!(%from, slot = ?p.slot, n = p.acks_logged, body = %hex_str(d), "replicated ack");
+                    }
+                    p.acks_logged += 1;
                     p.rep_acked = true;
                 }
             }
@@ -1362,6 +1545,7 @@ impl Session {
                 }
             }
             ENTRANT_STATE if reliable => self.on_entrant_state(from, d.to_vec()),
+            ENTRANT_DATA => self.on_entrant_data(from, d),
             LOADOUT_REQUEST if d.len() == 4 => {
                 let want = usize::from(u16_at(d, 0));
                 let body = self.slot_addr.get(want).copied().flatten().and_then(|a| self.peers.get(&a)).and_then(|p| p.loadout.clone());
@@ -1402,8 +1586,16 @@ impl Session {
             // room, where no gear-station message is ever sent. Punching
             // outside it came from clients left in combat mode by stations
             // that were never freed.)
+            STUN if { info!(%from, reliable, body = %hex_str(d), "stun message"); false } => {}
             STUN if reliable && self.stun_victim_is_spectator(d) => {
                 debug!(%from, body = %hex_str(d), "stun on a spectator (not relayed)");
+            }
+            // The cease fire is the clients' to honour, and a client that
+            // missed it (players after the first in the lobby, everyone
+            // during a goal) still sent stuns: dropped here, where native's
+            // cease fire would have stopped them.
+            STUN if reliable && self.cease_fire_for(from) => {
+                info!(%from, body = %hex_str(d), "stun during a cease fire (not relayed)");
             }
             STUN if reliable => {
                 self.on_stun(from, d);
@@ -1448,7 +1640,7 @@ impl Session {
                     }
                 }
             }
-            EQUIPMENT if reliable && d.len() == 56 => self.relay_reliable(from, ty, d, false),
+            EQUIPMENT if reliable && d.len() == 56 => self.on_equipment(from, d),
             // Only the 160-byte creates (projectiles) get native's destroy.
             // Others are tac mod effects placed in the world (NEUTRON's 96-byte
             // field, likely UMBRAL VEIL's cloud too): native neither echoes
@@ -1555,7 +1747,7 @@ impl Session {
                         } else {
                             let mut pkts = Vec::new();
                             for (a, p) in self.peers.iter_mut() {
-                                if *a != from && p.stage == Stage::Joined {
+                                if *a != from && p.stage == Stage::Joined && p.spawned() {
                                     p.t.mailbox_now(ty, key, &f, &mut pkts);
                                     self.udp_out.extend(pkts.drain(..).map(|d| (*a, d)));
                                 }
@@ -1632,8 +1824,10 @@ impl Session {
         let raw: [u8; 16] = d[17..33].try_into().expect("16 bytes");
         let requested = d.get(37..41).map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0xff; 4]))).filter(|t| *t <= 4).map(|t| t as u8);
         // Native gives a slot's first player generation 0, and the next one 1.
-        let genidx = self.slot_gen[slot];
-        self.slot_gen[slot] = genidx.wrapping_add(1);
+        // Kept to one digit: the entrant's cease fire var name has it as one
+        // (`msg::entrant_hold_var`), and a client reads only its own.
+        let genidx = self.slot_gen[slot] % 10;
+        self.slot_gen[slot] = (genidx + 1) % 10;
         let p = self.peers.get_mut(&from).expect("present");
         p.slot = Some(slot);
         p.genidx = genidx;
@@ -1781,7 +1975,76 @@ impl Session {
         let (slot, team) = (p.slot, p.team);
         self.roster_dirty = true;
         self.ever_joined = true;
+        self.send_entrant_data_on_join(addr);
+        if let Some(p) = self.peers.get_mut(&addr) {
+            p.joined_at = Some(Instant::now());
+            p.t.trace = true;
+        }
         info!(%addr, slot, team, players = self.player_count(), "player joined");
+    }
+
+    /// A client's own lobby data (native): stored, and given to everyone,
+    /// the sender included, under the sender's slot.
+    fn on_entrant_data(&mut self, from: SocketAddr, d: &[u8]) {
+        if d.len() < 18 {
+            return;
+        }
+        let Some(p) = self.peers.get_mut(&from) else { return };
+        let Some(slot) = p.slot else { return };
+        let key = u64::from_le_bytes(d[8..16].try_into().expect("8"));
+        let mut body = (slot as u64).to_le_bytes().to_vec();
+        body.extend_from_slice(&d[8..d.len() - 2]);
+        match p.entrant_data.iter_mut().find(|e| e.0 == key) {
+            Some(e) => e.1 = body.clone(),
+            None => p.entrant_data.push((key, body.clone())),
+        }
+        debug!(%from, slot, key = format_args!("{key:#018x}"), len = body.len(), "entrant data");
+        self.relay_reliable(from, ENTRANT_DATA, &body, true);
+    }
+
+    /// Native's entrant data at a join: the newcomer's own header (and, with
+    /// others present, its empty slot entry), then every earlier entrant's
+    /// slot entry and data; the others hear the newcomer's slot entry.
+    fn send_entrant_data_on_join(&mut self, addr: SocketAddr) {
+        let Some(slot) = self.peers.get(&addr).and_then(|p| p.slot) else { return };
+        let mut header = (slot as u64).to_le_bytes().to_vec();
+        header.extend_from_slice(&ENTRANT_DATA_HEADER);
+        let mut to_new = vec![header];
+        let mut to_others = Vec::new();
+        let earlier: Vec<(usize, Vec<Vec<u8>>)> = self
+            .peers
+            .iter()
+            .filter(|(a, p)| **a != addr && p.stage == Stage::Joined)
+            .filter_map(|(_, p)| Some((p.slot?, p.entrant_data.iter().map(|e| e.1.clone()).collect())))
+            .collect();
+        let slot_entry = |s: usize, with_value: bool| {
+            let mut b = (s as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(&ENTRANT_DATA_SLOT_KEY.to_le_bytes());
+            if with_value {
+                b.extend_from_slice(&(s as u16).to_le_bytes());
+            }
+            b
+        };
+        if !earlier.is_empty() {
+            to_new.push(slot_entry(slot, false));
+            to_others.push(slot_entry(slot, true));
+        }
+        // Native's server sets the newcomer's `afk` itself, right after.
+        let mut afk = (slot as u64).to_le_bytes().to_vec();
+        afk.extend_from_slice(&ENTRANT_KEY_AFK.to_le_bytes());
+        afk.extend_from_slice(&ENTRANT_AFK_VALUE);
+        to_new.push(afk.clone());
+        to_others.push(afk);
+        for (s, data) in earlier {
+            to_new.push(slot_entry(s, true));
+            to_new.extend(data);
+        }
+        for b in &to_new {
+            self.reliable_to(addr, ENTRANT_DATA, b);
+        }
+        for b in &to_others {
+            self.relay_reliable(addr, ENTRANT_DATA, b, false);
+        }
     }
 
     fn on_entrant_state(&mut self, from: SocketAddr, d: Vec<u8>) {
@@ -1953,7 +2216,7 @@ impl Session {
             // whose reset count the server moves on.
             self.reliable_to(from, TOUCH_GRANTED, &reply);
             if self.social && !release {
-                self.props.on_grant(object, entry_id);
+                self.props.on_grant(from, new_owner, object, entry_id);
             }
         } else {
             reply[0x08..0x0c].copy_from_slice(&e.owner.to_le_bytes());
@@ -2031,7 +2294,7 @@ impl Session {
         }
         // While the server holds the disc (goal, relaunch) clients' copies
         // are ignored; in play, the first player to hold it takes it over.
-        let free_play = self.arena.private && self.arena.phase == Phase::Waiting;
+        let free_play = (self.arena.private && self.arena.phase == Phase::Waiting) || self.arena.disc_loose;
         if self.arena.frozen.is_some() || (self.arena.server_disc && self.arena.phase != Phase::Playing && !free_play) {
             return;
         }
@@ -2176,7 +2439,16 @@ impl Session {
         {
             let margin = if self.arena.private { self.arena.rules.mercy_margin() } else { Some(public_mercy_margin()) };
             let mercy = margin.filter(|&m| self.arena.blue.abs_diff(self.arena.red) >= m);
-            if self.arena.overtime || mercy.is_some() {
+            if mercy.is_some() && !self.arena.overtime {
+                // Mercy ends the match at once: the score events of this
+                // goal go out, then match over (boards and clock read
+                // MERCY), with no 15 s goal celebration first.
+                let g = self.arena.tick;
+                self.arena.schedule.retain(|(at, _)| *at <= g);
+                self.arena.at(g + 1, Act::EndRound);
+                self.arena.round_live = false;
+                info!(margin = ?mercy, "mercy: match ends now");
+            } else if self.arena.overtime {
                 let end = self.arena.celebration_end(self.arena.tick);
                 self.arena.schedule.retain(|(at, _)| *at < end);
                 self.arena.at(end, Act::EndRound);
@@ -2204,6 +2476,57 @@ impl Session {
         let Some(b) = d.get(0..2) else { return false };
         let slot = usize::from(u16::from_le_bytes([b[0], b[1]]));
         self.peers.values().any(|p| p.slot == Some(slot) && matches!(p.team, TEAM_SPECTATOR | TEAM_MODERATOR))
+    }
+
+    /// `SR15NetPlayerEquipmentUpdate`: relayed to the others, as native. A
+    /// newcomer's first one also gets everyone else's latest: native (all four
+    /// combat server recordings, 2026-11-16) answers it within 0.1-0.3 s with
+    /// each other player's update, so players who joined later saw no guns,
+    /// tac mods or weapon arm (hand swap) until the owner changed something.
+    fn on_equipment(&mut self, from: SocketAddr, d: &[u8]) {
+        for (a, p) in self.peers.iter_mut() {
+            if *a != from && p.stage == Stage::Joined && p.spawned() {
+                p.t.queue_reliable(EQUIPMENT, d);
+            }
+        }
+        let Some(p) = self.peers.get_mut(&from) else { return };
+        let first = p.equipment.replace(d.to_vec()).is_none();
+        if !first {
+            return;
+        }
+        // Native's server marks the player spawned (entrant data, to everyone).
+        if let Some(slot) = p.slot {
+            let mut spawned = (slot as u64).to_le_bytes().to_vec();
+            spawned.extend_from_slice(&ENTRANT_KEY_SPAWNED.to_le_bytes());
+            let mut status = (slot as u64).to_le_bytes().to_vec();
+            status.extend_from_slice(&ENTRANT_KEY_MM_STATUS.to_le_bytes());
+            status.extend_from_slice(&ENTRANT_MM_STATUS_VALUE);
+            self.relay_reliable(from, ENTRANT_DATA, &spawned, true);
+            self.relay_reliable(from, ENTRANT_DATA, &status, true);
+        }
+        info!(%from, "spawned: other players' bodies now sent to it");
+        let others: Vec<Vec<u8>> = self
+            .peers
+            .iter()
+            .filter(|(a, p)| **a != from && p.stage == Stage::Joined)
+            .filter_map(|(_, p)| p.equipment.clone())
+            .collect();
+        debug!(%from, players = others.len(), "equipment of the others sent to a newcomer");
+        for e in others {
+            self.reliable_to(from, EQUIPMENT, &e);
+        }
+    }
+
+    /// Whether a stun from `who` is dropped: in the social lobby outside the
+    /// brawler room (arena stun and block) and the combat area (its stun
+    /// ordnance); in the arena while the hold is on (goal celebrations, round
+    /// and match ends). The client's own cease fire (`VAR_HOLD`) is lifted in
+    /// the brawler room only.
+    fn cease_fire_for(&self, who: SocketAddr) -> bool {
+        if self.social {
+            return !self.gear.may_fight(who) && !self.gear.stun_allowed(who, &[]);
+        }
+        self.arena_level && self.arena.flags.iter().any(|&(h, v)| h == VAR_HOLD && v == 1)
     }
 
     fn on_stun(&mut self, from: SocketAddr, d: &[u8]) {
@@ -2369,6 +2692,9 @@ impl Session {
             self.roster_dirty = false;
             self.publish_owner_state();
         }
+        // Who may hurt whom (splash, shots, stun fields) follows the teams.
+        self.gear.teams.clear();
+        self.gear.teams.extend(self.peers.iter().map(|(a, p)| (*a, p.team)));
 
         let mut sf = [0u8; 16];
         sf[..8].copy_from_slice(&frame.to_le_bytes());
@@ -2407,8 +2733,17 @@ impl Session {
                     if !p.seen_types.is_empty() {
                         let mut v: Vec<_> = p.seen_types.drain().collect();
                         v.sort_by(|a, b| b.1.cmp(&a.1));
-                        let list: Vec<String> = v.iter().take(16).map(|((t, r, l, o), n)| format!("{t:#x}/{}/{l}B/obj{o:#x}x{n}", if *r { "rel" } else { "mb" })).collect();
+                        let list: Vec<String> = v.iter().take(64).map(|((t, r, l, o), n)| format!("{t:#x}/{}/{l}B/obj{o:#x}x{n}", if *r { "rel" } else { "mb" })).collect();
                         debug!(slot = s, "client sent: {}", list.join(" "));
+                    }
+                    if !p.t.sent_types.is_empty() {
+                        let mut v: Vec<_> = p.t.sent_types.drain().collect();
+                        v.sort_by(|a, b| b.1.cmp(&a.1));
+                        let list: Vec<String> = v.iter().take(96).map(|((t, m, l), n)| format!("{t:#x}/{}/{l}B x{n}", if *m { "mb" } else { "rel" })).collect();
+                        info!(slot = s, "server sent: {}", list.join(" "));
+                    }
+                    if p.joined_at.is_some_and(|t| t.elapsed() > Duration::from_secs(90)) {
+                        p.t.trace = false;
                     }
                 }
             }
@@ -2499,6 +2834,7 @@ impl Session {
         if self.social {
             self.props.step(Instant::now());
             self.props.expire(Instant::now());
+            self.lobby_goal();
         }
         let every = if self.props.active() { frame_hz() / 40 } else { frame_hz() / 10 };
         if self.social && self.frame % every.max(1) == 0 {
@@ -2786,6 +3122,14 @@ impl Session {
                     a.clock = a.rules.round_secs();
                     a.round_clock = a.clock;
                     a.set_flag(VAR_MERCY_WIN, 0);
+                    // A disc left loose at time up: the server takes it back.
+                    if std::mem::take(&mut a.disc_loose) {
+                        a.server_disc = true;
+                        a.disc_live = false;
+                        a.disc_owner = u32::MAX;
+                        a.holder_state = None;
+                        a.last_disc = None;
+                    }
                     // Out of the goal and onto the spawn for the walk.
                     a.frozen = None;
                     a.parked = None;
@@ -2839,14 +3183,17 @@ impl Session {
             self.arena.clock = (self.arena.clock - dt).max(0.0);
             if self.arena.clock <= 0.0 {
                 let a = &mut self.arena;
-                if !a.private {
+                if !a.private && a.blue == a.red && super::msg::arena_public().sudden_death {
+                    let again = a.overtime;
+                    a.start_sudden_death(f);
+                    info!(score = a.blue, again, "time up, tied: sudden death");
+                } else if !a.private {
                     info!(blue = a.blue, orange = a.red, "match over");
                     a.end_match(f);
                 } else if a.blue == a.red && a.rules.overtime() {
-                    // Tied: play on; the next goal wins the round.
-                    a.overtime = true;
-                    let ot = crate::sns::symbol("MP_ANNOUNCER_001A_OVERTIME");
-                    a.soon.push(Act::Event(ot, MOD_ANNOUNCER, FILTER_ALL_ALT));
+                    // Tied: the draw and overtime calls, everyone back to the
+                    // launchers, then a launch; the next goal wins the round.
+                    a.start_sudden_death(f);
                     info!(score = a.blue, "time up, tied: overtime");
                 } else {
                     info!(blue = a.blue, orange = a.red, "time up: round over");
@@ -3245,7 +3592,8 @@ impl Session {
             for (name, get) in &tier_stats {
                 let best = players
                     .iter()
-                    .filter(|p| !tier_xp.contains_key(&p.slot) && get(&p.s) > 0.0)
+                    // One reward a player: not the MVP, not twice.
+                    .filter(|p| mvp != Some(p.slot) && !tier_xp.contains_key(&p.slot) && get(&p.s) > 0.0)
                     .max_by(|a, b| get(&a.s).total_cmp(&get(&b.s)).then(b.slot.cmp(&a.slot)));
                 let Some(p) = best else { continue };
                 let mut b = [0u8; 32];
@@ -3440,18 +3788,21 @@ impl Session {
         for a in self.joined() {
             self.reliable_to(a, TOP_AWARDS, &m);
         }
-        // Tier rewards: gold, silver, bronze (150/100/50 XP) for the top three
-        // in Goals, Assists and Saves, each to its player.
+        // Tier rewards: gold, silver, bronze (150/100/50 XP) in Goals,
+        // Assists and Saves, golds first. One reward a player: nobody who
+        // already has a top award, and nobody twice.
         let mut tiers = Vec::new();
-        for s in [Stat::Goals, Stat::Assists, Stat::Saves] {
-            let mut ranked: Vec<_> = players.iter().filter(|p| p.4.get(s) > 0).collect();
-            ranked.sort_by_key(|p| std::cmp::Reverse((p.4.get(s), p.4.get(Stat::Points))));
-            for (p, (tier, xp)) in ranked.iter().zip([(TIER_GOLD, 150u64), (TIER_SILVER, 100), (TIER_BRONZE, 50)]) {
+        let mut given: Vec<usize> = picks.iter().map(|p| p.slot).collect();
+        for (tier, xp) in [(TIER_GOLD, 150u64), (TIER_SILVER, 100), (TIER_BRONZE, 50)] {
+            for s in [Stat::Goals, Stat::Assists, Stat::Saves] {
+                let best = players.iter().filter(|p| p.4.get(s) > 0 && !given.contains(&p.0)).max_by_key(|p| (p.4.get(s), p.4.get(Stat::Points)));
+                let Some(p) = best else { continue };
                 let mut b = [0u8; 32];
                 b[0..8].copy_from_slice(&TEAM_STATS[s as usize].to_le_bytes());
                 b[8..16].copy_from_slice(&tier.to_le_bytes());
                 b[16..24].copy_from_slice(&(p.0 as u64).to_le_bytes());
                 b[24..32].copy_from_slice(&xp.to_le_bytes());
+                given.push(p.0);
                 tiers.push((p.0, b));
             }
         }
@@ -3472,8 +3823,22 @@ impl Session {
         // The lobby's vars this server changed (the Fury's engine, the discs'
         // first grabs): on a change, and every second for those who joined since.
         let (lobby_vars, lobby_changed) = if self.social {
+            // The combat room's barriers: their vars follow them (native).
+            let down = self.gear.barriers_down();
+            self.props.set_barriers_down(&down);
             let (v, c) = self.props.vars();
-            (v.to_vec(), c)
+            // Versioned vars keep the baseline's high word; ours is the low one.
+            let v = v
+                .iter()
+                .map(|&(h, x)| {
+                    if super::props::LO32_VARS.contains(&h) {
+                        (h, (var_raw(&base[0], h).unwrap_or(0) & !0xffff_ffff) | (x & 0xffff_ffff))
+                    } else {
+                        (h, x)
+                    }
+                })
+                .collect();
+            (v, c)
         } else {
             (Vec::new(), false)
         };
@@ -3510,6 +3875,25 @@ impl Session {
             }
             new
         };
+        // Every entrant's own cease fire var (`msg::entrant_hold_var`): a client
+        // obeys only its own entrant's, and native sends all of them to every
+        // client. Ours sent only `VAR_HOLD` (entrant 0/0's), so every late
+        // joiner's client never had a cease fire: stun and block anywhere in
+        // the lobby and through arena goals. Lifted (false) only in the
+        // brawler room (lobby); the arena's goal hold is everyone's.
+        let entrants: Vec<(u64, bool)> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.stage == Stage::Joined)
+            .filter_map(|(addr, p)| {
+                let slot = p.slot?;
+                let var = msg::entrant_hold_var(p.genidx, slot);
+                if var.is_none() {
+                    debug!(%addr, slot, genidx = p.genidx, "no cease fire var name for this entrant");
+                }
+                Some((var?, !self.social || self.gear.may_fight(*addr)))
+            })
+            .collect();
         let tracked: Vec<(u64, u64)> = if arena {
             let raw = |h| var_raw(&base[0], h).unwrap_or(0);
             let mut hs = vec![VAR_GAME_STATE, VAR_BLUE_SCORE, VAR_RED_SCORE];
@@ -3529,7 +3913,15 @@ impl Session {
                     hs.push(h);
                 }
             }
-            hs.into_iter().filter_map(|h| value(0, h, raw(h)).map(|v| (h, v))).collect()
+            let mut t: Vec<(u64, u64)> = hs.into_iter().filter_map(|h| value(0, h, raw(h)).map(|v| (h, v))).collect();
+            if let Some(&(_, hold)) = t.iter().find(|(h, _)| *h == VAR_HOLD) {
+                for &(var, _) in &entrants {
+                    if var != VAR_HOLD {
+                        t.push((var, hold));
+                    }
+                }
+            }
+            t
         } else {
             Vec::new()
         };
@@ -3568,18 +3960,46 @@ impl Session {
             }
             body
         };
+        // The sequence is one lobby-wide clock (native: frames since the
+        // session began, the same for every player; a late joiner's first
+        // snapshot came at 0xbdf, not at the first player's 0x13a). Ours
+        // counted per player from the captured start, so a late joiner's
+        // updates looked as old as the lobby's first ones and its client
+        // ignored them: the cease fire (`VAR_HOLD`) never reached it, in the
+        // lobby or on an arena goal, and it could stun and block anywhere.
         let stamp = |p: &mut Vec<u8>, seq_off: u64| {
-            if p.len() >= 28 {
+            if p.len() >= 24 {
                 let seq = u64::from_le_bytes(p[16..24].try_into().expect("8")).wrapping_add(seq_off);
                 p[16..24].copy_from_slice(&seq.to_le_bytes());
-                p[24..28].copy_from_slice(&(seq as u32).to_le_bytes());
+                if p.len() >= 28 {
+                    p[24..28].copy_from_slice(&(seq as u32).to_le_bytes());
+                }
             }
         };
-        let fulls: Vec<Vec<u8>> = base.iter().enumerate().map(|(i, b)| fresh(b, i)).collect();
-        // The lobby's cease fire (`VAR_HOLD`), per player: native lifts it
-        // (0) for a player in the brawler room or the combat area, and the
-        // client lets them punch and block only then.
-        let hold_hi = var_raw(&base[0], VAR_HOLD).unwrap_or(1) & !0xffff_ffff;
+        let mut fulls: Vec<Vec<u8>> = base.iter().enumerate().map(|(i, b)| fresh(b, i)).collect();
+        // The lobby's cease fire (`VAR_HOLD`), per player: lifted (0) only in
+        // the brawler room, where the client then lets them stun and block.
+        // Native's version in the high word (`LOBBY_HOLD_VERSION`), baseline included.
+        let holds: Vec<(u64, u64)> = if self.social {
+            entrants.iter().map(|&(var, fight)| (var, msg::LOBBY_HOLD_VERSION | u64::from(!fight))).collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(f) = fulls.first_mut() {
+            if self.social {
+                *f = msg::with_var(f, VAR_HOLD, msg::LOBBY_HOLD_VERSION | 1);
+                for &(var, v) in &holds {
+                    *f = msg::with_var_added(f, var, v);
+                }
+            } else if arena {
+                // The goal hold, for every entrant (`tracked` has them).
+                for &(var, _) in &entrants {
+                    if let Some(&(_, v)) = tracked.iter().find(|(h, _)| *h == var) {
+                        *f = msg::with_var_added(f, var, v);
+                    }
+                }
+            }
+        }
         let gear = &self.gear;
         // The combat mode's vars: those that changed every frame, all of them
         // twice a second (late joiners, lost packets).
@@ -3602,44 +4022,81 @@ impl Session {
             if full {
                 for (stream, b) in fulls.iter().enumerate() {
                     let mut body = b.clone();
-                    stamp(&mut body, p.rep_seq);
+                    stamp(&mut body, server_frame);
                     p.t.queue_mailbox(REPLICATED_VARS, key_replicated(stream, frame, slot), &body);
                 }
                 p.rep_sent = true;
                 p.rep_seq += 1;
                 // The baseline has the cease fire on: send ours again next frame.
                 p.fight_sent = None;
+                p.holds_sent = None;
             } else if arena {
                 // Every frame: the clock/countdown plus all tracked vars (tiny).
                 let mut body = delta(&base[0], &tracked);
-                stamp(&mut body, p.rep_seq);
+                stamp(&mut body, server_frame);
                 p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
                 if !tracked1.is_empty() && base.len() > 1 {
                     let mut body = delta(&base[1], &tracked1);
-                    stamp(&mut body, p.rep_seq);
+                    stamp(&mut body, server_frame);
                     p.t.queue_mailbox(REPLICATED_VARS, key_replicated(1, frame, slot), &body);
                 }
                 p.rep_seq += 1;
             } else if let Some((_, vars)) = combat_vars.as_ref() {
                 let mut body = delta(&base[0], vars);
-                stamp(&mut body, p.rep_seq);
+                stamp(&mut body, server_frame);
                 p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
                 p.rep_seq += 1;
             } else if self.social {
                 let fight = gear.may_fight(*addr);
-                let changed = p.fight_sent != Some(fight);
-                if changed {
-                    info!(%addr, fight, pos = ?gear.body_pos(*addr), "lobby cease fire {}", if fight { "lifted" } else { "on" });
+                if p.fight_sent != Some(fight) {
+                    info!(%addr, fight, slot = ?p.slot, genidx = p.genidx, pos = ?gear.body_pos(*addr), "lobby cease fire {}", if fight { "lifted" } else { "on" });
                 }
+                let changed = p.holds_sent.as_ref() != Some(&holds);
                 if lobby_due || changed || second {
                     let mut vars = lobby_vars.clone();
-                    vars.push((VAR_HOLD, hold_hi | u64::from(!fight)));
+                    vars.extend_from_slice(&holds);
                     let mut body = delta(&base[0], &vars);
-                    stamp(&mut body, p.rep_seq);
+                    stamp(&mut body, server_frame);
                     p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
                     p.rep_seq += 1;
                     p.fight_sent = Some(fight);
+                    p.holds_sent = Some(holds.clone());
+                } else if base[0].len() >= 24 {
+                    // Native (netrec 2026-11-18 21:05, both players): one every
+                    // frame, a 24-byte header when nothing changed, so the
+                    // sequence and the mailbox keys run on without gaps.
+                    let mut body = base[0][..24].to_vec();
+                    stamp(&mut body, server_frame);
+                    p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
+                    p.rep_seq += 1;
                 }
+            }
+        }
+    }
+
+    /// The quarter court (`props`): a goal's score update to everyone, and
+    /// the round start 3 s on, as native's server sends them.
+    fn lobby_goal(&mut self) {
+        if let Some(g) = self.props.take_goal() {
+            let handle = self.peers.get(&g.by).and_then(|p| Some((u32::from(p.generation.unwrap_or(p.genidx)) << 16) | p.slot? as u32));
+            let mut rec = [0u8; 28];
+            rec[0..2].copy_from_slice(&1u16.to_le_bytes());
+            rec[2..4].copy_from_slice(&g.points.to_le_bytes());
+            rec[4..6].copy_from_slice(&g.goal_type.to_le_bytes());
+            rec[6..10].copy_from_slice(&handle.unwrap_or(u32::MAX).to_le_bytes());
+            rec[10..14].copy_from_slice(&u32::MAX.to_le_bytes());
+            rec[16..20].copy_from_slice(&g.speed.to_le_bytes());
+            rec[20..24].copy_from_slice(&g.distance.to_le_bytes());
+            rec[24..28].copy_from_slice(&self.started.elapsed().as_secs_f32().to_le_bytes());
+            info!(by = %g.by, handle = ?handle, points = g.points, speed = g.speed, distance = g.distance, "quarter court goal: team 1");
+            for a in self.joined() {
+                self.reliable_to(a, POST_SCORE, &rec);
+            }
+        }
+        if self.props.take_round_start() {
+            let ev = component_event(msg::EV_ENABLE_SCORING, msg::MOD_LOBBY_SCORING, msg::LOBBY_SCORING_HANDLE, FILTER_ALL);
+            for a in self.joined() {
+                self.reliable_to(a, COMPONENT_EVENT, &ev);
             }
         }
     }
@@ -3765,7 +4222,17 @@ impl Session {
                 self.send_gear(from, o);
             }
             // The lobby's toys: the Fury controller's trigger.
-            self.props.on_event(from, sym);
+            self.props.on_event(from, sym, u16::from_le_bytes([d[16], d[17]]));
+            // Like combat (native relays a client's filter-13 events, the
+            // level scripts each client runs, byte for byte to the others):
+            // the lobby's scripts (punch zone, cease fire) sync through them
+            // too. Ours dropped every one in the lobby, so a client's script
+            // never told the others, and only the first player behaved.
+            let filter = if d.len() >= 20 { u16::from_le_bytes([d[18], d[19]]) } else { 0 };
+            info!(%from, sym = format_args!("{sym:#018x}"), module = format_args!("{module:#018x}"), handle = u16::from_le_bytes([d[16], d[17]]), filter, "lobby client event");
+            if d.len() == 24 && filter == FILTER_ALL_ALT {
+                self.relay_reliable(from, COMPONENT_EVENT, d, false);
+            }
             return;
         }
         if !self.arena.private {
@@ -4028,6 +4495,90 @@ mod server_mute_tests {
 
     /// A mute can arrive before the entrant's peer exists; it applies once
     /// that entrant joins.
+    /// Lobby: a client's filter-13 event (its level scripts) reaches the
+    /// other players byte for byte, not the sender; filter 5 stays here.
+    #[test]
+    fn lobby_relays_filter_13_client_events_to_the_others() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
+        let mut s = Session::new(info, 1);
+        let (a, b): (SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap());
+        s.peers.insert(a, joined_peer(Uuid::from_u128(1)));
+        s.peers.insert(b, joined_peer(Uuid::from_u128(2)));
+        let events = |s: &Session, at: SocketAddr| s.peers[&at].t.queued_reliable.iter().filter(|m| m.0 == COMPONENT_EVENT).map(|m| m.1.clone()).collect::<Vec<_>>();
+        let ev13 = hex_bytes("7a5aa1f228cc059cc4b6bab2ee99ea6a6c000d0000000000");
+        let ev5 = hex_bytes("c06471ffde095d63c4b6bab2ee99ea6a6c00050000000000");
+        s.on_client_event(a, &ev13);
+        s.on_client_event(a, &ev5);
+        assert_eq!(events(&s, b), vec![ev13.clone()], "filter 13 relayed as is, filter 5 not");
+        assert!(events(&s, a).is_empty(), "not back to the sender");
+    }
+
+    /// Native's lobby entrant data (netrec-lobby-native-20261118, slot-4
+    /// joiner; netrec-native-srv-1201): the newcomer gets its own header, its
+    /// empty slot entry and each earlier entrant's slot entry and data; a
+    /// client's own data goes to everyone, the sender too, under its slot,
+    /// without the client's 2-byte trailer.
+    #[test]
+    fn lobby_entrant_data_matches_native() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
+        let mut s = Session::new(info, 1);
+        let (a, b): (SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap());
+        let mut pa = joined_peer(Uuid::from_u128(1));
+        pa.slot = Some(0);
+        s.peers.insert(a, pa);
+        let data = |s: &Session, at: SocketAddr| s.peers[&at].t.queued_reliable.iter().filter(|m| m.0 == ENTRANT_DATA).map(|m| m.1.clone()).collect::<Vec<_>>();
+        s.on_entrant_data(a, &hex_bytes("0000000000000000e1e491a8b1d0e8c87d061f480cf31c191528a176ce52e9700000"));
+        let echo = hex_bytes("0000000000000000e1e491a8b1d0e8c87d061f480cf31c191528a176ce52e970");
+        assert_eq!(data(&s, a), vec![echo.clone()], "the sender hears its own, trailer dropped");
+        let mut pb = joined_peer(Uuid::from_u128(2));
+        pb.slot = Some(4);
+        s.peers.insert(b, pb);
+        s.send_entrant_data_on_join(b);
+        let got = data(&s, b);
+        assert_eq!(ENTRANT_DATA, 0x8f05_b673_5e91_6658);
+        assert_eq!(got[0].len(), 80);
+        assert_eq!(&got[0][..16], &hex_bytes("0400000000000000cc24f15e6e1a0fb1")[..]);
+        assert_eq!(got[1], hex_bytes("0400000000000000c332fe567a1e19a0"));
+        assert_eq!(got[2], hex_bytes("0400000000000000e1e491a8b1d0e8c87d061f480cf31c191528a176ce52e970"), "native's own afk");
+        assert_eq!(got[3], hex_bytes("0000000000000000c332fe567a1e19a00000"));
+        assert_eq!(got[4], echo);
+        let to_a = data(&s, a);
+        assert_eq!(to_a[to_a.len() - 2], hex_bytes("0400000000000000c332fe567a1e19a00400"));
+    }
+
+    /// Native: a newcomer hears nothing of the others' bodies or gear until
+    /// its own first equipment update; then their equipment, `spawned`.
+    #[test]
+    fn late_joiner_gets_bodies_only_after_its_spawn() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
+        let mut s = Session::new(info, 1);
+        let (a, b): (SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap());
+        let mut pa = joined_peer(Uuid::from_u128(1));
+        pa.slot = Some(0);
+        pa.equipment = Some(vec![1; 56]);
+        let mut pb = joined_peer(Uuid::from_u128(2));
+        pb.slot = Some(1);
+        pb.joined_at = Some(Instant::now());
+        s.peers.insert(a, pa);
+        s.peers.insert(b, pb);
+        s.relay_mailbox(a, PLAYER_STATE, 5, &[0; 64]);
+        s.relay_mailbox(a, PHYSICS, 5, &[0; 64]);
+        assert!(s.peers[&b].t.queued_mailbox.is_empty(), "no bodies before the spawn");
+        s.on_equipment(a, &[2; 56]);
+        assert!(!s.peers[&b].t.queued_reliable.iter().any(|m| m.0 == EQUIPMENT), "no gear before the spawn");
+        s.on_equipment(b, &[3; 56]);
+        let rel = &s.peers[&b].t.queued_reliable;
+        assert!(rel.iter().any(|m| m.0 == EQUIPMENT && m.1 == vec![2; 56]), "the others' gear at the spawn");
+        assert!(rel.iter().any(|m| m.0 == ENTRANT_DATA && m.1 == hex_bytes("01000000000000008e527a499e9fc42f")));
+        assert!(rel.iter().any(|m| m.0 == ENTRANT_DATA && m.1 == hex_bytes("01000000000000007d061f480cf31c19c4bedaed35d9f32d")));
+        s.relay_mailbox(a, PLAYER_STATE, 5, &[0; 64]);
+        assert_eq!(s.peers[&b].t.queued_mailbox.len(), 1);
+    }
+
+    fn hex_bytes(h: &str) -> Vec<u8> {
+        (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
     #[test]
     fn a_mute_before_join_applies_on_join() {
         let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
@@ -4071,5 +4622,129 @@ mod arena_profile_tests {
         assert_eq!(crate::upstream::with_features_for_test("ws://h/ws?a=1"), "ws://h/ws?a=1&features=save_loadout,server_mute");
         assert_eq!(crate::upstream::with_features_for_test("ws://h/ws"), "ws://h/ws?features=save_loadout,server_mute");
         assert_eq!(crate::upstream::with_features_for_test("ws://h/ws?features=x"), "ws://h/ws?features=x");
+    }
+}
+
+#[cfg(test)]
+mod arena_end_tests {
+    use super::*;
+
+    /// Time up while a player's client flies the disc: the server pins it and
+    /// moves the reset count on, so the holder's client snaps to the pin too.
+    #[test]
+    fn time_up_pin_moves_every_client_to_the_server_disc() {
+        let mut a = Arena::new(1, false);
+        a.server_disc = false;
+        a.last_disc = Some((10, 20, 30));
+        a.disc_owner = 3;
+        let before = a.disc_resets;
+        a.pin_disc();
+        assert_eq!(a.frozen, Some((10, 20, 30)));
+        assert!(a.server_disc);
+        assert_ne!(a.disc_resets, before, "reset count moved past the holder's");
+        assert_eq!(a.disc_owner, u32::MAX);
+        // Already the server's (after a goal): no second bump.
+        let r = a.disc_resets;
+        a.pin_disc();
+        assert_eq!(a.disc_resets, r);
+    }
+
+    /// Public, time up tied: sudden death. pre_sudden_death with the
+    /// overtime call, a 2:00 clock, `sudden_death_active` on, then the launch;
+    /// a scoreless one goes again through post_sudden_death; a goal ends it.
+        /// Private, time up tied with OVERTIME on: the same calls and relaunch
+    /// as public, but no clock: it stays at 0:00.
+    #[test]
+    fn private_tied_overtime_relaunches_without_a_clock() {
+        let mut a = Arena::new(1, true);
+        a.start_sudden_death(1000);
+        assert!(a.overtime);
+        assert_eq!(a.clock, 0.0);
+        assert!(a.schedule.iter().any(|(_, x)| matches!(x, Act::Event(s, _, _) if *s == EV_ROUND_RESTART)));
+        assert!(a.schedule.iter().any(|(_, x)| matches!(x, Act::State(s) if *s == ST_PRE_LAUNCH_ENTER)));
+    }
+
+    /// Time up with the disc out of the goals: it stays free (grabs and the
+    /// holder's states go on); after a goal it stays pinned in the goal.
+    #[test]
+    fn time_up_leaves_the_disc_free_unless_it_is_in_a_goal() {
+        let mut a = Arena::new(1, false);
+        a.server_disc = false;
+        a.last_disc = Some((10, 20, 30));
+        a.disc_owner = 3;
+        a.end_match(1000);
+        assert!(a.disc_loose && a.disc_free());
+        assert_eq!(a.frozen, None);
+        assert!(!a.server_disc, "the holder keeps simulating it");
+        let mut b = Arena::new(1, false);
+        b.frozen = Some((0, 0, 36_000));
+        b.end_match(1000);
+        assert!(!b.disc_loose && !b.disc_free());
+        assert!(b.server_disc);
+    }
+
+    /// Public, time up tied: native's sudden death (captures/netrec-pub-ot-20261119).
+    #[test]
+    fn tied_time_up_goes_to_repeating_sudden_death() {
+        let states = |a: &Arena| -> Vec<u64> { a.schedule.iter().filter_map(|(_, x)| match x { Act::State(s) => Some(*s), _ => None }).collect() };
+        let said = |a: &Arena| -> Vec<(u64, u64)> { a.schedule.iter().filter_map(|(t, x)| match x { Act::Event(s, m, _) if *m == MOD_ANNOUNCER => Some((*t, *s)), _ => None }).collect() };
+        let at = |a: &Arena, want: &dyn Fn(&Act) -> bool| a.schedule.iter().find(|(_, x)| want(x)).map(|(t, _)| *t).expect("scheduled");
+        let draws: Vec<u64> = ["A", "B", "C", "D", "E", "F"].iter().map(|v| crate::sns::symbol(&format!("MP_ANNOUNCER_0100{v}_DRAW"))).collect();
+        let hz = frame_hz();
+        let mut a = Arena::new(1, false);
+        a.blue = 4;
+        a.red = 4;
+        a.start_sudden_death(1000);
+        assert!(a.overtime);
+        assert_eq!(a.clock, 120.0);
+        let st = states(&a);
+        assert_eq!(&st[..5], &[ST_MATCH_END[0], ST_PRE_SUDDEN_DEATH[0], ST_PRE_SUDDEN_DEATH[1], ST_SD_NEW_ROUND[0], ST_SD_NEW_ROUND[1]]);
+        assert!(st.contains(&ST_GOAL[6]) && st.contains(&ST_PRE_LAUNCH_ENTER) && st.contains(&ST_PLAYING));
+        // The draw at once, "overtime round 1" at pre_launch.
+        let s = said(&a);
+        assert!(s.iter().any(|&(t, x)| t == 1001 && draws.contains(&x)));
+        let pre = at(&a, &|x| matches!(x, Act::State(s) if *s == ST_PRE_LAUNCH_ENTER));
+        assert!(s.contains(&(pre, crate::sns::symbol("MP_ANNOUNCER_OT_ROUND_1"))));
+        // 5 s in sudden_death_new_round, then the walk; pre_launch 4.5 s on.
+        let restart = at(&a, &|x| matches!(x, Act::Event(s, _, _) if *s == EV_ROUND_RESTART));
+        assert_eq!(restart, 1003 + 5 * hz);
+        assert_eq!(pre, restart + 2 + (HOLD_SECS * hz as f32) as u64);
+        assert_eq!(at(&a, &|x| matches!(x, Act::State(s) if *s == ST_ROUND_START)), pre + hz);
+        // Scoreless: again, "overtime round 2".
+        a.start_sudden_death(50_000);
+        assert_eq!(a.clock, 120.0);
+        assert!(said(&a).iter().any(|&(_, x)| x == crate::sns::symbol("MP_ANNOUNCER_OT_ROUND_2")));
+        // A goal decides it: post_sudden_death, then match over.
+        a.blue = 6;
+        a.end_round(90_000, false);
+        assert_eq!(a.phase, Phase::Over);
+        assert!(!a.overtime);
+        let post0 = at(&a, &|x| matches!(x, Act::State(s) if *s == ST_POST_SUDDEN_DEATH[0]));
+        let over = at(&a, &|x| matches!(x, Act::State(s) if *s == ST_MATCH_END[0]));
+        assert!(post0 < over);
+        assert!(a.schedule.iter().any(|(t, x)| *t < over && matches!(x, Act::Flag(k, 0) if *k == VAR_SUDDEN_DEATH)));
+        assert_eq!(a.flag(VAR_MERCY_WIN), Some(0));
+    }
+
+    /// A mercy end of the match sets the mercy flag and opens with the round
+    /// wrap-up, like a time-up end.
+    #[test]
+    fn mercy_end_announces_round_over() {
+        let said = |a: &Arena| -> Vec<u64> {
+            a.schedule.iter().filter_map(|(_, act)| match act { Act::Event(s, m, _) if *m == MOD_ANNOUNCER => Some(*s), _ => None }).collect()
+        };
+        let mut a = Arena::new(1, false);
+        a.blue = 15;
+        a.red = 3;
+        a.end_round(100, true);
+        assert_eq!(a.phase, Phase::Over);
+        assert_eq!(a.flag(VAR_MERCY_WIN), Some(1));
+        assert!(said(&a).contains(&EV_ANNOUNCER_ROUND_OVER));
+
+        let mut b = Arena::new(1, false);
+        b.blue = 5;
+        b.red = 3;
+        b.end_match(100);
+        assert!(said(&b).contains(&EV_ANNOUNCER_ROUND_OVER));
     }
 }

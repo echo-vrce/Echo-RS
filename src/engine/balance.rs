@@ -214,11 +214,19 @@ pub struct ArenaPublic {
     pub launch_secs: f32,
     pub mercy_margin: u32,
     pub self_goals: bool,
+    /// Sudden death (overtime) when time runs out tied (`enable_sudden_death`).
+    pub sudden_death: bool,
+    /// Each overtime round's clock (`sudden_death_round_time`, 120 s).
+    pub sd_round_secs: f32,
+    /// From regulation's end to the first overtime round (`sudden_death_regulation_over_time`, 0 s).
+    pub sd_regulation_over_secs: f32,
+    /// From a scoreless overtime round's end to the next (`sudden_death_round_over_time`, 5 s).
+    pub sd_round_over_secs: f32,
 }
 
 impl Default for ArenaPublic {
     fn default() -> Self {
-        Self { round_secs: 300.0, pre_match_secs: 45.0, launch_secs: 15.0, mercy_margin: 12, self_goals: false }
+        Self { round_secs: 300.0, pre_match_secs: 45.0, launch_secs: 15.0, mercy_margin: 12, self_goals: false, sudden_death: true, sd_round_secs: 120.0, sd_regulation_over_secs: 0.0, sd_round_over_secs: 5.0 }
     }
 }
 
@@ -233,6 +241,10 @@ impl ArenaPublic {
             launch_secs: f(&rr, "wait_for_launch_time", d.launch_secs, 1.0),
             mercy_margin: r.get("mercy_win_point_spread").and_then(Value::as_u64).map_or(d.mercy_margin, |m| m.clamp(1, 999) as u32),
             self_goals: r.get("self_goaling_public").and_then(Value::as_bool).unwrap_or(d.self_goals),
+            sudden_death: rr.get("enable_sudden_death").and_then(Value::as_bool).unwrap_or(d.sudden_death),
+            sd_round_secs: f(&rr, "sudden_death_round_time", d.sd_round_secs, 10.0),
+            sd_regulation_over_secs: f(&rr, "sudden_death_regulation_over_time", d.sd_regulation_over_secs, 0.0),
+            sd_round_over_secs: f(&rr, "sudden_death_round_over_time", d.sd_round_over_secs, 0.0),
         }
     }
 }

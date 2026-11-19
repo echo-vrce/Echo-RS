@@ -101,11 +101,47 @@ pub const VAR_FURY_ENGINE: u64 = 0xbec4_d8ed_f6ac_f8f3;
 const GRAB_VARS: [(u32, u32, &[(u64, u64)]); 3] = [
     // The main disc.
     (0xb1c7_5c04, 0, &[(0x3261_fa72_2679_4279, 1)]),
-    // The quarter-court disc.
-    (0xd33d_44b7, 0, &[(0x1b10_bdc9_62b4_7fcc, 0), (0xa22d_90ef_70f6_fa83, 1)]),
+    // The quarter-court disc (its holder var, `VAR_QC_HOLDER`, is set on every grant).
+    (0xd33d_44b7, 0, &[(0xa22d_90ef_70f6_fa83, 1)]),
     // The mini-arena disc.
     (0xd33d_44b7, 1, &[(0xd279_7da9_9ab3_17a5, 1)]),
 ];
+
+/// The lobby combat room's level scripts, as native's server runs them
+/// (`captures/netrec-native-srv-1201`, 2026-11-18): a client's server-only
+/// event (sym, net handle) sets a var's low word (the high one stays the
+/// baseline's, see [`LO32_VARS`]). Area enter/exit on handles 0xa8 and 0xb7
+/// (1.0 / 0.0), the ability station on 0xc6 (used 0, ready 1), and 0xb7's
+/// second trigger (exit 0.0; enter 1.0 by its pair, not seen changing).
+const LOBBY_REFLEXES: [(u64, u16, u64, u32); 8] = [
+    (0xfbc0_427a_c211_919e, 0xa8, 0xec48_aa3f_f874_8bae, 0),
+    (0xfbc0_427a_c211_919f, 0xa8, 0xec48_aa3f_f874_8bae, 0x3f80_0000),
+    (0xfbc0_427a_c211_919e, 0xb7, 0xab54_4d4b_2113_0c68, 0),
+    (0xfbc0_427a_c211_919f, 0xb7, 0xab54_4d4b_2113_0c68, 0x3f80_0000),
+    (0xea7a_6e23_ed5c_ace2, 0xc6, 0x01d5_d534_863e_cb0e, 0),
+    (0x8a4a_9239_b3d3_06ac, 0xc6, 0x01d5_d534_863e_cb0e, 1),
+    (0x635d_09de_ff71_64c0, 0xb7, 0xcb3e_710e_2dd8_e5c2, 0),
+    (0x635d_09de_ff71_64c1, 0xb7, 0xcb3e_710e_2dd8_e5c2, 0x3f80_0000),
+];
+/// The lobby combat room's barriers (net handle, var): the var is 0 while the
+/// barrier is down, 1 once it respawns. 64/65/66 were seen breaking in the same
+/// capture; the rest follow from them by `tools/gen_combat_vars.py`'s
+/// `barrier_var` (the handle in decimal), and all 11 are native's baseline vars at 1.
+pub const LOBBY_BARRIER_VARS: [(u16, u64); 11] = [
+    (58, 0x707e_2294_ceb4_9f36),
+    (59, 0x379e_4d91_6ec6_4c78),
+    (60, 0x29e6_4cf2_bb83_bb90),
+    (61, 0x46a6_d317_a29d_3db0),
+    (62, 0x58de_d274_77d8_ca58),
+    (63, 0x1f3e_bd71_d7aa_1916),
+    (64, 0x7452_cb20_8066_2e3a),
+    (65, 0x6a2a_ca43_5523_d9d2),
+    (66, 0x2dca_a546_f551_0a9c),
+    (67, 0x33b2_a425_2014_fd74),
+    (68, 0x5cf2_3bc0_390a_7b54),
+];
+/// Vars whose high word is a per-level version: only their low word is ours.
+pub const LO32_VARS: [u64; 4] = [0xec48_aa3f_f874_8bae, 0xab54_4d4b_2113_0c68, 0x01d5_d534_863e_cb0e, 0xcb3e_710e_2dd8_e5c2];
 
 /// An object whose owner has sent no record of it for this long is the
 /// server's again. A client stops sending what it threw once it comes to
@@ -113,6 +149,102 @@ const GRAB_VARS: [(u32, u32, &[(u64, u64)]); 3] = [
 /// client's, nobody sent it at all, and a player who joined later saw it
 /// where it started.
 const SILENCE: Duration = Duration::from_secs(2);
+
+// -- The quarter court's goal ------------------------------------------------
+//
+// The goal is `mpl_arena_goal_di_i705` (lobby.fbx): a ring of radius 1.555 m
+// at (-53.540, 1.482, -30.910), turned 60 degrees about +Y, so its axis is
+// `QC_NORMAL`. Native's server (`captures/netrec-info-20261118`, the session
+// of the 14:40:19 "EmitOnFlagBaseScore team(1), point value(2) ... INSIDE
+// SHOT" log) took a goal for each pass of the disc (set `d33d44b7`, entry 0)
+// through the ring from the front (+normal) to the back: all six goals were
+// such passes, 0.09 to 1.02 m from the centre; every other front-to-back pass
+// was 1.42 m out or more, and a back-to-front one at 0.34 m did nothing. The
+// disc's owner keeps simulating it through the goal (no stop, no reset).
+//
+// On a goal native:
+// - sets `VAR_GAME_STATE` to `LOBBY_ST_GOAL` for 3 s, then back to playing,
+//   with `EV_ENABLE_SCORING` on the lobby's scoring module (`OnRoundStartCB`);
+// - sent everyone `SR15NetReliablePostScoreUpdate`: team 1, 2 points, goal
+//   type 2 (INSIDE SHOT), the owner's handle, no assist, speed (m/s),
+//   release-to-goal distance (m), the lobby's clock (s). For three of the six
+//   it did not (released from 6.4 to 11.1 m out, 5.6 to 10.9 m to the side;
+//   the scoring ones 7.0 to 8.0 m out, 0.8 to 6.1 m to the side): the rule is
+//   not known, so here every goal scores.
+
+/// The quarter-court disc: set and entry.
+pub const QC_SET: u32 = 0xd33d_44b7;
+const QC_ENTRY: u8 = 0;
+/// The disc's current simulator, `gen << 16 | slot` (`ffffffff`: the server).
+pub const VAR_QC_HOLDER: u64 = 0x1b10_bdc9_62b4_7fcc;
+/// The ring's centre, its front (unit, horizontal) and the radius a goal
+/// passes within (m; the ring itself is 1.555).
+pub const QC_GOAL: [f64; 3] = [-53.540, 1.482, -30.910];
+const QC_NORMAL: [f64; 3] = [0.866_025, 0.0, 0.5];
+const QC_RADIUS: f64 = 1.2;
+/// How long the lobby stays in its goal state.
+pub const QC_GOAL_HOLD: Duration = Duration::from_secs(3);
+/// The lobby's game state during a goal (native; `ST_PLAYING` otherwise).
+pub const LOBBY_ST_GOAL: u64 = 0xb059_068e_f815_8682;
+
+/// The 3-point bubble, `mpl_arena_barrier_3pt_bubble_blue_i4364` (lobby.fbx,
+/// material `mpl_score_volume_blue`): a sphere cap of radius 7.97 m (its 2726
+/// vertices within 0.2 m) centred 0.7 m behind the ring. A shot let go
+/// outside it is a 3-pointer (LONG SHOT), inside a 2-pointer (INSIDE SHOT).
+/// Where it was let go is the disc's first free-flight position. Native's
+/// six recorded goals were all 2-pointers, let go 6.2 to 8.2 m from the
+/// centre (the 8.2 m one at about 15 samples a second), hence the slack.
+pub const QC_BUBBLE: [f64; 3] = [-54.106, 1.466, -31.237];
+const QC_BUBBLE_RADIUS: f64 = 7.97;
+const QC_BUBBLE_SLACK: f64 = 0.3;
+
+/// Points and goal type (`stats::GOAL_*`) for a shot let go at `release`.
+fn qc_points(release: Option<[f64; 3]>) -> (u16, u16) {
+    let out = release.is_some_and(|a| (0..3).map(|k| (a[k] - QC_BUBBLE[k]).powi(2)).sum::<f64>().sqrt() > QC_BUBBLE_RADIUS + QC_BUBBLE_SLACK);
+    if out { (3, super::stats::GOAL_LONG_SHOT) } else { (2, super::stats::GOAL_INSIDE_SHOT) }
+}
+
+/// A disc through the quarter court's ring.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QcGoal {
+    /// The client simulating the disc (the shooter).
+    pub by: SocketAddr,
+    /// 2 or 3 (the bubble).
+    pub points: u16,
+    pub goal_type: u16,
+    pub speed: f32,
+    /// From where it was let go to the ring (m), 0 when not seen.
+    pub distance: f32,
+}
+
+#[derive(Default)]
+struct QuarterCourt {
+    /// The disc's last reported position.
+    last: Option<[f64; 3]>,
+    /// Held in the last report.
+    held: bool,
+    /// Where it was let go: its first free position after a hand.
+    release: Option<[f64; 3]>,
+    /// In the goal state until then.
+    hold_until: Option<Instant>,
+    goal: Option<QcGoal>,
+    round_start: bool,
+}
+
+/// Whether the move a -> b goes through the ring from its front.
+fn through_the_ring(a: [f64; 3], b: [f64; 3]) -> bool {
+    let side = |p: [f64; 3]| (0..3).map(|k| (p[k] - QC_GOAL[k]) * QC_NORMAL[k]).sum::<f64>();
+    let (sa, sb) = (side(a), side(b));
+    if !(sa > 0.0 && sb <= 0.0) {
+        return false;
+    }
+    let u = sa / (sa - sb);
+    (0..3).map(|k| (a[k] + u * (b[k] - a[k]) - QC_GOAL[k]).powi(2)).sum::<f64>() <= QC_RADIUS * QC_RADIUS
+}
+
+fn velocity(r: &Record) -> [f64; 3] {
+    [0, 1, 2].map(|k| (f64::from(field(r, VEL_BIT + 12 * k, 12)) - 1536.0) / 32.0)
+}
 
 type Record = [u8; RECORD_BYTES];
 
@@ -316,6 +448,9 @@ pub struct Props {
     /// the captured full state), and whether one changed since last sent.
     vars: Vec<(u64, u64)>,
     vars_changed: bool,
+    qc: QuarterCourt,
+    /// Who the quarter-court disc was last granted to.
+    qc_holder: Option<SocketAddr>,
 }
 
 fn unhex(t: &str) -> Vec<u8> {
@@ -346,7 +481,7 @@ impl Props {
             .iter()
             .map(|(id, key_base, d)| Set { id: *id, key_base: *key_base, entries: records(d).into_iter().map(|record| Entry { record, owner: None, heard: None }).collect() })
             .collect();
-        let mut p = Self { sets, pilot: None, flight: None, fury_home: [0.0; 3], vars: Vec::new(), vars_changed: false };
+        let mut p = Self { sets, pilot: None, flight: None, fury_home: [0.0; 3], vars: Vec::new(), vars_changed: false, qc: QuarterCourt::default(), qc_holder: None };
         p.fury_home = p.entry(FURY).map_or([0.0; 3], |e| position(&e.record));
         p
     }
@@ -360,7 +495,12 @@ impl Props {
     }
 
     /// A client's ComponentEvent: the Fury controller's trigger.
-    pub fn on_event(&mut self, from: SocketAddr, sym: u64) {
+    pub fn on_event(&mut self, from: SocketAddr, sym: u64, handle: u16) {
+        for (s, h, var, v) in LOBBY_REFLEXES {
+            if s == sym && h == handle {
+                self.set_var(var, u64::from(v));
+            }
+        }
         match sym {
             FURY_ENGINE_ON if self.entry(FURY_CONTROLLER).is_some_and(|c| c.owner == Some(from)) => {
                 tracing::info!(%from, "Fury: engine on");
@@ -389,9 +529,27 @@ impl Props {
         self.vars_changed = true;
     }
 
+    /// The combat room's barriers that are down now (net handles).
+    pub fn set_barriers_down(&mut self, down: &[u16]) {
+        for (h, var) in LOBBY_BARRIER_VARS {
+            let up = !down.contains(&h);
+            // Untouched barriers stay as the baseline has them (up).
+            if up && !self.vars.iter().any(|e| e.0 == var) {
+                continue;
+            }
+            self.set_var(var, u64::from(up));
+        }
+    }
+
     /// A touch grant in the lobby: native's scripts set a var the first
     /// time each disc is taken.
-    pub fn on_grant(&mut self, set: u32, entry: u32) {
+    pub fn on_grant(&mut self, to: SocketAddr, handle: u32, set: u32, entry: u32) {
+        // Native: the quarter-court disc's holder var follows every grant
+        // (`ffffffff` once the server has it again).
+        if set == QC_SET && entry == u32::from(QC_ENTRY) {
+            self.qc_holder = Some(to);
+            self.set_var(VAR_QC_HOLDER, u64::from(handle));
+        }
         for (s, e, vars) in GRAB_VARS {
             if s == set && e == entry {
                 for &(h, v) in vars {
@@ -420,6 +578,7 @@ impl Props {
     /// (`pilot`) is the engine: thrust along the nose. Let go, it coasts and
     /// keeps turning, slowing down, then sleeps.
     pub fn step(&mut self, now: Instant) {
+        self.qc_step(now);
         let held = self.entry(FURY_CONTROLLER).filter(|c| c.owner.is_some() && bit(&c.record, HELD)).map(|c| (c.owner, rotation(&c.record)));
         // The engine stops with the hand that started it.
         if self.pilot.is_some() && held.map(|h| h.0) != Some(self.pilot) {
@@ -491,10 +650,16 @@ impl Props {
             return;
         }
         let id = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
-        let Some(set) = self.sets.iter_mut().find(|s| s.id == id) else { return };
+        if !self.sets.iter().any(|s| s.id == id) {
+            return;
+        }
         let now = Some(Instant::now());
         for record in records(d) {
             let entry = entry_of(&record);
+            if id == QC_SET && entry == QC_ENTRY {
+                self.qc_track(from, &record, Instant::now());
+            }
+            let Some(set) = self.sets.iter_mut().find(|s| s.id == id) else { return };
             match set.entries.iter_mut().find(|e| entry_of(&e.record) == entry) {
                 Some(e) => {
                     e.record = record;
@@ -506,8 +671,57 @@ impl Props {
         }
     }
 
+    /// The quarter-court disc as its owner reports it: through the ring?
+    fn qc_track(&mut self, from: SocketAddr, r: &Record, now: Instant) {
+        let pos = position(r);
+        let prev = self.qc.last.replace(pos);
+        if bit(r, HELD) {
+            self.qc.release = Some(pos);
+            self.qc.held = true;
+            return;
+        }
+        if std::mem::take(&mut self.qc.held) {
+            self.qc.release = Some(pos);
+        }
+        let Some(prev) = prev else { return };
+        if self.qc.hold_until.is_some() || !through_the_ring(prev, pos) {
+            return;
+        }
+        let v = velocity(r);
+        let speed = v.iter().map(|x| x * x).sum::<f64>().sqrt() as f32;
+        let release = self.qc.release.take();
+        let distance = release.map_or(0.0, |a| (0..3).map(|k| (QC_GOAL[k] - a[k]).powi(2)).sum::<f64>().sqrt() as f32);
+        let (points, goal_type) = qc_points(release);
+        tracing::info!(%from, points, speed, distance, release = ?release, "quarter court: goal");
+        self.qc.hold_until = Some(now + QC_GOAL_HOLD);
+        self.qc.goal = Some(QcGoal { by: from, points, goal_type, speed, distance });
+        self.set_var(super::msg::VAR_GAME_STATE, LOBBY_ST_GOAL);
+    }
+
+    /// A quarter-court goal since the last call.
+    pub fn take_goal(&mut self) -> Option<QcGoal> {
+        self.qc.goal.take()
+    }
+
+    /// The goal state just ended: send `EV_ENABLE_SCORING`.
+    pub fn take_round_start(&mut self) -> bool {
+        std::mem::take(&mut self.qc.round_start)
+    }
+
+    fn qc_step(&mut self, now: Instant) {
+        if self.qc.hold_until.is_some_and(|t| now >= t) {
+            self.qc.hold_until = None;
+            self.qc.round_start = true;
+            self.set_var(super::msg::VAR_GAME_STATE, super::msg::ST_PLAYING);
+        }
+    }
+
     /// A player left: what they owned stays where they last reported it, asleep.
     pub fn forget(&mut self, who: SocketAddr) {
+        if self.qc_holder == Some(who) {
+            self.qc_holder = None;
+            self.set_var(VAR_QC_HOLDER, 0xffff_ffff);
+        }
         if self.pilot == Some(who) {
             self.engine_off();
         }
@@ -632,7 +846,7 @@ mod tests {
         let still = position(&r);
         assert!((0..3).all(|k| (still[k] - home[k]).abs() < 1e-3), "{still:?}");
         assert!(p.vars().0.is_empty());
-        p.on_event(addr(), FURY_ENGINE_ON);
+        p.on_event(addr(), FURY_ENGINE_ON, 0);
         assert_eq!(p.vars(), (&[(VAR_FURY_ENGINE, 1)][..], true));
         for _ in 0..(8 * 120) {
             now += tick;
@@ -647,7 +861,7 @@ mod tests {
         // It is in what the server sends.
         assert_eq!(records(&p.broadcast(0, 0)[0].1).iter().filter(|r| entry_of(r) == FURY).count(), 1);
         // Trigger and controller let go: the engine var drops, the ship coasts on.
-        p.on_event(addr(), FURY_ENGINE_OFF);
+        p.on_event(addr(), FURY_ENGINE_OFF, 0);
         assert_eq!(p.vars(), (&[(VAR_FURY_ENGINE, 0)][..], true));
         set_bit(&mut c, HELD, false);
         p.observe(addr(), &message(&c));
@@ -671,12 +885,130 @@ mod tests {
     #[test]
     fn a_first_grab_of_each_lobby_disc_sets_natives_var() {
         let mut p = Props::new();
-        p.on_grant(0xd33d_44b7, 1);
+        let who: SocketAddr = "1.2.3.4:5".parse().expect("addr");
+        p.on_grant(who, 7, 0xd33d_44b7, 1);
         assert_eq!(p.vars(), (&[(0xd279_7da9_9ab3_17a5, 1)][..], true));
-        p.on_grant(0xd33d_44b7, 1);
+        p.on_grant(who, 7, 0xd33d_44b7, 1);
         assert!(!p.vars().1);
-        p.on_grant(0xb1c7_5c04, 3);
+        p.on_grant(who, 7, 0xb1c7_5c04, 3);
         assert_eq!(p.vars().0.len(), 1);
+    }
+
+    // Every combat-room barrier breaks out of sight, not only the three a capture saw.
+    #[test]
+    fn every_lobby_barrier_has_its_var() {
+        let handles: Vec<u16> = include_str!("data/lobby_combat_barriers.txt")
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.split_whitespace().nth(1).unwrap().parse().unwrap())
+            .collect();
+        let ours: Vec<u16> = LOBBY_BARRIER_VARS.iter().map(|&(h, _)| h).collect();
+        assert_eq!(handles, ours);
+    }
+
+    // The quarter-court disc's holder var follows each grant, and is the
+    // server's (`ffffffff`) once the holder leaves (captures/netrec-info-20261118).
+    #[test]
+    fn quarter_court_holder_var_follows_grants() {
+        let mut p = Props::new();
+        let a: SocketAddr = "1.2.3.4:5".parse().expect("addr");
+        let b: SocketAddr = "1.2.3.4:6".parse().expect("addr");
+        p.on_grant(a, 0x0002_0001, QC_SET, 0);
+        assert!(p.vars().0.contains(&(VAR_QC_HOLDER, 0x0002_0001)));
+        p.on_grant(b, 5, QC_SET, 0);
+        assert!(p.vars().0.contains(&(VAR_QC_HOLDER, 5)));
+        p.forget(a);
+        assert!(p.vars().0.contains(&(VAR_QC_HOLDER, 5)));
+        p.forget(b);
+        assert!(p.vars().0.contains(&(VAR_QC_HOLDER, 0xffff_ffff)));
+    }
+
+    // Moves of the disc from the native recording (two samples each).
+    #[test]
+    fn the_ring_takes_native_goals_and_only_them() {
+        // Goals (146.6 s, 242.3 s, 419.9 s, 447.4 s, 601.9 s): the two
+        // samples either side of the ring.
+        assert!(through_the_ring([-53.543, 1.444, -30.648], [-53.571, 1.396, -30.916]));
+        assert!(through_the_ring([-53.452, 1.159, -30.583], [-53.529, 1.13, -30.965]));
+        assert!(through_the_ring([-53.851, 1.387, -29.97], [-54.214, 1.488, -30.078]));
+        assert!(through_the_ring([-53.641, 1.647, -30.691], [-53.926, 1.435, -30.548]));
+        assert!(through_the_ring([-53.003, 1.44, -31.594], [-53.302, 1.419, -31.334]));
+        // The same move backwards: from behind the ring.
+        assert!(!through_the_ring([-53.571, 1.396, -30.916], [-53.543, 1.444, -30.648]));
+        // Past the ring's edge (463.7 s, 1.42 m from its centre): no goal.
+        assert!(!through_the_ring([-54.085, 2.331, -29.903], [-54.125, 2.435, -30.062]));
+    }
+
+    // Native's goals were all 2-pointers: first free positions of three of
+    // them (146.1 s, 241.9 s, 419.6 s) and one close to the ring. A shot from
+    // well outside the bubble is a 3-pointer, and an unseen release 2.
+    #[test]
+    fn the_bubble_splits_twos_and_threes() {
+        use super::super::stats::{GOAL_INSIDE_SHOT, GOAL_LONG_SHOT};
+        for at in [[-52.82, 2.693, -23.675], [-52.217, 1.624, -24.457], [-47.613, -0.347, -28.12], [-53.003, 1.44, -33.594]] {
+            assert_eq!(qc_points(Some(at)), (2, GOAL_INSIDE_SHOT), "{at:?}");
+        }
+        assert_eq!(qc_points(Some([-45.0, 1.5, -26.0])), (3, GOAL_LONG_SHOT));
+        assert_eq!(qc_points(Some([-57.241, 1.975, -20.447])), (3, GOAL_LONG_SHOT));
+        assert_eq!(qc_points(None), (2, GOAL_INSIDE_SHOT));
+    }
+
+    #[test]
+    fn a_shot_from_outside_the_bubble_scores_three() {
+        let mut p = Props::new();
+        let who: SocketAddr = "1.2.3.4:5".parse().expect("addr");
+        p.observe(who, &qc_record([-44.9, 1.6, -25.8], true));
+        p.observe(who, &qc_record([-45.0, 1.5, -26.0], false));
+        p.observe(who, &qc_record([-53.543, 1.444, -30.648], false));
+        p.observe(who, &qc_record([-53.571, 1.396, -30.916], false));
+        let g = p.take_goal().expect("goal");
+        assert_eq!(g.points, 3);
+    }
+
+    fn qc_record(pos: [f64; 3], held: bool) -> Vec<u8> {
+        let mut r = [0u8; RECORD_BYTES];
+        set_field(&mut r, ENTRY_BIT, ENTRY_BITS, u32::from(QC_ENTRY));
+        set_bit(&mut r, HELD, held);
+        set_position(&mut r, pos);
+        set_velocity(&mut r, [-1.25, -2.15, -12.06]);
+        let mut d = vec![0u8; (HEAD * 8 + RECORD_BITS).div_ceil(64) * 8];
+        d[..4].copy_from_slice(&2u32.to_le_bytes());
+        d[4..8].copy_from_slice(&QC_SET.to_le_bytes());
+        d[16..20].copy_from_slice(&COUNT_UNIT.to_le_bytes());
+        for k in 0..RECORD_BITS {
+            if bit(&r, k) {
+                set_bit(&mut d, HEAD * 8 + k, true);
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn a_goal_holds_the_lobby_three_seconds() {
+        let mut p = Props::new();
+        let who: SocketAddr = "1.2.3.4:5".parse().expect("addr");
+        // Native 146.06 s: the last sample in the hand, the first free one.
+        p.observe(who, &qc_record([-52.798, 2.743, -23.436], true));
+        p.observe(who, &qc_record([-52.82, 2.693, -23.675], false));
+        p.observe(who, &qc_record([-53.543, 1.444, -30.648], false));
+        assert!(p.take_goal().is_none());
+        p.observe(who, &qc_record([-53.571, 1.396, -30.916], false));
+        let g = p.take_goal().expect("goal");
+        assert_eq!(g.by, who);
+        assert_eq!((g.points, g.goal_type), (2, super::super::stats::GOAL_INSIDE_SHOT));
+        assert!((g.speed - 12.3).abs() < 0.1, "{}", g.speed);
+        // Native reported 7.41 m.
+        assert!((g.distance - 7.4).abs() < 0.2, "{}", g.distance);
+        assert!(p.vars().0.contains(&(super::super::msg::VAR_GAME_STATE, LOBBY_ST_GOAL)));
+        // Through again during the goal: nothing.
+        p.observe(who, &qc_record([-53.543, 1.444, -30.648], false));
+        p.observe(who, &qc_record([-53.571, 1.396, -30.916], false));
+        assert!(p.take_goal().is_none());
+        p.step(Instant::now());
+        assert!(!p.take_round_start());
+        p.step(Instant::now() + QC_GOAL_HOLD);
+        assert!(p.take_round_start());
+        assert!(p.vars().0.contains(&(super::super::msg::VAR_GAME_STATE, super::super::msg::ST_PLAYING)));
     }
 
     #[test]
@@ -716,5 +1048,26 @@ mod tests {
         let recs = records(after);
         let disc = recs.iter().find(|r| entry_of(r) == 0).expect("entry 0");
         assert!(bit(disc, ASLEEP) && !bit(disc, HELD));
+    }
+
+    /// Native's lobby combat room (netrec-native-srv-1201): area events on a
+    /// handle set that handle's var; a broken barrier's var is 0 until it
+    /// respawns; untouched barriers send nothing.
+    #[test]
+    fn lobby_reflexes_and_barrier_vars_follow_native() {
+        let mut p = Props::new();
+        p.set_barriers_down(&[]);
+        assert!(p.vars().0.is_empty());
+        p.on_event(addr(), 0xfbc0_427a_c211_919e, 0xb7);
+        assert_eq!(p.vars(), (&[(0xab54_4d4b_2113_0c68, 0)][..], true));
+        // The same event on another handle is another area's var.
+        p.on_event(addr(), 0xfbc0_427a_c211_919f, 0xa8);
+        assert!(p.vars().0.contains(&(0xec48_aa3f_f874_8bae, 0x3f80_0000)));
+        p.set_barriers_down(&[65]);
+        assert!(p.vars().0.contains(&(0x6a2a_ca43_5523_d9d2, 0)));
+        p.set_barriers_down(&[]);
+        let (v, changed) = p.vars();
+        assert!(changed && v.contains(&(0x6a2a_ca43_5523_d9d2, 1)));
+        assert!(!v.iter().any(|e| e.0 == 0x7452_cb20_8066_2e3a));
     }
 }

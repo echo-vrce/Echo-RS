@@ -26,6 +26,28 @@ pub const OWNER_STATE: u64 = h("SNSLobbyOwnerState");
 pub const HOST_STATE: u64 = h("SNSLobbyHostState");
 pub const ENTRANT_STATE: u64 = M::SNS_LOBBY_ENTRANT_STATE_V2.data();
 pub const ENTRANT_REMOVED: u64 = M::SNS_LOBBY_ENTRANT_REMOVED.data();
+/// A lobby entrant's key/value data. Client -> server `[slot u64][key u64][data][u16]`;
+/// server -> everyone (the sender too) `[sender slot u64][key u64][data]`
+/// (netrec-native-srv-1201 and its client netrec-lobby-ours-1959; netrec-lobby-native-20261118).
+pub const ENTRANT_DATA: u64 = h("SNSLobbyEntrantDataChanged");
+/// The entrant-data header native's server gives each newcomer for its own slot (key + 8 key
+/// hashes, identical in every capture). The client publishes its own entrant data only after it.
+pub const ENTRANT_DATA_HEADER: [u8; 72] = [
+    0xcc, 0x24, 0xf1, 0x5e, 0x6e, 0x1a, 0x0f, 0xb1, 0xa2, 0x08, 0x7d, 0x33, 0x48, 0x3e, 0xc3, 0xc8, 0x63, 0x89, 0xfe, 0x27,
+    0x1a, 0x95, 0xe8, 0x22, 0xdf, 0x32, 0x32, 0x13, 0x1b, 0x17, 0x62, 0x2f, 0x8e, 0x5e, 0x6d, 0x4a, 0x8d, 0x8e, 0xc7, 0x2f,
+    0x63, 0x94, 0xe6, 0x3d, 0x0e, 0x90, 0xe2, 0x34, 0x88, 0x31, 0x93, 0x80, 0x82, 0x93, 0x76, 0x5d, 0x5e, 0x98, 0xfd, 0xb4,
+    0x85, 0x63, 0xce, 0x64, 0x7f, 0x0c, 0x5f, 0x0b, 0x63, 0x28, 0xe2, 0x6f,
+];
+/// Native's per-entrant slot entry: an earlier entrant's is its slot (u16), a newcomer's own empty.
+pub const ENTRANT_DATA_SLOT_KEY: u64 = 0xa019_1e7a_56fe_32c3;
+/// Entrant data native's server sets itself (peer -1 of netrec-native-srv-1201; the same bytes
+/// in every client capture): `afk` with its value right after the join header, `spawned`
+/// (empty) and `mm|status` once the player's first equipment update arrives.
+pub const ENTRANT_KEY_AFK: u64 = 0xc8e8_d0b1_a891_e4e1;
+pub const ENTRANT_AFK_VALUE: [u8; 16] = [0x7d, 0x06, 0x1f, 0x48, 0x0c, 0xf3, 0x1c, 0x19, 0x15, 0x28, 0xa1, 0x76, 0xce, 0x52, 0xe9, 0x70];
+pub const ENTRANT_KEY_SPAWNED: u64 = 0x2fc4_9f9e_497a_528e;
+pub const ENTRANT_KEY_MM_STATUS: u64 = 0x191c_f30c_481f_067d;
+pub const ENTRANT_MM_STATUS_VALUE: [u8; 8] = [0xc4, 0xbe, 0xda, 0xed, 0x35, 0xd9, 0xf3, 0x2d];
 pub const UPDATE_PINGS: u64 = h("SNSLobbyUpdatePings");
 /// Client -> server on each cosmetic equip: `[slot u64][instance][slot type][item]`.
 pub const ITEM_EQUIPPED: u64 = h("SR15NetItemEquippedNotification");
@@ -185,6 +207,11 @@ pub const FILTER_ALL: u16 = 5;
 pub const FILTER_ALL_ALT: u16 = 13;
 
 pub const EV_ENABLE_SCORING: u64 = 0x521f_717a_2cb8_0aa9;
+/// The social lobby's scoring module (the quarter court): native sends
+/// `EV_ENABLE_SCORING` on it 3 s after each goal, on net handle 0x2e in a
+/// session whose IdsResponse is our `ids_response_045c` (captures/netrec-info-20261118).
+pub const MOD_LOBBY_SCORING: u64 = 0x5578_07c7_3b06_750f;
+pub const LOBBY_SCORING_HANDLE: u16 = 0x002e;
 pub const EV_RESTART_CELEBRATION: u64 = 0x9ebb_9a61_909b_5440;
 pub const EV_MATCH_NOT_READY: u64 = 0x5ca9_e3d2_7753_75f5;
 pub const EV_RESTART_GOALS: u64 = 0x0f20_dd3d_f2d9_e5a1;
@@ -480,6 +507,66 @@ pub fn ids_response(level: u64, session_level: u64, mode: u64) -> Option<&'stati
 }
 
 /// Look up a variable's raw value in a replicated-vars payload.
+/// The lobby's `VAR_HOLD` as native sends it: the flag in the low word, `6aea99ee` in the high one (every lobby
+/// capture: native-lobby/native-det/native-20261116/native-match, baseline and each per-player change). The high
+/// word is the var's version (the lobby's other vars carry one near the message sequence): a client keeps its own
+/// value against a lower one, so a hold sent at version 0 (our captured baseline's) never overrode a client that
+/// had lifted it itself, and players stunned and blocked anywhere.
+pub const LOBBY_HOLD_VERSION: u64 = 0x6aea_99ee_0000_0000;
+
+/// `payload` with the var `hash` set to `value` (unchanged if the payload has no such var).
+pub fn with_var(payload: &[u8], hash: u64, value: u64) -> Vec<u8> {
+    let mut p = payload.to_vec();
+    if p.len() < 30 {
+        return p;
+    }
+    let n = u16::from_le_bytes([p[28], p[29]]) as usize;
+    for i in 0..n {
+        let o = 30 + i * 16;
+        if o + 16 > p.len() {
+            break;
+        }
+        if u64::from_le_bytes(p[o..o + 8].try_into().expect("8")) == hash {
+            p[o + 8..o + 16].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    p
+}
+
+/// `with_var`, adding the var when the payload lacks it.
+pub fn with_var_added(payload: &[u8], hash: u64, value: u64) -> Vec<u8> {
+    if payload.len() < 30 || var_raw(payload, hash).is_some() {
+        return with_var(payload, hash, value);
+    }
+    let mut p = payload.to_vec();
+    let n = u16::from_le_bytes([p[28], p[29]]).wrapping_add(1);
+    p[28..30].copy_from_slice(&n.to_le_bytes());
+    p.extend_from_slice(&hash.to_le_bytes());
+    p.extend_from_slice(&value.to_le_bytes());
+    p
+}
+
+/// The cease fire var of entrant `(gen, slot)`: every entrant has its own, and
+/// a client reads only its own entrant's (native sends all of them to everyone,
+/// in the snapshot and as a delta when someone joins or moves). `VAR_HOLD` is
+/// entrant (0, 0)'s. The name differs from `VAR_HOLD`'s only in the generation
+/// and slot digits (`<gen>?<slot>` then 15 more characters), and the hash is
+/// affine in the bytes for names of one length, so H(name) = VAR_HOLD ^
+/// fold0(name ^ name00). Pinned: (0, 1) = 0x79ac0fb75468917e (native-2p-c1,
+/// player 2's join), (2, 4) = 0x9f65696aa4ce186c (netrec-lobby-native-20261118,
+/// mode 0x042d; once thought a per-mode var). Two-digit generations or slots
+/// lengthen the name, which is not known: `None`.
+pub fn entrant_hold_var(generation: u16, slot: usize) -> Option<u64> {
+    if generation > 9 || slot > 9 {
+        return None;
+    }
+    let mut d = [0u8; 18];
+    d[0] = generation as u8;
+    d[2] = slot as u8;
+    let diff = std::str::from_utf8(&d).ok()?;
+    Some(VAR_HOLD ^ rad_protocol::symbol::Symbol::calculate(diff, 0) as u64)
+}
+
 pub fn var_raw(payload: &[u8], hash: u64) -> Option<u64> {
     if payload.len() < 30 {
         return None;
@@ -603,5 +690,27 @@ mod loadout_tests {
         let inst = parse_loadout(&d).expect("parses");
         assert_eq!(inst.items[1].equipped_item, 99);
         assert_eq!(inst.items[0].equipped_item, 12);
+    }
+}
+
+#[cfg(test)]
+mod lobby_hold_tests {
+    use super::*;
+
+    // Native's lobby hold (every lobby capture): 0x6aea99ee00000001 on, 0x6aea99ee00000000 lifted.
+    #[test]
+    fn lobby_hold_carries_natives_version() {
+        assert_eq!(entrant_hold_var(0, 0), Some(VAR_HOLD));
+        assert_eq!(entrant_hold_var(0, 1), Some(0x79ac_0fb7_5468_917e));
+        assert_eq!(entrant_hold_var(0, 2), Some(0xddbc_5ca1_9ab6_2b1c));
+        assert_eq!(entrant_hold_var(0, 9), Some(0xbac1_65a3_3f1e_4608));
+        assert_eq!(entrant_hold_var(2, 4), Some(0x9f65_696a_a4ce_186c));
+        assert_eq!(entrant_hold_var(0, 10), None);
+        assert_eq!(entrant_hold_var(10, 0), None);
+        assert_eq!(LOBBY_HOLD_VERSION | 1, 0x6aea_99ee_0000_0001);
+        let base = &baseline(LEVEL_SOCIAL, 0).expect("lobby baseline")[0];
+        let fixed = with_var(base, VAR_HOLD, LOBBY_HOLD_VERSION | 1);
+        assert_eq!(var_raw(&fixed, VAR_HOLD), Some(0x6aea_99ee_0000_0001));
+        assert_eq!(fixed.len(), base.len());
     }
 }
