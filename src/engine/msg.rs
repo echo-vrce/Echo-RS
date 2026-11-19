@@ -554,18 +554,32 @@ pub fn with_var_added(payload: &[u8], hash: u64, value: u64) -> Vec<u8> {
 /// affine in the bytes for names of one length, so H(name) = VAR_HOLD ^
 /// fold0(name ^ name00). Pinned: (0, 1) = 0x79ac0fb75468917e (native-2p-c1,
 /// player 2's join), (2, 4) = 0x9f65696aa4ce186c (netrec-lobby-native-20261118,
-/// mode 0x042d; once thought a per-mode var). Two-digit generations or slots
-/// lengthen the name, which is not known: `None`.
+/// mode 0x042d; once thought a per-mode var).
+///
+/// Slots 10-19 have a longer name, still unknown, but in it the generation and
+/// the slot's ones digit sit at the same distance from the end. So the same
+/// formula works from entrant (0, 10)'s var, `VAR_HOLD_SLOT10`. Native server
+/// recording netrec-info-20261118 (part_003.zip) pins (0, 10), (0, 11), (1, 10)
+/// and (1, 11): each var first appears in a delta as that entrant joins.
+/// Two-digit generations are unknown: `None`.
 pub fn entrant_hold_var(generation: u16, slot: usize) -> Option<u64> {
-    if generation > 9 || slot > 9 {
+    let base = match slot {
+        0..=9 => VAR_HOLD,
+        10..=19 => VAR_HOLD_SLOT10,
+        _ => return None,
+    };
+    if generation > 9 {
         return None;
     }
     let mut d = [0u8; 18];
     d[0] = generation as u8;
-    d[2] = slot as u8;
+    d[2] = (slot % 10) as u8;
     let diff = std::str::from_utf8(&d).ok()?;
-    Some(VAR_HOLD ^ rad_protocol::symbol::Symbol::calculate(diff, 0) as u64)
+    Some(base ^ rad_protocol::symbol::Symbol::calculate(diff, 0) as u64)
 }
+
+/// Entrant (0, 10)'s cease fire var (see `entrant_hold_var`).
+pub const VAR_HOLD_SLOT10: u64 = 0x1ed1_36b5_f1c0_fc6a;
 
 pub fn var_raw(payload: &[u8], hash: u64) -> Option<u64> {
     if payload.len() < 30 {
@@ -705,7 +719,11 @@ mod lobby_hold_tests {
         assert_eq!(entrant_hold_var(0, 2), Some(0xddbc_5ca1_9ab6_2b1c));
         assert_eq!(entrant_hold_var(0, 9), Some(0xbac1_65a3_3f1e_4608));
         assert_eq!(entrant_hold_var(2, 4), Some(0x9f65_696a_a4ce_186c));
-        assert_eq!(entrant_hold_var(0, 10), None);
+        assert_eq!(entrant_hold_var(0, 10), Some(0x1ed1_36b5_f1c0_fc6a));
+        assert_eq!(entrant_hold_var(0, 11), Some(0x6ef7_9c53_fda3_6e92));
+        assert_eq!(entrant_hold_var(1, 10), Some(0x8137_9f72_0986_0106));
+        assert_eq!(entrant_hold_var(1, 11), Some(0xf111_3594_05e5_93fe));
+        assert_eq!(entrant_hold_var(0, 20), None);
         assert_eq!(entrant_hold_var(10, 0), None);
         assert_eq!(LOBBY_HOLD_VERSION | 1, 0x6aea_99ee_0000_0001);
         let base = &baseline(LEVEL_SOCIAL, 0).expect("lobby baseline")[0];

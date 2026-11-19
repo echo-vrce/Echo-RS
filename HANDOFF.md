@@ -923,3 +923,15 @@ in the brawler room". Don't ask the user for more recordings.
   states are forwarded. Only a goal-ended round/match pins it (`frozen` set by the goal). The next round's walk
   (`Act::NewRound`) takes it back for the server; sudden death's `take_disc` clears it too. (Was: `pin_disc` at every end,
   which froze a thrown disc in mid-air.)
+
+## 2026-11-19: cease fire for slots 10-15 (v0.1.6)
+- Source: the user's native server recording `J:\IDM\part_003.zip`. It is the rest of `captures/netrec-info-20261118`
+  (same session, parts 1-12, up to 108 peers); only parts 0-1 are decoded, which was enough. J: has ~9 GB free,
+  so decode the rest on H: if it's needed.
+- The server's own entrant data (peer -1) shows slots 10 and 11 joining at 213.7 s and 215.5 s. Vars that first
+  appear in a delta at those moments: (0,10) 0x1ed136b5f1c0fc6a, (0,11) 0x6ef79c53fda36e92, and later (1,10)
+  0x81379f7209860106, (1,11) 0xf111359405e593fe (right after (1,9) at 447.0 s).
+- Their XORs show the generation and the ones digit at the same distances from the end as in the 18-character tail.
+  So H(g, 10+s) = VAR_HOLD_SLOT10 ^ fold0([g,0,s,0*15]), whatever the full name is (`msg::entrant_hold_var`, pinned
+  by tests). '?'->'1' (zero-padded tens) and a '1' prefix on the generation were tried and do not fit.
+- Two-digit generations are still unknown (they wrap mod 10).
