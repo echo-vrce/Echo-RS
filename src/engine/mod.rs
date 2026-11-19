@@ -7,6 +7,7 @@
 //! backend connection, so an idle instance costs no CPU. While a session runs
 //! it wakes at 100 Hz for retransmits and at 20 Hz for the server frame.
 
+pub mod announcer;
 pub mod balance;
 pub mod combat;
 pub mod gear;

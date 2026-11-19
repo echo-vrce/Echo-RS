@@ -935,3 +935,17 @@ in the brawler room". Don't ask the user for more recordings.
   So H(g, 10+s) = VAR_HOLD_SLOT10 ^ fold0([g,0,s,0*15]), whatever the full name is (`msg::entrant_hold_var`, pinned
   by tests). '?'->'1' (zero-padded tens) and a '1' prefix on the generation were tried and do not fit.
 - Two-digit generations are still unknown (they wrap mod 10).
+
+## 2026-11-19: native announcer calls for saves, interceptions, steals, goals
+
+- `src/engine/announcer.rs`: the stock `mp_announcer_server_state` (e28785a6428603f9) pick tables, read by emulating
+  each `expression_<id>_name` from the script DLL (unicorn; DLL+PDB from the StreamingScriptWin10 container, symbols
+  via dbghelp). Every send picks one line uniformly at random from its table.
+- Calls are made in `apply_credits` where we count the stat: save at once; interception 0.75 s later from the
+  interceptor's team's table; steal = `steal_sound` at once and the call 0.75 s later. Goal calls now use native's
+  random 2/3-point tables. Checked against netrec-pub-ot-20261119 (cue times vs player and team stat increments).
+- Not done: clears, possession changes, generic interception, post hit, punch, rampage. The engine raises the clear,
+  steal, interception and possession events from one routine around 0x140330000 in FunBuild echovr.exe (refs to the
+  `OlPrEfIxnevt_*` records at 0x142b96d70+); its clear and possession conditions are not decoded.
+- `docs/announcer_lines.md/.csv`: every file in J:\EchoAudio\vo_announcer_arena, now renamed to its cue name
+  (`_rename_map.csv` in that folder maps back to the `<event>_<media>.wav` names).

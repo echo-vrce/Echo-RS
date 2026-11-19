@@ -582,6 +582,33 @@ impl Arena {
         self.schedule.push((frame, act));
     }
 
+    /// The stock announcer's call for a save, interception or steal, as
+    /// `mp_announcer_server_state` answers the engine's event (see
+    /// `announcer`): a save at once; an interception 0.75 s later from the
+    /// interceptor's team's table; a steal's `steal_sound` at once and its
+    /// call 0.75 s later.
+    fn announce_stat(&mut self, stat: Stat, team: u8) {
+        use super::announcer as an;
+        let say = |s| Act::Event(s, MOD_ANNOUNCER, FILTER_ALL_ALT);
+        let later = self.tick + (an::CALL_DELAY_S * frame_hz() as f32).round() as u64;
+        match stat {
+            Stat::Saves => self.soon.push(say(an::pick(&an::SAVE))),
+            Stat::Interceptions => {
+                let table: &[u64] = match team {
+                    TEAM_BLUE => &an::INTERCEPTION_BLUE,
+                    TEAM_ORANGE => &an::INTERCEPTION_ORANGE,
+                    _ => return,
+                };
+                self.at(later, say(an::pick(table)));
+            }
+            Stat::Steals => {
+                self.soon.push(say(an::STEAL_SOUND));
+                self.at(later, say(an::pick(&an::STEAL)));
+            }
+            _ => {}
+        }
+    }
+
     /// Players may take the disc: in play, and in a private match before
     /// Start (the disc is free to play with until the match starts).
     fn disc_free(&self) -> bool {
@@ -837,7 +864,9 @@ impl Arena {
         self.at(g + 1, Act::Flag(VAR_HOLD, 1));
         let celebrate = self.celebration_secs();
         self.at(g + 1, Act::Countdown(celebrate));
-        let call = if points >= 3 { EV_ANNOUNCER_GOAL_3 } else { EV_ANNOUNCER_GOAL_2 };
+        // Native (mp_announcer_server_state, nevt_game_score): one line at
+        // random from the points' table.
+        let call = super::announcer::pick(super::announcer::goal_table(points));
         self.at(g + 1, ev13(call, MOD_ANNOUNCER));
         let c = g + 1 + (celebrate * frame_hz() as f32) as u64;
         self.at(c, Act::State(ST_GOAL[2]));
@@ -2465,6 +2494,8 @@ impl Session {
             if let Some(p) = self.peers.values_mut().find(|p| p.slot == Some(usize::from(slot))) {
                 p.stats.add(stat, 1);
                 debug!(slot, ?stat, total = p.stats.get(stat), "stat");
+                let team = p.team;
+                self.arena.announce_stat(stat, team);
             }
         }
     }
@@ -4681,6 +4712,49 @@ mod arena_end_tests {
         b.end_match(1000);
         assert!(!b.disc_loose && !b.disc_free());
         assert!(b.server_disc);
+    }
+
+    /// Saves, interceptions and steals get native's calls, with its delays
+    /// and the interceptor's team's table (mp_announcer_server_state).
+    #[test]
+    fn stat_calls_follow_the_stock_announcer() {
+        use super::super::announcer as an;
+        let said = |a: &Arena| -> Vec<(u64, u64)> {
+            a.schedule.iter().filter_map(|(t, x)| match x { Act::Event(s, m, _) if *m == MOD_ANNOUNCER => Some((*t, *s)), _ => None }).collect()
+        };
+        let now = |a: &Arena| -> Vec<u64> { a.soon.iter().filter_map(|x| match x { Act::Event(s, m, _) if *m == MOD_ANNOUNCER => Some(*s), _ => None }).collect() };
+        let later = (an::CALL_DELAY_S * frame_hz() as f32).round() as u64;
+        let mut a = Arena::new(1, false);
+        a.tick = 100;
+        a.announce_stat(Stat::Saves, TEAM_BLUE);
+        assert!(an::SAVE.contains(&now(&a)[0]) && a.schedule.is_empty());
+
+        let mut a = Arena::new(1, false);
+        a.tick = 100;
+        a.announce_stat(Stat::Interceptions, TEAM_ORANGE);
+        let s = said(&a);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].0, 100 + later);
+        assert!(an::INTERCEPTION_ORANGE.contains(&s[0].1));
+        a.schedule.clear();
+        for _ in 0..100 {
+            a.announce_stat(Stat::Interceptions, TEAM_BLUE);
+        }
+        assert!(said(&a).iter().all(|(_, c)| an::INTERCEPTION_BLUE.contains(c)));
+        assert!(!said(&a).iter().any(|(_, c)| *c == an::INTERCEPTION_ORANGE[4]), "no red call for blue");
+
+        let mut a = Arena::new(1, false);
+        a.tick = 100;
+        a.announce_stat(Stat::Steals, TEAM_BLUE);
+        assert_eq!(now(&a), vec![an::STEAL_SOUND]);
+        let s = said(&a);
+        assert_eq!(s[0].0, 100 + later);
+        assert!(an::STEAL.contains(&s[0].1));
+
+        let mut a = Arena::new(1, false);
+        a.announce_stat(Stat::Passes, TEAM_BLUE);
+        a.announce_stat(Stat::Interceptions, TEAM_SPECTATOR);
+        assert!(said(&a).is_empty() && now(&a).is_empty());
     }
 
     /// Public, time up tied: native's sudden death (captures/netrec-pub-ot-20261119).
