@@ -29,6 +29,8 @@
  "self_goaling_public": false,
  "self_goaling_private": true,
  "goalie_ping_window": 150.0,
+ "goalie_ping_advantage_public": false,
+ "goalie_ping_advantage_private": false,
  "round_rules": {
   "round_time": 300.0,
   "sudden_death_round_over_time": 5.0,

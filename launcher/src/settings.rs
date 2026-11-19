@@ -52,6 +52,8 @@ struct Part {
     heading: String,
     doc: &'static str,
     path: Vec<String>,
+    /// Only the values whose path passes (None: all of them).
+    only: Option<fn(&[String]) -> bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,7 +137,7 @@ fn gear_items(kind: Kind) -> Vec<Item> {
                 Some(w) => format!("{heading} · {w}"),
                 None => heading.to_string(),
             };
-            let part = Part { heading, doc: WEAPONS, path: vec![table.to_string(), key.clone()] };
+            let part = Part { heading, doc: WEAPONS, path: vec![table.to_string(), key.clone()], only: None };
             match found.iter_mut().find(|(g, ..)| g == gear) {
                 Some((.., parts)) => parts.push(part),
                 None => {
@@ -154,7 +156,36 @@ fn gear_items(kind: Kind) -> Vec<Item> {
 }
 
 fn single(title: &'static str, doc: &'static str, at: &[&str], help: &'static str) -> Section {
-    Section { title, help, tabs: false, items: vec![Item { name: title.to_string(), parts: vec![Part { heading: String::new(), doc, path: at.iter().map(|s| s.to_string()).collect() }] }] }
+    filtered(title, doc, at, help, None)
+}
+
+fn filtered(title: &'static str, doc: &'static str, at: &[&str], help: &'static str, only: Option<fn(&[String]) -> bool>) -> Section {
+    Section {
+        title,
+        help,
+        tabs: false,
+        items: vec![Item { name: title.to_string(), parts: vec![Part { heading: String::new(), doc, path: at.iter().map(|s| s.to_string()).collect(), only }] }],
+    }
+}
+
+/// Which arena matches an `mp_arena_rules` value is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scope {
+    Public,
+    Private,
+    Both,
+}
+
+fn arena_scope(path: &[String]) -> Scope {
+    let Some(k) = path.last().map(String::as_str) else { return Scope::Both };
+    if k.ends_with("_private") || k == "mercy_rule_private_enabled" {
+        return Scope::Private;
+    }
+    let public_round = path.first().is_some_and(|f| f == "round_rules");
+    if public_round || matches!(k, "mercy_win_point_spread" | "self_goaling_public" | "goalie_ping_advantage_public") {
+        return Scope::Public;
+    }
+    Scope::Both
 }
 
 fn sections(game: Game) -> Vec<Section> {
@@ -167,7 +198,21 @@ fn sections(game: Game) -> Vec<Section> {
             single("Movement", "mp_combat_movement", &[], ""),
         ],
         Game::Arena => vec![
-            single("Match rules", "mp_arena_rules", &[], "Public round time, pre-match wait, launch wait, mercy spread and self goals are also followed by this server's match flow."),
+            filtered(
+                "Public matches",
+                "mp_arena_rules",
+                &[],
+                "Public matches only. Round time, pre-match wait, launch wait, mercy spread, self goals, overtime and goalie ping advantage are also followed by this server's match flow.",
+                Some(|p| arena_scope(p) == Scope::Public),
+            ),
+            filtered(
+                "Private matches",
+                "mp_arena_rules",
+                &[],
+                "Private matches only: the values a private match starts with. Players can still change them on the in-game RULES screen.",
+                Some(|p| arena_scope(p) == Scope::Private),
+            ),
+            filtered("Match rules", "mp_arena_rules", &[], "Public and private matches.", Some(|p| arena_scope(p) == Scope::Both)),
             single("Disc & grab", DISC_GRAB, &[], ""),
             single("Movement", "mp_arena_movement", &[], "Also used in the social lobby."),
             single("Punch", "mp_arena_punch", &[], "Also used in the social lobby."),
@@ -179,6 +224,9 @@ fn part_leaves(p: &Part) -> Vec<Leaf> {
     let mut out = Vec::new();
     if let Some(v) = defaults().get(p.doc).and_then(|d| at(d, &p.path)) {
         leaves(p.doc, v, &mut p.path.clone(), "", &mut out);
+    }
+    if let Some(only) = p.only {
+        out.retain(|l| only(&l.path));
     }
     out
 }
@@ -479,6 +527,19 @@ pub fn page(ui: &mut egui::Ui, st: &mut State, changes: &mut Map<String, Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_rules_split_into_public_and_private() {
+        let p = |s: &str| s.split('/').map(String::from).collect::<Vec<_>>();
+        assert_eq!(arena_scope(&p("round_rules/round_time")), Scope::Public);
+        assert_eq!(arena_scope(&p("round_rules/round_time_private")), Scope::Private);
+        assert_eq!(arena_scope(&p("mercy_win_point_spread")), Scope::Public);
+        assert_eq!(arena_scope(&p("mercy_rule_private_enabled")), Scope::Private);
+        assert_eq!(arena_scope(&p("goalie_ping_advantage_public")), Scope::Public);
+        assert_eq!(arena_scope(&p("goalie_ping_advantage_private")), Scope::Private);
+        assert_eq!(arena_scope(&p("goalie_ping_window")), Scope::Both);
+        assert_eq!(arena_scope(&p("team_0_color_active/r")), Scope::Both);
+    }
 
     #[test]
     fn defaults_parse_and_every_section_has_values() {

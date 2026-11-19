@@ -27,6 +27,16 @@ use tracing::{info, warn};
 
 static CHANGES: OnceLock<Map<String, Value>> = OnceLock::new();
 static BASE: OnceLock<Base> = OnceLock::new();
+static SERVER_ARENA: OnceLock<Map<String, Value>> = OnceLock::new();
+
+/// `mp_arena_rules` values only this server has (the launcher's Settings page
+/// shows them with the game's): kept out of what clients get.
+pub const SERVER_ARENA_KEYS: [&str; 2] = ["goalie_ping_advantage_public", "goalie_ping_advantage_private"];
+
+/// One of `SERVER_ARENA_KEYS` as the host set it.
+pub fn server_arena_flag(key: &str) -> Option<bool> {
+    SERVER_ARENA.get()?.get(key)?.as_bool()
+}
 
 pub(crate) const ECHOCOMBAT_WEAPONS: &str = include_str!("data/mp_weapon_settings_echocombat.json");
 /// The gear list a native H server with EchoCombat sends (its social lobby, 2026-11-16):
@@ -48,9 +58,18 @@ pub fn set_base(base: Base) {
 /// Loads the host's changes; call once at startup, before any session.
 pub fn load(path: &std::path::Path) -> Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let Value::Object(changes) = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))? else {
+    let Value::Object(mut changes) = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))? else {
         bail!("{} is not a JSON object", path.display());
     };
+    let mut server = Map::new();
+    if let Some(Value::Object(rules)) = changes.get_mut("mp_arena_rules") {
+        for k in SERVER_ARENA_KEYS {
+            if let Some(v) = rules.remove(k) {
+                server.insert(k.to_string(), v);
+            }
+        }
+    }
+    let _ = SERVER_ARENA.set(server);
     let n = count_leaves(&Value::Object(changes.clone()));
     let _ = CHANGES.set(changes);
     info!(file = %path.display(), values = n, "balance changes loaded");
@@ -222,11 +241,16 @@ pub struct ArenaPublic {
     pub sd_regulation_over_secs: f32,
     /// From a scoreless overtime round's end to the next (`sudden_death_round_over_time`, 5 s).
     pub sd_round_over_secs: f32,
+    /// Goalie ping advantage in public matches (this server's
+    /// `goalie_ping_advantage_public`, off unless the host turns it on).
+    pub goalie_advantage: bool,
+    /// Its window (`goalie_ping_window`, 150 ms), for public and private matches.
+    pub goalie_window_ms: f32,
 }
 
 impl Default for ArenaPublic {
     fn default() -> Self {
-        Self { round_secs: 300.0, pre_match_secs: 45.0, launch_secs: 15.0, mercy_margin: 12, self_goals: false, sudden_death: true, sd_round_secs: 120.0, sd_regulation_over_secs: 0.0, sd_round_over_secs: 5.0 }
+        Self { round_secs: 300.0, pre_match_secs: 45.0, launch_secs: 15.0, mercy_margin: 12, self_goals: false, sudden_death: true, sd_round_secs: 120.0, sd_regulation_over_secs: 0.0, sd_round_over_secs: 5.0, goalie_advantage: false, goalie_window_ms: 150.0 }
     }
 }
 
@@ -245,6 +269,8 @@ impl ArenaPublic {
             sd_round_secs: f(&rr, "sudden_death_round_time", d.sd_round_secs, 10.0),
             sd_regulation_over_secs: f(&rr, "sudden_death_regulation_over_time", d.sd_regulation_over_secs, 0.0),
             sd_round_over_secs: f(&rr, "sudden_death_round_over_time", d.sd_round_over_secs, 0.0),
+            goalie_advantage: server_arena_flag("goalie_ping_advantage_public").unwrap_or(d.goalie_advantage),
+            goalie_window_ms: f(r, "goalie_ping_window", d.goalie_window_ms, 0.0),
         }
     }
 }

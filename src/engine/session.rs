@@ -294,6 +294,9 @@ struct TouchEntry {
 // the client drops any frame not above the last one it saw. The frame word
 // ticks at the frame rate (at least 120 Hz) and the client's own match timers
 // (the tube countdown, the doors) run on this clock.
+/// Goalie ping advantage: how far out from their goal's plane a defender's
+/// grab counts as the goalie's (mm).
+const GOALIE_ZONE_MM: i32 = 5_000;
 /// Echo ages kept per player for the ping estimate (native keeps 450).
 const ECHO_SAMPLES: usize = 450;
 
@@ -436,6 +439,10 @@ struct Arena {
     disc_live: bool,
     /// Last trusted disc position, for the goal-plane crossing.
     last_disc: Option<(i32, i32, i32)>,
+    /// The disc's last reported position, in play too (mm: x, y, depth).
+    disc_at: Option<[i32; 3]>,
+    /// When the disc's current holder was granted it.
+    granted_at: Instant,
     /// Where the disc stopped in the goal; the server holds it there until
     /// the relaunch park.
     frozen: Option<(i32, i32, i32)>,
@@ -519,9 +526,9 @@ struct Arena {
 
 impl Arena {
     fn new(min_per_team: usize, private: bool) -> Self {
-        let rules = Rules::default();
+        let rules = if private { super::msg::arena_private_rules() } else { Rules::default() };
         let clock = if private { rules.round_secs() } else { round_secs() };
-        Self {
+        let mut a = Self {
             phase: Phase::Waiting,
             state: ST_PRE_MATCH,
             blue: 0,
@@ -575,7 +582,21 @@ impl Arena {
             disc_loose: false,
             rounds_played: 0,
             goal_touch: [false; 2],
+            disc_at: None,
+            granted_at: Instant::now(),
+        };
+        if private {
+            // The host's private values: published like a RULES screen change.
+            for (i, r) in RULES.iter().enumerate() {
+                if a.rules.v[i] != r.default {
+                    a.set_var1(r.var, a.rules.s1_value(i));
+                    for (h, v) in a.rules.s0_values(i) {
+                        a.set_var(h, v);
+                    }
+                }
+            }
         }
+        a
     }
 
     fn at(&mut self, frame: u64, act: Act) {
@@ -1346,6 +1367,50 @@ fn combat_for(level: u64) -> Option<super::combat::Combat> {
 
 fn u16_at(p: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([p[o], p[o + 1]])
+}
+
+/// One entry of `SR15NetTopAwardsMsg`.
+struct AwardPick {
+    id: u64,
+    stat: u64,
+    value: u64,
+    slot: usize,
+    handle: u32,
+    team: u16,
+    name: Vec<u8>,
+}
+
+/// `SR15NetTopAwardsMsg`: `[count u8]`, then arrays of `count`: award ids,
+/// stat hashes, values (u64 each), slots (u64), handles (u32), teams (u16),
+/// names (32 bytes), and a u16 each.
+fn top_awards_msg(picks: &[AwardPick]) -> Vec<u8> {
+    let mut m = vec![picks.len() as u8];
+    for p in picks {
+        m.extend_from_slice(&p.id.to_le_bytes());
+    }
+    for p in picks {
+        m.extend_from_slice(&p.stat.to_le_bytes());
+    }
+    for p in picks {
+        m.extend_from_slice(&p.value.to_le_bytes());
+    }
+    for p in picks {
+        m.extend_from_slice(&(p.slot as u64).to_le_bytes());
+    }
+    for p in picks {
+        m.extend_from_slice(&p.handle.to_le_bytes());
+    }
+    for p in picks {
+        m.extend_from_slice(&p.team.to_le_bytes());
+    }
+    for p in picks {
+        let mut n = [0u8; 32];
+        let k = p.name.len().min(31);
+        n[..k].copy_from_slice(&p.name[..k]);
+        m.extend_from_slice(&n);
+    }
+    m.extend(std::iter::repeat_n(0u8, 2 * picks.len()));
+    m
 }
 
 impl Session {
@@ -2165,6 +2230,7 @@ impl Session {
         // owned by a ghost: nobody's view of the owner or stamp could ever
         // match again. The server takes it back for whoever asks next.
         let owner_gone = e.owner != u32::MAX && !self.handle_present(e.owner);
+        let goalie = self.arena_level && !release && !locked && new_owner == sender && self.goalie_wins(from, e.owner);
         let grant = target_ok
             && !locked
             && if release {
@@ -2179,6 +2245,9 @@ impl Session {
                 // then still named the thrower, and everyone else, who
                 // rightly believed nobody owned it, was declined until the
                 // thrower touched it again. Only something in a hand is kept.
+                true
+            } else if goalie {
+                info!(%from, owner = e.owner, "goalie ping advantage: the defender's grab wins");
                 true
             } else if believed == u32::MAX {
                 e.owner == u32::MAX && (self.arena_level || (e.generation & 0xf) != 0xf)
@@ -2211,6 +2280,9 @@ impl Session {
                 (ent.generation + 1) % 15
             };
             if self.arena_level && !release {
+                if self.arena.granted != new_owner {
+                    self.arena.granted_at = Instant::now();
+                }
                 self.arena.granted = new_owner;
                 self.arena.disc_heard = Instant::now();
                 self.arena.disc_touch = Some((object, entry_id, actor.try_into().expect("8 bytes")));
@@ -2302,6 +2374,36 @@ impl Session {
         true
     }
 
+    /// Goalie ping advantage (private: the RULES screen's GOALIE PING ADV;
+    /// public: the host's `goalie_ping_advantage_public`): a defender
+    /// grabbing the disc within `GOALIE_ZONE_MM` of their own goal wins over
+    /// an opponent the server granted it less than the defender's round trip
+    /// ago (at most `goalie_ping_window`): the defender could not have seen
+    /// that grab yet when they made theirs.
+    fn goalie_wins(&self, from: SocketAddr, owner: u32) -> bool {
+        let on = if self.arena.private { self.arena.rules.goalie_ping_advantage() } else { msg::arena_public().goalie_advantage };
+        if !on || owner == u32::MAX {
+            return false;
+        }
+        let Some(me) = self.peers.get(&from) else { return false };
+        if !matches!(me.team, TEAM_BLUE | TEAM_ORANGE) {
+            return false;
+        }
+        let owner_team = self.slot_addr.get((owner & 0xffff) as usize).copied().flatten().and_then(|a| self.peers.get(&a)).map(|p| p.team);
+        if owner_team.is_none_or(|t| t == me.team || !matches!(t, TEAM_BLUE | TEAM_ORANGE)) {
+            return false;
+        }
+        let Some([_, _, depth]) = self.arena.disc_at else { return false };
+        // Blue defends the goal at -z, orange the one at +z.
+        let toward_own = if me.team == TEAM_BLUE { -depth } else { depth };
+        if toward_own < super::stats::GOAL_DEPTH - GOALIE_ZONE_MM {
+            return false;
+        }
+        let window_us = (msg::arena_public().goalie_window_ms.max(0.0) * 1000.0) as u128;
+        let rtt_us = me.rtt_us().map_or(0, u128::from);
+        self.arena.granted_at.elapsed().as_micros() < rtt_us.min(window_us)
+    }
+
     /// A player handle (`gen << 16 | slot`) still names a joined player.
     fn handle_present(&self, h: u32) -> bool {
         let slot = (h & 0xffff) as usize;
@@ -2311,6 +2413,7 @@ impl Session {
 
     fn observe_disc(&mut self, from: SocketAddr, d: &[u8]) {
         let Some((owner, x, y, depth)) = msg::disc_transform(d) else { return };
+        self.arena.disc_at = Some([x, y, depth]);
         if let Some(p) = self.peers.get_mut(&from) {
             p.disc_seen += 1;
             p.disc_max_depth = p.disc_max_depth.max(depth.abs());
@@ -3605,20 +3708,36 @@ impl Session {
             .filter(|p| winner.is_none() || won(p))
             .max_by_key(|p| (p.s.score(), std::cmp::Reverse(p.slot)))
             .map(|p| p.slot);
+        // Native (four recorded matches): the MVP, then up to three stat
+        // awards in this order, each to the best player without an award
+        // yet (medic and tank, for healing and damage absorbed, are not
+        // counted by this server).
+        let mut picks: Vec<AwardPick> = Vec::new();
+        let pick = |p: &P, id: u64, stat: u64, value: u64| AwardPick { id, stat, value, slot: p.slot, handle: p.handle, team: u16::from(p.team == TEAM_ORANGE), name: p.name.clone() };
         if let Some(m) = mvp.and_then(|s| players.iter().find(|p| p.slot == s)) {
-            let mut b = vec![1u8];
-            b.extend_from_slice(&AWARD_MVP_ID.to_le_bytes());
-            b.extend_from_slice(&AWARD_MVP_STAT.to_le_bytes());
-            b.extend_from_slice(&m.s.score().max(1).to_le_bytes());
-            b.extend_from_slice(&(m.slot as u64).to_le_bytes());
-            b.extend_from_slice(&m.handle.to_le_bytes());
-            b.extend_from_slice(&u16::from(m.team == TEAM_ORANGE).to_le_bytes());
-            let mut n = [0u8; 32];
-            let k = m.name.len().min(31);
-            n[..k].copy_from_slice(&m.name[..k]);
-            b.extend_from_slice(&n);
-            b.extend_from_slice(&[0, 0]);
-            info!(mvp = %String::from_utf8_lossy(&m.name), "combat top awards");
+            picks.push(pick(m, AWARD_MVP_ID, AWARD_MVP_STAT, u64::from(m.s.score().max(1))));
+        }
+        let stat_awards: [(&str, &str, fn(&CombatStats) -> f32); 4] = [
+            ("guard", "CombatObjectiveTime", |s| s.objective_time),
+            ("defender", "CombatObjectiveEliminations", |s| s.objective_eliminations as f32),
+            ("specialist", "CombatAssists", |s| s.assists as f32),
+            ("cannoneer", "CombatDamage", |s| s.damage),
+        ];
+        for (award, stat, get) in stat_awards {
+            if picks.len() >= TOP_AWARDS_MAX {
+                break;
+            }
+            let best = players
+                .iter()
+                .filter(|p| get(&p.s) > 0.0 && picks.iter().all(|k| k.slot != p.slot))
+                .max_by(|a, b| get(&a.s).total_cmp(&get(&b.s)).then(b.slot.cmp(&a.slot)));
+            if let Some(p) = best {
+                picks.push(pick(p, crate::sns::symbol(award), crate::sns::symbol(stat), get(&p.s).round() as u64));
+            }
+        }
+        if !picks.is_empty() {
+            let b = top_awards_msg(&picks);
+            info!(mvp = %String::from_utf8_lossy(&picks[0].name), awards = picks.len(), "combat top awards");
             for a in self.joined() {
                 self.reliable_to(a, TOP_AWARDS, &b);
             }
@@ -3759,15 +3878,7 @@ impl Session {
     /// Native sends four (MVP and three stat awards); ours sent only the MVP
     /// and the end-of-match board showed only that. Then the tier rewards.
     fn send_top_awards(&mut self) {
-        struct Pick {
-            id: u64,
-            stat: u64,
-            value: u64,
-            slot: usize,
-            handle: u32,
-            team: u16,
-            name: Vec<u8>,
-        }
+        type Pick = AwardPick;
         let players: Vec<(usize, u32, u16, Vec<u8>, Stats)> = self
             .peers
             .values()
@@ -3791,7 +3902,7 @@ impl Session {
         if let Some(p) = players.iter().max_by_key(|p| (p.4.get(Stat::Points), p.4.get(Stat::PossessionTime))) {
             picks.push(Pick { id: AWARD_MVP_ID, stat: AWARD_MVP_STAT, value: u64::from(p.4.get(Stat::Points).max(1)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
         }
-        for (id, s) in [(AWARD_GOALS_ID, Stat::Goals), (AWARD_PASSES_ID, Stat::Passes), (AWARD_CATCHES_ID, Stat::Catches)] {
+        for (id, s) in [(AWARD_GOALS_ID, Stat::Goals), (AWARD_PASSES_ID, Stat::Passes), (AWARD_BRUISER_ID, Stat::Stuns), (AWARD_CATCHES_ID, Stat::Catches)] {
             let best = players.iter().filter(|p| p.4.get(s) > 0 && picks.iter().all(|k| k.slot != p.0)).max_by_key(|p| (p.4.get(s), p.4.get(Stat::Points)));
             if let Some(p) = best {
                 picks.push(Pick { id, stat: TEAM_STATS[s as usize], value: u64::from(p.4.get(s)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
@@ -3801,32 +3912,7 @@ impl Session {
         if picks.is_empty() {
             return;
         }
-        let mut m = vec![picks.len() as u8];
-        for p in &picks {
-            m.extend_from_slice(&p.id.to_le_bytes());
-        }
-        for p in &picks {
-            m.extend_from_slice(&p.stat.to_le_bytes());
-        }
-        for p in &picks {
-            m.extend_from_slice(&p.value.to_le_bytes());
-        }
-        for p in &picks {
-            m.extend_from_slice(&(p.slot as u64).to_le_bytes());
-        }
-        for p in &picks {
-            m.extend_from_slice(&p.handle.to_le_bytes());
-        }
-        for p in &picks {
-            m.extend_from_slice(&p.team.to_le_bytes());
-        }
-        for p in &picks {
-            let mut n = [0u8; 32];
-            let k = p.name.len().min(31);
-            n[..k].copy_from_slice(&p.name[..k]);
-            m.extend_from_slice(&n);
-        }
-        m.extend(std::iter::repeat_n(0u8, 2 * picks.len()));
+        let m = top_awards_msg(&picks);
         info!(mvp = %String::from_utf8_lossy(&picks[0].name), awards = picks.len(), "top awards");
         for a in self.joined() {
             self.reliable_to(a, TOP_AWARDS, &m);

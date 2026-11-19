@@ -49,6 +49,10 @@ pub const VAR_ROUND_TIME: u64 = 0x5b74_8a2b_4792_dd2d;
 /// s0 latch native sets the first time the disc spawn rule is changed.
 pub const VAR_SPAWN_CHANGED: u64 = 0xd389_fa29_81d5_124c;
 pub const ROW_START_COUNT: usize = 10;
+/// "GOALIE PING ADV" (row 1.1, default off).
+pub const ROW_GOALIE_PING: usize = 5;
+/// "ROUND COUNT" (row 2.0, default 3).
+pub const ROW_ROUND_COUNT: usize = 8;
 /// `net_catapult_time`: the launch-tube count.
 pub const ROW_CATAPULT_TIME: usize = 7;
 /// `net_self_goaling`: own goals count.
@@ -160,6 +164,40 @@ pub fn parse_press(d: &[u8]) -> Option<(u32, u32)> {
 }
 
 impl Rules {
+    /// A private match's starting rules: the stock RULES screen with the
+    /// host's `mp_arena_rules` private values (`round_time_private` and the
+    /// rest; the stock ones are the screen's own defaults) and this server's
+    /// `goalie_ping_advantage_private`.
+    pub fn from_private(r: &serde_json::Value, goalie: Option<bool>) -> Self {
+        let mut rules = Self::default();
+        let rr = r.get("round_rules");
+        let num = |v: Option<&serde_json::Value>| v.and_then(serde_json::Value::as_f64);
+        let round = |k: &str| num(rr.and_then(|x| x.get(k)));
+        if let Some(t) = round("round_time_private") {
+            let t = t.max(0.0).round() as i32;
+            rules.set(0, t / 60);
+            rules.set(1, t % 60);
+        }
+        for (k, row) in [("round_count_private", ROW_ROUND_COUNT), ("rounds_played_private", ROW_ROUNDS_PLAYED), ("team_room_wait_time_private", ROW_START_COUNT), ("wait_for_launch_time_private", ROW_CATAPULT_TIME)] {
+            if let Some(v) = round(k) {
+                rules.set(row, v.round() as i32);
+            }
+        }
+        if let Some(v) = num(r.get("mercy_win_point_spread_private")) {
+            rules.set(ROW_MERCY_MARGIN, v.round() as i32);
+        }
+        for (v, row) in [(r.get("mercy_rule_private_enabled").and_then(serde_json::Value::as_bool), ROW_MERCY_ON), (r.get("self_goaling_private").and_then(serde_json::Value::as_bool), ROW_SELF_GOALING), (goalie, ROW_GOALIE_PING)] {
+            if let Some(on) = v {
+                rules.set(row, i32::from(on));
+            }
+        }
+        rules
+    }
+
+    pub fn goalie_ping_advantage(&self) -> bool {
+        self.v[ROW_GOALIE_PING] != 0
+    }
+
     pub fn index(page: u32, row: u32) -> Option<usize> {
         RULES.iter().position(|r| r.page == page && r.row == row)
     }
@@ -257,6 +295,32 @@ pub fn disc_spawn(setting: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private match starts from the host's private values; the stock
+    /// ones are the RULES screen's own defaults.
+    #[test]
+    fn private_rules_follow_the_private_settings() {
+        let stock: serde_json::Value = serde_json::from_str(
+            r#"{"mercy_win_point_spread_private":20,"mercy_rule_private_enabled":true,"self_goaling_private":true,
+            "round_rules":{"round_count_private":3,"round_time_private":600.0,"rounds_played_private":1,
+            "team_room_wait_time_private":59.0,"wait_for_launch_time_private":12.0}}"#,
+        )
+        .expect("json");
+        assert_eq!(Rules::from_private(&stock, None).v, Rules::default().v);
+        let host: serde_json::Value = serde_json::from_str(
+            r#"{"mercy_win_point_spread_private":8,"mercy_rule_private_enabled":false,"self_goaling_private":false,
+            "round_rules":{"round_count_private":5,"round_time_private":330.0,"wait_for_launch_time_private":5.0}}"#,
+        )
+        .expect("json");
+        let r = Rules::from_private(&host, Some(true));
+        assert_eq!(r.round_secs(), 330.0);
+        assert_eq!(r.v[ROW_ROUND_COUNT], 5);
+        assert_eq!(r.catapult_secs(), 5.0);
+        assert_eq!(r.mercy_margin(), None);
+        assert_eq!(r.v[ROW_MERCY_MARGIN], 8);
+        assert!(!r.self_goaling());
+        assert!(r.goalie_ping_advantage());
+    }
 
     #[test]
     fn ints_clamp_and_bools_toggle() {

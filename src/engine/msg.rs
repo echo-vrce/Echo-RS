@@ -115,6 +115,8 @@ pub const AWARD_MVP_STAT: u64 = 0xe32d_c7c9_da80_56b5;
 pub const AWARD_GOALS_ID: u64 = 0x4303_0e90_92f3_c421;
 pub const AWARD_PASSES_ID: u64 = 0x4fce_de87_b2b2_913b;
 pub const AWARD_CATCHES_ID: u64 = 0xdafa_9a46_0fe1_0167;
+/// `bruiser`: the arena's stuns award.
+pub const AWARD_BRUISER_ID: u64 = 0x2fd5_9d8a_5767_5298;
 pub const TOP_AWARDS_MAX: usize = 4;
 /// `SR15NetTierRewardMsg` `[stat u64][tier u64][slot u64][xp u64]`, to the
 /// player only (native: gold/silver/bronze in Goals, Assists, Saves).
@@ -488,6 +490,21 @@ pub fn arena_public() -> super::balance::ArenaPublic {
     })
 }
 
+/// A private match's starting rules, from the `mp_arena_rules` clients get.
+pub fn arena_private_rules() -> super::rules::Rules {
+    static R: std::sync::OnceLock<super::rules::Rules> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let goalie = super::balance::server_arena_flag("goalie_ping_advantage_private");
+        captured()
+            .balance
+            .iter()
+            .find(|(l, _)| *l == LEVEL_ARENA)
+            .and_then(|(_, b)| super::balance::document(b, "mp_arena_rules"))
+            .map_or_else(super::rules::Rules::default, |r| super::rules::Rules::from_private(&r, goalie))
+    })
+    .clone()
+}
+
 fn private_arena(level: u64, mode: u64) -> bool {
     level == LEVEL_ARENA && mode == MODE_ARENA_PRIVATE
 }
@@ -684,6 +701,13 @@ pub fn equip_in_loadout(d: &mut [u8], slot_type: u64, item: u64) -> bool {
 #[cfg(test)]
 mod loadout_tests {
     use super::*;
+
+    #[test]
+    fn award_ids_are_the_games_names() {
+        for (name, id) in [("mvp", AWARD_MVP_ID), ("unstoppable", AWARD_GOALS_ID), ("eagle_eye", AWARD_PASSES_ID), ("quick_reflexes", AWARD_CATCHES_ID), ("bruiser", AWARD_BRUISER_ID)] {
+            assert_eq!(crate::sns::symbol(name), id, "{name}");
+        }
+    }
 
     #[test]
     fn equip_symbols_match_the_capture() {

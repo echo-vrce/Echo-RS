@@ -1,6 +1,6 @@
 [package]
 name = "echo-rust-server"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Standalone, all-Rust Echo VR server: login/config/matching services plus its own game-server engine. No Echo VR install needed."
 license = "MIT"
