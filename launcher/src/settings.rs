@@ -182,7 +182,7 @@ fn arena_scope(path: &[String]) -> Scope {
         return Scope::Private;
     }
     let public_round = path.first().is_some_and(|f| f == "round_rules");
-    if public_round || matches!(k, "mercy_win_point_spread" | "self_goaling_public" | "goalie_ping_advantage_public") {
+    if public_round || matches!(k, "mercy_win_point_spread" | "self_goaling_public" | "goalie_ping_advantage_public" | "team_only_voice_public") {
         return Scope::Public;
     }
     Scope::Both
@@ -537,6 +537,8 @@ mod tests {
         assert_eq!(arena_scope(&p("mercy_rule_private_enabled")), Scope::Private);
         assert_eq!(arena_scope(&p("goalie_ping_advantage_public")), Scope::Public);
         assert_eq!(arena_scope(&p("goalie_ping_advantage_private")), Scope::Private);
+        assert_eq!(arena_scope(&p("team_only_voice_public")), Scope::Public);
+        assert_eq!(arena_scope(&p("team_only_voice_private")), Scope::Private);
         assert_eq!(arena_scope(&p("goalie_ping_window")), Scope::Both);
         assert_eq!(arena_scope(&p("team_0_color_active/r")), Scope::Both);
     }

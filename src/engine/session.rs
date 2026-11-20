@@ -159,6 +159,8 @@ struct Peer {
     seen_types: HashMap<(u64, bool, usize, u32), u32>,
     /// Running match totals (native sends totals, never deltas).
     stats: Stats,
+    /// Arena counts only the awards use.
+    extra: super::stats::ArenaExtra,
     /// Combat match totals.
     cstats: CombatStats,
     /// A hand on the payload (the client's touch state).
@@ -230,6 +232,7 @@ impl Peer {
             rep_seq: 0,
             ping_token: 0,
             stats: Stats::default(),
+            extra: super::stats::ArenaExtra::default(),
             cstats: CombatStats::default(),
             on_payload: false,
             last_stun: None,
@@ -323,6 +326,8 @@ const EV_SD_ENTER: u64 = 0xe283_ccf7_d47e_142b;
 const EV_SD_CALLED: u64 = 0x0ae9_dc18_2d5a_c591;
 /// Native sits in sudden_death_new_round this long before the team-room walk.
 const SD_NEW_ROUND_SECS: f32 = 5.0;
+/// From a public match's return to lobby to the session's end.
+const PUBLIC_END_GRACE: Duration = Duration::from_secs(5);
 
 /// How far the server's disc timestamp runs ahead of session time (the
 /// clients' clocks start within a few seconds of it).
@@ -437,6 +442,8 @@ struct Arena {
     server_disc: bool,
     /// After the launch: the disc state word's high nibble reads 2.
     disc_live: bool,
+    /// The disc was just launched: the first grab wins the joust.
+    joust_open: bool,
     /// Last trusted disc position, for the goal-plane crossing.
     last_disc: Option<(i32, i32, i32)>,
     /// The disc's last reported position, in play too (mm: x, y, depth).
@@ -505,6 +512,14 @@ struct Arena {
     pre_pause_flags: Vec<(u64, u8)>,
     /// Acts for the next frame, run even while paused.
     soon: Vec<Act>,
+    /// Our own announcer calls (`announcer`): the next goal's call, when a
+    /// shot's call is due unless something else happened first, the last
+    /// call's frame, recent stuns and the end of a rampage's quiet.
+    next_goal_call: Option<u64>,
+    shot_due: Option<u64>,
+    last_call: u64,
+    stun_frames: VecDeque<u64>,
+    rampage_until: u64,
     /// Team requests from the terminal: [blue, orange].
     ready: [bool; 2],
     restart_req: [bool; 2],
@@ -574,6 +589,11 @@ impl Arena {
             resume: 0.0,
             pre_pause_flags: Vec::new(),
             soon: Vec::new(),
+            next_goal_call: None,
+            shot_due: None,
+            last_call: 0,
+            stun_frames: VecDeque::new(),
+            rampage_until: 0,
             ready: [false; 2],
             restart_req: [false; 2],
             round_live: false,
@@ -584,6 +604,7 @@ impl Arena {
             goal_touch: [false; 2],
             disc_at: None,
             granted_at: Instant::now(),
+            joust_open: false,
         };
         if private {
             // The host's private values: published like a RULES screen change.
@@ -612,8 +633,15 @@ impl Arena {
         use super::announcer as an;
         let say = |s| Act::Event(s, MOD_ANNOUNCER, FILTER_ALL_ALT);
         let later = self.tick + (an::CALL_DELAY_S * frame_hz() as f32).round() as u64;
+        if matches!(stat, Stat::Saves | Stat::Interceptions | Stat::Steals | Stat::Passes) {
+            self.shot_due = None; // the shot's flight ended in someone's hands
+        }
+        if stat != Stat::ShotsOnGoal && stat != Stat::Catches {
+            self.last_call = self.tick;
+        }
         match stat {
-            Stat::Saves => self.soon.push(say(an::pick(&an::SAVE))),
+            Stat::ShotsOnGoal => self.shot_due = Some(self.tick + (an::SHOT_WAIT_S * frame_hz() as f32) as u64),
+            Stat::Saves => self.soon.push(say(an::save())),
             Stat::Interceptions => {
                 let table: &[u64] = match team {
                     TEAM_BLUE => &an::INTERCEPTION_BLUE,
@@ -627,6 +655,44 @@ impl Arena {
                 self.at(later, say(an::pick(&an::STEAL)));
             }
             _ => {}
+        }
+    }
+
+    /// A call that gives way to the others (clears, possession, misses,
+    /// jousts, punches): none within `MINOR_GAP_S` of another, and only in
+    /// play.
+    fn minor_call(&mut self, delay_s: f32, call: u64) {
+        let gap = (super::announcer::MINOR_GAP_S * frame_hz() as f32) as u64;
+        if self.phase != Phase::Playing || (self.last_call > 0 && self.tick < self.last_call + gap) {
+            return;
+        }
+        self.last_call = self.tick;
+        let at = self.tick + (delay_s * frame_hz() as f32).round() as u64;
+        self.at(at, Act::Event(call, MOD_ANNOUNCER, FILTER_ALL_ALT));
+    }
+
+    /// A stun: a punch call, or a rampage call once
+    /// `RAMPAGE_STUNS` land within `RAMPAGE_WINDOW_S` (then quiet for
+    /// `RAMPAGE_COOLDOWN_S`).
+    fn announce_stun(&mut self) {
+        use super::announcer as an;
+        let hz = frame_hz() as f32;
+        let t = self.tick;
+        let window = (an::RAMPAGE_WINDOW_S * hz) as u64;
+        self.stun_frames.push_back(t);
+        while self.stun_frames.front().is_some_and(|&s| s + window < t) {
+            self.stun_frames.pop_front();
+        }
+        if t < self.rampage_until {
+            return;
+        }
+        if self.stun_frames.len() >= an::RAMPAGE_STUNS && self.phase == Phase::Playing {
+            self.stun_frames.clear();
+            self.rampage_until = t + (an::RAMPAGE_COOLDOWN_S * hz) as u64;
+            self.last_call = t;
+            self.at(t + (an::PUNCH_DELAY_S * hz).round() as u64, Act::Event(an::pick_cue(&[&an::RAMPAGE]), MOD_ANNOUNCER, FILTER_ALL_ALT));
+        } else {
+            self.minor_call(an::PUNCH_DELAY_S, an::pick_cue(&[&an::PUNCH]));
         }
     }
 
@@ -887,7 +953,9 @@ impl Arena {
         self.at(g + 1, Act::Countdown(celebrate));
         // Native (mp_announcer_server_state, nevt_game_score): one line at
         // random from the points' table.
-        let call = super::announcer::pick(super::announcer::goal_table(points));
+        let call = self.next_goal_call.take().unwrap_or_else(|| super::announcer::pick(super::announcer::goal_table(points)));
+        self.shot_due = None;
+        self.last_call = g;
         self.at(g + 1, ev13(call, MOD_ANNOUNCER));
         let c = g + 1 + (celebrate * frame_hz() as f32) as u64;
         self.at(c, Act::State(ST_GOAL[2]));
@@ -916,6 +984,12 @@ impl Arena {
     /// private match it is the respawn time rule.
     fn celebration_secs(&self) -> f32 {
         if self.private { self.rules.respawn_secs().max(1.0) } else { launch_secs() }
+    }
+
+    /// The round counter var (the HUD shows it + 1): the rounds played, or in
+    /// public overtime the overtime round (it stayed 0, so OT 2 read OT 1).
+    fn round_counter(&self) -> u32 {
+        if self.overtime && !self.private { self.ot_rounds.saturating_sub(1) } else { self.rounds_played }
     }
 
     /// Frame a goal scheduled at `g` hands over to the team-room walk.
@@ -1182,6 +1256,8 @@ pub struct Session {
     combat_sent: HashMap<u64, u64>,
     /// Seconds since the last combat stat update.
     combat_stat_clock: f32,
+    /// The capture point's holder last tick (for capture credits).
+    cap_owner: Option<u8>,
     /// Who hurt whom lately (assists): victim -> (attacker, when).
     recent_hits: HashMap<SocketAddr, Vec<(SocketAddr, Instant)>>,
     /// Component handles from the IdsResponse this session sends.
@@ -1225,6 +1301,10 @@ pub struct Session {
     pub udp_out: Vec<(SocketAddr, Vec<u8>)>,
     pub last_activity: Instant,
     pub ever_joined: bool,
+    /// A public match over and everyone sent back to the lobby: the session
+    /// ends at this time whoever is still here, so the server goes idle and
+    /// nobody (a `-lobbyid` join, the matchmaker) lands in the finished game.
+    close_at: Option<Instant>,
     /// Entrants the backend server-muted (atlas's /mute-player): their voice
     /// is not relayed to anyone. Kept by entrant, so a mute can arrive before
     /// the player's connection does; a rejoin gets a new entrant id, and the
@@ -1380,6 +1460,29 @@ struct AwardPick {
     name: Vec<u8>,
 }
 
+/// An arena award's stat (`awards::ARENA`) for one player.
+fn arena_award_value(s: &Stats, x: &super::stats::ArenaExtra, stat: &str, hz: f32) -> f32 {
+    match stat {
+        "stuns" => s.get(Stat::Stuns) as f32,
+        "steals" => s.get(Stat::Steals) as f32,
+        "assists" => s.get(Stat::Assists) as f32,
+        "saves" => s.get(Stat::Saves) as f32,
+        "shotsongoal" => s.get(Stat::ShotsOnGoal) as f32,
+        "goals" => s.get(Stat::Goals) as f32,
+        "passes" => s.get(Stat::Passes) as f32,
+        "catches" => s.get(Stat::Catches) as f32,
+        "interceptions" => s.get(Stat::Interceptions) as f32,
+        "threepointgoals" => x.three_point_goals as f32,
+        "onepointgoals" => x.dunks as f32,
+        "bouncegoals" => x.bounce_goals as f32,
+        "hattricks" => x.hat_tricks as f32,
+        "clears" => x.clears as f32,
+        "joustswon" => x.jousts_won as f32,
+        "longestpossession" => x.longest_possession as f32 / hz.max(1.0),
+        _ => 0.0,
+    }
+}
+
 /// `SR15NetTopAwardsMsg`: `[count u8]`, then arrays of `count`: award ids,
 /// stat hashes, values (u64 each), slots (u64), handles (u32), teams (u16),
 /// names (32 bytes), and a u16 each.
@@ -1441,6 +1544,7 @@ impl Session {
             combat_at: None,
             combat_sent: HashMap::new(),
             combat_stat_clock: 0.0,
+            cap_owner: None,
             recent_hits: HashMap::new(),
             handles,
             peers: HashMap::new(),
@@ -1467,6 +1571,7 @@ impl Session {
             udp_out: Vec::new(),
             last_activity: Instant::now(),
             ever_joined: false,
+            close_at: None,
             muted: HashSet::new(),
         }
     }
@@ -1517,6 +1622,11 @@ impl Session {
     }
 
     // ── Inbound ────────────────────────────────────────────────────────────
+
+    /// EchoCombat said this player used NEUTRON (VeilNet `P`).
+    pub fn point_token(&mut self, from: SocketAddr) {
+        self.gear.point_token(from, Instant::now());
+    }
 
     pub fn on_packet(&mut self, from: SocketAddr, data: &[u8]) {
         if !self.peers.contains_key(&from) {
@@ -1684,6 +1794,9 @@ impl Session {
             STUN if reliable && self.stun_victim_is_spectator(d) => {
                 debug!(%from, body = %hex_str(d), "stun on a spectator (not relayed)");
             }
+            STUN if reliable && self.stun_victim_is_phased(d) => {
+                debug!(%from, body = %hex_str(d), "stun on a PHASE SHIFT user (not relayed)");
+            }
             // The cease fire is the clients' to honour, and a client that
             // missed it (players after the first in the lobby, everyone
             // during a goal) still sent stuns: dropped here, where native's
@@ -1743,6 +1856,8 @@ impl Session {
             // (stock barrier flashed, the player froze).
             ACTOR_CREATE if reliable && d.len() != 160 => {
                 debug!(%from, len = d.len(), "tac mod effect actor (relayed, not destroyed)");
+                // A NEUTRON's wall: its stun blast is the server's to set off.
+                self.gear.wall_placed(from, d, Instant::now());
                 self.relay_reliable(from, ty, d, false);
             }
             ACTOR_CREATE if reliable => {
@@ -1853,13 +1968,40 @@ impl Session {
                 }
             }
         }
-        let key = if ty == VOIP {
+        if ty == VOIP {
             let slot = self.peers.get(&from).and_then(|p| p.slot).unwrap_or(0) as u64;
-            key + (slot + 1) * VOICE_SLOT_STRIDE
-        } else {
-            key
-        };
+            let key = key + (slot + 1) * VOICE_SLOT_STRIDE;
+            match self.voice_team(from) {
+                Some(team) => {
+                    for (a, p) in self.peers.iter_mut() {
+                        if *a != from && p.stage == Stage::Joined && p.team == team {
+                            p.t.queue_mailbox(ty, key, d);
+                        }
+                    }
+                }
+                None => self.relay_mailbox(from, ty, key, d),
+            }
+            return;
+        }
         self.relay_mailbox(from, ty, key, d);
+    }
+
+    /// Whether team-only voice is on for this match right now: public
+    /// matches follow the host's `team_only_voice_public`, private ones the
+    /// RULES screen (starting from `team_only_voice_private`). It holds
+    /// through every round and opens to everyone once the match is over.
+    fn team_only_voice(&self) -> bool {
+        self.arena_level
+            && self.arena.phase != Phase::Over
+            && if self.arena.private { self.arena.rules.team_only_voice() } else { super::msg::arena_public().team_voice }
+    }
+
+    /// The team a speaker's voice is kept to (None: everyone hears it).
+    fn voice_team(&self, from: SocketAddr) -> Option<u8> {
+        if !self.team_only_voice() {
+            return None;
+        }
+        self.peers.get(&from).map(|p| p.team)
     }
 
     fn on_ping_response(&mut self, from: SocketAddr, d: &[u8]) {
@@ -2280,6 +2422,15 @@ impl Session {
                 (ent.generation + 1) % 15
             };
             if self.arena_level && !release {
+                if std::mem::take(&mut self.arena.joust_open)
+                    && let Some(p) = self.slot_addr.get((new_owner & 0xffff) as usize).copied().flatten().and_then(|a| self.peers.get_mut(&a))
+                {
+                    p.extra.jousts_won += 1;
+                    let blue = p.team == TEAM_BLUE;
+                    if matches!(p.team, TEAM_BLUE | TEAM_ORANGE) {
+                        self.arena.minor_call(0.0, super::announcer::joust(blue));
+                    }
+                }
                 if self.arena.granted != new_owner {
                     self.arena.granted_at = Instant::now();
                 }
@@ -2502,6 +2653,13 @@ impl Session {
         if owner_team == TEAM_BLUE || owner_team == TEAM_ORANGE {
             let client_us = u32::from_le_bytes([d[8], d[9], d[10], d[11]]);
             self.arena.tracker.sample(now, Some(client_us), owner, owner_team, [x, y, depth], held, hit);
+            for (slot, speed) in std::mem::take(&mut self.arena.tracker.throw_speeds) {
+                if speed > super::checks::MAX_THROW_SPEED
+                    && let Some(addr) = self.slot_addr.get(usize::from(slot)).copied().flatten()
+                {
+                    self.gear.flag_throw(addr, speed);
+                }
+            }
         }
         self.apply_credits();
         if !self.arena.goals_armed {
@@ -2522,6 +2680,16 @@ impl Session {
         }
         let g = self.arena.tracker.goal(now, hit, if blue_scored { TEAM_BLUE } else { TEAM_ORANGE });
         self.apply_credits();
+        let mut hat_trick = false;
+        if g.goal_type != super::stats::GOAL_SELF {
+            let slot = g.scorer.map(usize::from).unwrap_or((self.arena.disc_owner & 0xffff) as usize);
+            if let Some(p) = self.slot_addr.get(slot).copied().flatten().and_then(|a| self.peers.get_mut(&a)) {
+                let goals = p.stats.get(Stat::Goals);
+                p.extra.goal(g.points, g.goal_type, goals);
+                hat_trick = goals > 0 && goals % 3 == 0;
+            }
+        }
+        self.arena.next_goal_call = Some(super::announcer::goal_call(g.points, g.goal_type, g.assister.is_some(), hat_trick));
         let mut rec = [0u8; 28];
         rec[0..2].copy_from_slice(&u16::from(!blue_scored).to_le_bytes());
         rec[2..4].copy_from_slice(&(g.points as u16).to_le_bytes());
@@ -2593,19 +2761,49 @@ impl Session {
 
     /// Move the tracker's stat credits onto the players.
     fn apply_credits(&mut self) {
+        use super::announcer as an;
+        for slot in std::mem::take(&mut self.arena.tracker.clears) {
+            if let Some(p) = self.peers.values_mut().find(|p| p.slot == Some(usize::from(slot))) {
+                p.extra.clears += 1;
+                let blue = p.team == TEAM_BLUE;
+                self.arena.minor_call(0.0, an::clear(blue));
+            }
+        }
+        let pickups = std::mem::take(&mut self.arena.tracker.pickups);
         for (slot, stat) in std::mem::take(&mut self.arena.tracker.credits) {
             if let Some(p) = self.peers.values_mut().find(|p| p.slot == Some(usize::from(slot))) {
                 p.stats.add(stat, 1);
                 debug!(slot, ?stat, total = p.stats.get(stat), "stat");
                 let team = p.team;
-                self.arena.announce_stat(stat, team);
+                if matches!(stat, Stat::Steals | Stat::Interceptions) && pickups.iter().any(|&(s, _)| s == slot) {
+                    // A loose disc picked up, not one taken from a hand.
+                    self.arena.shot_due = None;
+                    self.arena.minor_call(0.0, an::possession(team == TEAM_BLUE));
+                } else {
+                    self.arena.announce_stat(stat, team);
+                }
             }
+        }
+        if !std::mem::take(&mut self.arena.tracker.posts).is_empty() && self.arena.phase == Phase::Playing {
+            // Native's post call comes 0.75 s after the hit.
+            let a = &mut self.arena;
+            a.shot_due = None;
+            a.last_call = a.tick;
+            let at = a.tick + (an::CALL_DELAY_S * frame_hz() as f32).round() as u64;
+            a.at(at, Act::Event(an::pick_cue(&[&an::HIT_POST]), MOD_ANNOUNCER, FILTER_ALL_ALT));
         }
     }
 
     /// `SR15StunPlayerMsg` from the stunner's client: one stun. The body
     /// layout is unrecorded, so a burst within 0.5 s counts once.
     /// The stun's victim (`u16` slot at 0) is watching, not playing.
+    /// A punch on someone PHASE SHIFT makes stun-immune.
+    fn stun_victim_is_phased(&self, d: &[u8]) -> bool {
+        let Some(b) = d.get(0..2) else { return false };
+        let slot = usize::from(u16::from_le_bytes([b[0], b[1]]));
+        self.peers.iter().any(|(a, p)| p.slot == Some(slot) && self.gear.immune(a, "stun_imm"))
+    }
+
     fn stun_victim_is_spectator(&self, d: &[u8]) -> bool {
         let Some(b) = d.get(0..2) else { return false };
         let slot = usize::from(u16::from_le_bytes([b[0], b[1]]));
@@ -2623,6 +2821,7 @@ impl Session {
                 p.t.queue_reliable(EQUIPMENT, d);
             }
         }
+        self.gear.set_equipment(from, d);
         let Some(p) = self.peers.get_mut(&from) else { return };
         let first = p.equipment.replace(d.to_vec()).is_none();
         if !first {
@@ -2674,6 +2873,7 @@ impl Session {
         p.last_stun = Some(Instant::now());
         p.stats.add(Stat::Stuns, 1);
         info!(%from, slot = ?p.slot, stuns = p.stats.get(Stat::Stuns), len = d.len(), body = %hex_str(d), "stun");
+        self.arena.announce_stun();
     }
 
     // ── Departures ─────────────────────────────────────────────────────────
@@ -2715,6 +2915,20 @@ impl Session {
         }
         info!(%addr, slot = p.slot, players = self.player_count(), "player left");
         self.last_activity = Instant::now();
+    }
+
+    /// A public match has sent everyone back to the lobby: end the session
+    /// `PUBLIC_END_GRACE` later (their games leave on their own first).
+    fn public_match_over(&mut self) {
+        if self.close_at.is_none() {
+            info!(grace = ?PUBLIC_END_GRACE, "public match over, players sent to the lobby: the session ends");
+            self.close_at = Some(Instant::now() + PUBLIC_END_GRACE);
+        }
+    }
+
+    /// Whether a finished public match's session is due to end (see `close_at`).
+    pub fn finished(&self) -> bool {
+        self.close_at.is_some_and(|t| Instant::now() >= t)
     }
 
     pub fn kick(&mut self, entrant: &str) {
@@ -2829,6 +3043,10 @@ impl Session {
         // Who may hurt whom (splash, shots, stun fields) follows the teams.
         self.gear.teams.clear();
         self.gear.teams.extend(self.peers.iter().map(|(a, p)| (*a, p.team)));
+        self.gear.slots.clear();
+        self.gear.slots.extend(self.peers.iter().filter_map(|(a, p)| p.slot.map(|s| (*a, s as u32))));
+        self.gear.gens.clear();
+        self.gear.gens.extend(self.peers.iter().map(|(a, p)| (*a, u16::from(p.generation.unwrap_or(0)))));
 
         let mut sf = [0u8; 16];
         sf[..8].copy_from_slice(&frame.to_le_bytes());
@@ -2960,6 +3178,17 @@ impl Session {
         }
         if self.combat.is_some() {
             self.run_combat();
+            // The payload where it is, as native: with each other frame at
+            // its 90 Hz, so about 45 a second.
+            let every = (frame_hz() / 45).max(1);
+            if self.frame % every == 0
+                && let Some(body) = self.combat.as_ref().and_then(|c| c.payload_physics(now_us))
+            {
+                let key = super::combat::PAYLOAD_PHYS_KEY + key_server_frame(frame) * 0x11;
+                for p in self.peers.values_mut().filter(|p| p.stage == Stage::Joined) {
+                    p.t.queue_mailbox(PHYSICS, key, &body);
+                }
+            }
         }
         self.replicate();
         // The lobby objects nobody owns, ten times a second (native: 45; they
@@ -2994,14 +3223,23 @@ impl Session {
             .filter(|(_, p)| p.stage == Stage::Joined && matches!(p.team, TEAM_BLUE | TEAM_ORANGE))
             .map(|(a, p)| {
                 let slot = self.gear.slot_of(a) as u8;
-                (u8::from(p.team == TEAM_ORANGE), self.gear.alive(*a), self.gear.body_pos(*a), slot)
+                // PHASE SHIFT's user can't take or hold the objective.
+                let present = self.gear.alive(*a) && !self.gear.immune(a, "disable_objectives");
+                (u8::from(p.team == TEAM_ORANGE), present, self.gear.body_pos(*a), slot)
             })
             .collect();
         let down = self.gear.barriers_down();
         let holders: Vec<u8> = self.peers.iter().filter(|(_, p)| p.on_payload && p.stage == Stage::Joined).map(|(a, _)| self.gear.slot_of(a) as u8).collect();
+        let team_slots: Vec<(u8, u8)> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.stage == Stage::Joined && matches!(p.team, TEAM_BLUE | TEAM_ORANGE))
+            .map(|(a, p)| (self.gear.slot_of(a) as u8, p.team_slot as u8))
+            .collect();
         let Some(c) = self.combat.as_mut() else { return };
         c.set_barriers_down(down);
         c.set_payload_holders(holders);
+        c.set_team_slots(team_slots);
         let outs = c.step(dt, &players);
         self.combat_stats(dt, now);
         self.combat_outs(outs);
@@ -3017,6 +3255,9 @@ impl Session {
                     }
                 }
                 super::combat::Out::Event(sym, module, handle, filter) => {
+                    if sym == super::msg::EV_RETURN_TO_LOBBY && self.combat.as_ref().is_some_and(|c| !c.is_private()) {
+                        self.public_match_over();
+                    }
                     let ev = component_event(sym, module, handle, filter);
                     for a in self.joined() {
                         self.reliable_to(a, COMPONENT_EVENT, &ev);
@@ -3189,6 +3430,11 @@ impl Session {
                 self.arena.start_round(f);
             }
         }
+        // A shot on goal that nothing else answered: our miss call.
+        if self.arena.shot_due.is_some_and(|t| f >= t) {
+            self.arena.shot_due = None;
+            self.arena.minor_call(0.0, super::announcer::pick_cue(&[&super::announcer::SHOT_ON_GOAL]));
+        }
         // Due actions, in schedule order.
         let mut due = std::mem::take(&mut self.arena.soon);
         self.arena.schedule.retain(|(at, act)| {
@@ -3207,6 +3453,9 @@ impl Session {
                     self.arena.state = s;
                 }
                 Act::Event(sym, module, filter) => {
+                    if sym == EV_RETURN_TO_LOBBY && !self.arena.private {
+                        self.public_match_over();
+                    }
                     let ev = component_event(sym, module, handles.for_module(module), filter);
                     for a in &joined {
                         if let Some(p) = self.peers.get_mut(a) {
@@ -3224,6 +3473,7 @@ impl Session {
                 }
                 Act::Live => {
                     self.arena.disc_live = true;
+                    self.arena.joust_open = true;
                     self.arena.last_disc = None;
                     self.arena.tracker.reset();
                     // Native republishes "no owner" at main_loop_enter.
@@ -3299,9 +3549,13 @@ impl Session {
             }
         }
         // Possession: frames the disc is in someone's hand (not in flight).
-        if self.arena.phase == Phase::Playing && let Some(holder) = self.arena.tracker.holding() {
-            if let Some(p) = self.peers.values_mut().find(|p| p.slot == Some(usize::from(holder))) {
+        let holding = self.arena.tracker.holding().filter(|_| self.arena.phase == Phase::Playing);
+        for p in self.peers.values_mut() {
+            if holding.is_some_and(|h| p.slot == Some(usize::from(h))) {
                 p.stats.add(Stat::PossessionTime, 1);
+                p.extra.holding();
+            } else {
+                p.extra.possession_run = 0;
             }
         }
         if matches!(self.arena.phase, Phase::Playing | Phase::Goal) && f % (3 * frame_hz()) == 0 {
@@ -3536,10 +3790,23 @@ impl Session {
         let mut objective: HashMap<SocketAddr, bool> = HashMap::new();
         for (a, p) in &self.peers {
             if p.stage == Stage::Joined && matches!(p.team, TEAM_BLUE | TEAM_ORANGE) {
-                objective.insert(*a, self.gear.body_pos(*a).is_some_and(|q| c.on_objective(q)));
+                objective.insert(*a, !self.gear.immune(a, "disable_objectives") && self.gear.body_pos(*a).is_some_and(|q| c.on_objective(q)));
             }
         }
         let credits: Vec<super::gear::Credit> = self.gear.credits.drain(..).collect();
+        // The point changed hands: the new holders on it captured it.
+        let owner_now = c.capture_owner();
+        if playing && owner_now != self.cap_owner && let Some(t) = owner_now {
+            for (a, o) in &objective {
+                if let Some(p) = self.peers.get_mut(a)
+                    && *o
+                    && p.team == t
+                {
+                    p.cstats.hill_captures += 1;
+                }
+            }
+        }
+        self.cap_owner = owner_now;
         if playing {
             for (a, o) in &objective {
                 let alive = self.gear.alive(*a);
@@ -3570,17 +3837,35 @@ impl Session {
                     hits.retain(|(a, _)| *a != by);
                     hits.push((by, now));
                 }
-                super::gear::Credit::Kill { by, victim } => {
+                super::gear::Credit::Heal { by, amount } => {
+                    if let Some(p) = self.peers.get_mut(&by) {
+                        p.cstats.healing += amount;
+                    }
+                }
+                super::gear::Credit::Stun { by } => {
+                    if let Some(p) = self.peers.get_mut(&by) {
+                        p.cstats.stuns += 1;
+                    }
+                }
+                super::gear::Credit::Kill { by, victim, head } => {
                     let obj = by.is_some_and(|b| on_obj(&b)) || on_obj(&victim);
                     if let Some(p) = self.peers.get_mut(&victim) {
                         p.cstats.deaths += 1;
+                        p.cstats.streak = 0;
                     }
+                    let solo = self.recent_hits.get(&victim).is_none_or(|h| h.iter().all(|(a, t)| Some(*a) == by || now.duration_since(*t) > COMBAT_ASSIST_WINDOW));
+                    let defend = on_obj(&victim) && by.and_then(|b| self.peers.get(&b)).is_some_and(|p| Some(p.team) == owner_now);
                     if let Some(p) = by.and_then(|b| self.peers.get_mut(&b)) {
                         p.cstats.kills += 1;
                         p.cstats.eliminations += 1;
                         if obj {
                             p.cstats.objective_eliminations += 1;
                         }
+                        p.cstats.streak += 1;
+                        p.cstats.best_streak = p.cstats.best_streak.max(p.cstats.streak);
+                        p.cstats.headshot_kills += u32::from(head);
+                        p.cstats.solo_kills += u32::from(solo);
+                        p.cstats.hill_defends += u32::from(defend);
                     }
                     // Others who hurt the victim in the last 10 s assisted.
                     let helpers: Vec<SocketAddr> = self
@@ -3703,41 +3988,23 @@ impl Session {
             return;
         }
         let won = |p: &P| winner == Some(p.team);
-        let mvp = players
+        // Native's awards (`awards`): the MVP, then three more.
+        let defs = &super::awards::COMBAT;
+        let values: Vec<Vec<f32>> = players.iter().map(|p| defs.iter().map(|d| p.s.award_value(d.1)).collect()).collect();
+        let chosen = super::awards::choose(defs, &values);
+        let mvp = chosen.first().map(|&(i, ..)| players[i].slot);
+        let picks: Vec<AwardPick> = chosen
             .iter()
-            .filter(|p| winner.is_none() || won(p))
-            .max_by_key(|p| (p.s.score(), std::cmp::Reverse(p.slot)))
-            .map(|p| p.slot);
-        // Native (four recorded matches): the MVP, then up to three stat
-        // awards in this order, each to the best player without an award
-        // yet (medic and tank, for healing and damage absorbed, are not
-        // counted by this server).
-        let mut picks: Vec<AwardPick> = Vec::new();
-        let pick = |p: &P, id: u64, stat: u64, value: u64| AwardPick { id, stat, value, slot: p.slot, handle: p.handle, team: u16::from(p.team == TEAM_ORANGE), name: p.name.clone() };
-        if let Some(m) = mvp.and_then(|s| players.iter().find(|p| p.slot == s)) {
-            picks.push(pick(m, AWARD_MVP_ID, AWARD_MVP_STAT, u64::from(m.s.score().max(1))));
-        }
-        let stat_awards: [(&str, &str, fn(&CombatStats) -> f32); 4] = [
-            ("guard", "CombatObjectiveTime", |s| s.objective_time),
-            ("defender", "CombatObjectiveEliminations", |s| s.objective_eliminations as f32),
-            ("specialist", "CombatAssists", |s| s.assists as f32),
-            ("cannoneer", "CombatDamage", |s| s.damage),
-        ];
-        for (award, stat, get) in stat_awards {
-            if picks.len() >= TOP_AWARDS_MAX {
-                break;
-            }
-            let best = players
-                .iter()
-                .filter(|p| get(&p.s) > 0.0 && picks.iter().all(|k| k.slot != p.slot))
-                .max_by(|a, b| get(&a.s).total_cmp(&get(&b.s)).then(b.slot.cmp(&a.slot)));
-            if let Some(p) = best {
-                picks.push(pick(p, crate::sns::symbol(award), crate::sns::symbol(stat), get(&p.s).round() as u64));
-            }
-        }
+            .map(|&(i, k, value)| {
+                let p = &players[i];
+                let (id, stat) = k.map_or((AWARD_MVP_ID, AWARD_MVP_STAT), |k| (crate::sns::symbol(defs[k].0), crate::sns::symbol(defs[k].1)));
+                AwardPick { id, stat, value, slot: p.slot, handle: p.handle, team: u16::from(p.team == TEAM_ORANGE), name: p.name.clone() }
+            })
+            .collect();
         if !picks.is_empty() {
             let b = top_awards_msg(&picks);
-            info!(mvp = %String::from_utf8_lossy(&picks[0].name), awards = picks.len(), "combat top awards");
+            let names: Vec<&str> = chosen.iter().map(|&(_, k, _)| k.map_or("mvp", |k| defs[k].0)).collect();
+            info!(mvp = %String::from_utf8_lossy(&picks[0].name), awards = ?names, "combat top awards");
             for a in self.joined() {
                 self.reliable_to(a, TOP_AWARDS, &b);
             }
@@ -3878,8 +4145,8 @@ impl Session {
     /// Native sends four (MVP and three stat awards); ours sent only the MVP
     /// and the end-of-match board showed only that. Then the tier rewards.
     fn send_top_awards(&mut self) {
-        type Pick = AwardPick;
-        let players: Vec<(usize, u32, u16, Vec<u8>, Stats)> = self
+        let hz = frame_hz() as f32;
+        let players: Vec<(usize, u32, u16, Vec<u8>, Stats, super::stats::ArenaExtra)> = self
             .peers
             .values()
             .filter(|p| matches!(p.team, TEAM_BLUE | TEAM_ORANGE))
@@ -3892,28 +4159,29 @@ impl Session {
                     .map(|n| n.split(|&b| b == 0).next().unwrap_or(&[]).to_vec())
                     .unwrap_or_default();
                 let handle = (u32::from(p.generation.unwrap_or(0)) << 16) | slot as u32;
-                Some((slot, handle, u16::from(p.team == TEAM_ORANGE), name, p.stats))
+                Some((slot, handle, u16::from(p.team == TEAM_ORANGE), name, p.stats, p.extra))
+            })
+            .collect::<Vec<_>>();
+        let mut players = players;
+        players.sort_by_key(|p| p.0);
+        // Native's awards (`awards`): the MVP, then three more.
+        let defs = &super::awards::ARENA;
+        let values: Vec<Vec<f32>> = players.iter().map(|p| defs.iter().map(|d| arena_award_value(&p.4, &p.5, d.1, hz)).collect()).collect();
+        let chosen = super::awards::choose(defs, &values);
+        let picks: Vec<AwardPick> = chosen
+            .iter()
+            .map(|&(i, k, value)| {
+                let p = &players[i];
+                let (id, stat) = k.map_or((AWARD_MVP_ID, AWARD_MVP_STAT), |k| (crate::sns::symbol(defs[k].0), crate::sns::symbol(defs[k].1)));
+                AwardPick { id, stat, value, slot: p.0, handle: p.1, team: p.2, name: p.3.clone() }
             })
             .collect();
-        // One award a player (native: every recorded award list names each
-        // slot once): the MVP first, then each stat's best among those
-        // still without one.
-        let mut picks: Vec<Pick> = Vec::new();
-        if let Some(p) = players.iter().max_by_key(|p| (p.4.get(Stat::Points), p.4.get(Stat::PossessionTime))) {
-            picks.push(Pick { id: AWARD_MVP_ID, stat: AWARD_MVP_STAT, value: u64::from(p.4.get(Stat::Points).max(1)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
-        }
-        for (id, s) in [(AWARD_GOALS_ID, Stat::Goals), (AWARD_PASSES_ID, Stat::Passes), (AWARD_BRUISER_ID, Stat::Stuns), (AWARD_CATCHES_ID, Stat::Catches)] {
-            let best = players.iter().filter(|p| p.4.get(s) > 0 && picks.iter().all(|k| k.slot != p.0)).max_by_key(|p| (p.4.get(s), p.4.get(Stat::Points)));
-            if let Some(p) = best {
-                picks.push(Pick { id, stat: TEAM_STATS[s as usize], value: u64::from(p.4.get(s)), slot: p.0, handle: p.1, team: p.2, name: p.3.clone() });
-            }
-        }
-        picks.truncate(TOP_AWARDS_MAX);
         if picks.is_empty() {
             return;
         }
         let m = top_awards_msg(&picks);
-        info!(mvp = %String::from_utf8_lossy(&picks[0].name), awards = picks.len(), "top awards");
+        let names: Vec<&str> = chosen.iter().map(|&(_, k, _)| k.map_or("mvp", |k| defs[k].0)).collect();
+        info!(mvp = %String::from_utf8_lossy(&picks[0].name), awards = ?names, "top awards");
         for a in self.joined() {
             self.reliable_to(a, TOP_AWARDS, &m);
         }
@@ -3985,7 +4253,7 @@ impl Session {
                 VAR_TOTAL_ROUNDS => Val::Lo32(a.total_rounds).resolve(old),
                 VAR_BLUE_ROUND_SCORE => Val::Lo32(a.blue_rounds).resolve(old),
                 VAR_RED_ROUND_SCORE => Val::Lo32(a.red_rounds).resolve(old),
-                VAR_ROUND_COUNTER => Val::Lo32(a.rounds_played).resolve(old),
+                VAR_ROUND_COUNTER => Val::Lo32(a.round_counter()).resolve(old),
                 VAR_OVERTIME => old & 0xffff_ffff_0000_0000,
                 VAR_DISC_OWNER => u64::from(a.disc_owner),
                 _ => return None,
@@ -4522,6 +4790,7 @@ impl Session {
         for p in self.peers.values_mut() {
             p.rep_sent = false;
             p.stats = Stats::default();
+            p.extra = super::stats::ArenaExtra::default();
         }
         if keep_rules {
             // Rematch: the same rules again (re-derive what each one sets).
@@ -4622,6 +4891,37 @@ mod server_mute_tests {
         p
     }
 
+    /// Public overtime: the HUD's round counter follows the overtime round
+    /// (OT 1 reads 0, OT 2 reads 1), and goes back once it is over.
+    #[test]
+    fn public_overtime_rounds_count_up() {
+        let mut a = Arena::new(1, false);
+        a.blue = 2;
+        a.red = 2;
+        assert_eq!(a.round_counter(), 0);
+        a.start_sudden_death(1000);
+        assert_eq!(a.round_counter(), 0, "OT 1");
+        a.start_sudden_death(5000);
+        assert_eq!(a.round_counter(), 1, "OT 2");
+        a.start_sudden_death(9000);
+        assert_eq!(a.round_counter(), 2, "OT 3");
+        a.end_round(12000, false);
+        assert_eq!(a.round_counter(), 0);
+    }
+
+    /// A finished public match ends its session a little after everyone is
+    /// sent back to the lobby, whoever is still connected.
+    #[test]
+    fn a_finished_public_match_ends_its_session() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
+        let mut s = Session::new(info, 1);
+        assert!(!s.finished());
+        s.public_match_over();
+        assert!(!s.finished(), "the grace first");
+        s.close_at = Some(Instant::now() - Duration::from_millis(1));
+        assert!(s.finished());
+    }
+
     /// A server-muted peer's voice reaches nobody; others still hear each
     /// other, and lifting the mute lets it through again.
     #[test]
@@ -4644,6 +4944,49 @@ mod server_mute_tests {
         assert_eq!(s.set_muted(&[ea], false), 1);
         s.on_mailbox(a, VOIP, 0, &[1, 2, 3]);
         assert_eq!(heard(&s, b), 1, "lifted mute relays again");
+    }
+
+    /// Team-only voice: on (a private match's default) teammates hear each
+    /// other and the other team does not, through every round; once the
+    /// match is over everyone hears everyone. Off, voice reaches all.
+    #[test]
+    fn team_only_voice_lasts_until_the_match_is_over() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: MODE_ARENA_PRIVATE, level: LEVEL_ARENA };
+        let mut s = Session::new(info, 1);
+        let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap(), "10.0.0.3:1".parse().unwrap());
+        for (addr, n, team) in [(a, 1, TEAM_BLUE), (b, 2, TEAM_BLUE), (c, 3, TEAM_ORANGE)] {
+            let mut p = joined_peer(Uuid::from_u128(n));
+            p.team = team;
+            s.peers.insert(addr, p);
+        }
+        let heard = |s: &Session, at: SocketAddr| s.peers[&at].t.queued_mailbox.iter().filter(|m| m.0 == VOIP).count();
+        s.arena.rules.set(rules::ROW_TEAM_VOICE, 1);
+        assert!(s.team_only_voice());
+        s.on_mailbox(a, VOIP, 0, &[1, 2, 3]);
+        assert_eq!((heard(&s, b), heard(&s, c)), (1, 0), "teammate only");
+
+        s.arena.phase = Phase::Goal; // between rounds of a best of 3
+        s.on_mailbox(a, VOIP, 0, &[1, 2, 3]);
+        assert_eq!((heard(&s, b), heard(&s, c)), (2, 0), "still team-only between rounds");
+
+        s.arena.end_match(1000);
+        s.on_mailbox(a, VOIP, 0, &[1, 2, 3]);
+        assert_eq!((heard(&s, b), heard(&s, c)), (3, 1), "match over: everyone");
+
+        s.arena.phase = Phase::Playing;
+        s.arena.rules.set(rules::ROW_TEAM_VOICE, 0);
+        s.on_mailbox(c, VOIP, 0, &[1, 2, 3]);
+        assert_eq!((heard(&s, a), heard(&s, b)), (1, 4), "rule off: everyone");
+    }
+
+    /// Public matches leave voice open unless the host turned
+    /// `team_only_voice_public` on.
+    #[test]
+    fn public_voice_is_open_by_default() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: LEVEL_ARENA };
+        let s = Session::new(info, 1);
+        assert!(!s.arena.private);
+        assert!(!s.team_only_voice());
     }
 
     /// A mute can arrive before the entrant's peer exists; it applies once
@@ -4836,6 +5179,55 @@ mod arena_end_tests {
         assert!(b.server_disc);
     }
 
+    /// Our own calls: stuns call a punch line 0.5 s later, four within 6 s a
+    /// rampage (then quiet); lesser calls give way to one another; a shot
+    /// on goal nothing answered gets a miss call, a save cancels it.
+    #[test]
+    fn own_calls_punch_rampage_and_misses() {
+        use super::super::announcer as an;
+        let said = |a: &Arena| -> Vec<(u64, u64)> {
+            a.schedule.iter().filter_map(|(t, x)| match x { Act::Event(s, m, _) if *m == MOD_ANNOUNCER => Some((*t, *s)), _ => None }).collect()
+        };
+        let in_table = |t: &[an::Cue], c: u64| t.iter().any(|x| x.symbol() == c);
+        let hz = frame_hz() as u64;
+        let mut a = Arena::new(1, false);
+        a.phase = Phase::Playing;
+        a.tick = 1000;
+        a.announce_stun();
+        let s = said(&a);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].0, 1000 + hz / 2);
+        assert!(in_table(&an::PUNCH, s[0].1));
+        a.tick += hz / 2;
+        a.announce_stun();
+        assert_eq!(said(&a).len(), 1, "a second punch call gives way");
+        a.tick += hz;
+        a.announce_stun();
+        a.tick += hz;
+        a.announce_stun();
+        let s = said(&a);
+        assert_eq!(s.len(), 2);
+        assert!(in_table(&an::RAMPAGE, s[1].1), "the fourth stun in 6 s");
+        a.tick += hz * 5;
+        a.announce_stun();
+        assert_eq!(said(&a).len(), 2, "quiet after a rampage");
+
+        // Not in play: no lesser calls.
+        let mut a = Arena::new(1, false);
+        a.tick = 1000;
+        a.announce_stun();
+        assert!(said(&a).is_empty());
+
+        // A shot: due 3.5 s on unless a save answers it.
+        let mut a = Arena::new(1, false);
+        a.phase = Phase::Playing;
+        a.tick = 1000;
+        a.announce_stat(Stat::ShotsOnGoal, TEAM_BLUE);
+        assert_eq!(a.shot_due, Some(1000 + (an::SHOT_WAIT_S * hz as f32) as u64));
+        a.announce_stat(Stat::Saves, TEAM_ORANGE);
+        assert_eq!(a.shot_due, None);
+    }
+
     /// Saves, interceptions and steals get native's calls, with its delays
     /// and the interceptor's team's table (mp_announcer_server_state).
     #[test]
@@ -4849,7 +5241,8 @@ mod arena_end_tests {
         let mut a = Arena::new(1, false);
         a.tick = 100;
         a.announce_stat(Stat::Saves, TEAM_BLUE);
-        assert!(an::SAVE.contains(&now(&a)[0]) && a.schedule.is_empty());
+        let save = now(&a)[0];
+        assert!((an::SAVE.contains(&save) || save == an::SAVE_EXTRA[0].symbol()) && a.schedule.is_empty());
 
         let mut a = Arena::new(1, false);
         a.tick = 100;

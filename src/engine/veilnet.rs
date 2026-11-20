@@ -223,10 +223,11 @@ impl VeilNet {
         self.relay(None, b'G', self.rules_word(), now, out)
     }
 
-    /// A VeilNet packet from `from`; what to send goes to `out`.
-    pub fn handle(&mut self, from: SocketAddr, kind: u8, id: u32, now: Instant, out: &mut Out) {
+    /// A VeilNet packet from `from`; what to send goes to `out`. True for an
+    /// event seen for the first time (not a resend).
+    pub fn handle(&mut self, from: SocketAddr, kind: u8, id: u32, now: Instant, out: &mut Out) -> bool {
         if !self.enabled {
-            return;
+            return false;
         }
         self.remember(from, now);
         match kind {
@@ -237,13 +238,16 @@ impl VeilNet {
             b'C' => self.rules_ask(from, id, now, out),
             b'M' if self.medigun && self.first_time(id) => {
                 self.relay(Some(from), kind, id, now, out);
+                return true;
             }
             b'V' | b'P' | b'T' | b'O' if self.first_time(id) => {
                 let n = self.relay(Some(from), kind, id, now, out);
                 debug!(client = %from, id = format_args!("{id:08x}"), told = n, "VeilNet: {}", what(kind));
+                return true;
             }
             _ => {}
         }
+        false
     }
 
     fn rules_ask(&mut self, from: SocketAddr, id: u32, now: Instant, out: &mut Out) {
@@ -310,6 +314,7 @@ mod tests {
         assert_eq!(MODE_COMBAT_PRIVATE, symbol("echo_combat_private"));
         assert_eq!(MODE_ARENA_PRIVATE, symbol("echo_arena_private"));
         assert_eq!(LEVEL_FISSION, symbol("mpl_combat_fission"));
+        assert_eq!(crate::engine::msg::LEVEL_FISSION_CLIMAX, symbol("mpl_combat_fission_climax"));
         assert_eq!(LEVEL_GAUSS, symbol("mpl_combat_gauss"));
     }
 

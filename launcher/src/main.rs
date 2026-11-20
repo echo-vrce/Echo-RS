@@ -52,6 +52,14 @@ enum ModeChoice {
     Exclude,
 }
 
+/// The server's checks on what clients claim (`--cheat-checks`).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+enum CheatChecks {
+    Off,
+    Log,
+    Enforce,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 struct Setup {
@@ -70,6 +78,9 @@ struct Setup {
     excluded_maps: Vec<String>,
     region: String,
     public_ip: String,
+    /// Ask the router (UPnP) to forward the game ports.
+    upnp: bool,
+    cheat_checks: CheatChecks,
     /// Answer EchoCombat (VeilNet). Off: players get stock Combat.
     echocombat: bool,
     /// Settings page: balance values that differ from the stock game's.
@@ -96,6 +107,8 @@ impl Default for Setup {
             excluded_maps: Vec::new(),
             region: "default".into(),
             public_ip: String::new(),
+            upnp: true,
+            cheat_checks: CheatChecks::Log,
             echocombat: true,
             balance: serde_json::Map::new(),
             auto_update: true,
@@ -174,6 +187,15 @@ impl Setup {
         if !self.echocombat {
             a.push("--no-veilnet".into());
         }
+        if !self.upnp {
+            a.push("--no-upnp".into());
+        }
+        let checks = match self.cheat_checks {
+            CheatChecks::Off => "off",
+            CheatChecks::Log => "log",
+            CheatChecks::Enforce => "enforce",
+        };
+        a.extend(["--cheat-checks".into(), checks.into()]);
         a
     }
 
@@ -721,7 +743,11 @@ impl App {
                 field_label(ui, "Public IP", "Leave empty to detect");
                 ui.add(egui::TextEdit::singleline(&mut s.public_ip).desired_width(150.0).hint_text("auto"));
                 ui.end_row();
+                field_label(ui, "Open ports automatically", "Asks the router (UPnP)");
+                ui.checkbox(&mut s.upnp, "");
+                ui.end_row();
             });
+            hint(ui, "Needs UPnP on in the router. It can't work behind carrier-grade NAT (Starlink, most mobile): the server log says when that's the case.");
         });
     }
 
@@ -760,6 +786,15 @@ impl App {
                 hint(ui, "Logs every grab, ping and packet summary. Only for tracking down a problem: it is the heaviest work the server does and fills the log fast. Takes effect at the next start.");
             });
         });
+        ui.add_space(12.0);
+        ui.add_enabled_ui(!live, |ui| card(ui, "Cheat checks", |ui| {
+            segmented(ui, &mut s.cheat_checks, &[(CheatChecks::Off, "Off"), (CheatChecks::Log, "Log"), (CheatChecks::Enforce, "Enforce")]);
+            hint(ui, match s.cheat_checks {
+                CheatChecks::Off => "Clients' shots, hits and movement aren't checked.",
+                CheatChecks::Log => "Impossible damage, fire rate, hits far from their target, hits through walls, speed over 100 m/s and disc throws over 18.95 m/s are written to the server log. Nothing is changed.",
+                CheatChecks::Enforce => "As Log, and impossible damage is capped, shots over the fire rate are dropped and hits far from their target do nothing. Hits through walls, speed and throws are only logged.",
+            });
+        }));
         ui.add_space(12.0);
         ui.add_enabled_ui(!live, |ui| card(ui, "Game modes", |ui| {
             segmented(ui, &mut s.mode_choice, &[(ModeChoice::All, "All"), (ModeChoice::OnlyOne, "Only one"), (ModeChoice::Exclude, "Exclude")]);

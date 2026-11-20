@@ -14,7 +14,8 @@
  "zone_2_point_value": 3,
  "mercy_win_point_spread_private": 20,
  "mercy_rule_private_enabled": true,
- "team_only_voice": true,
+ "team_only_voice_public": false,
+ "team_only_voice_private": true,
  "zone_0_point_value": 2,
  "team_0_color_active": {
   "r": 0,
@@ -31,6 +32,12 @@
  "goalie_ping_window": 150.0,
  "goalie_ping_advantage_public": false,
  "goalie_ping_advantage_private": false,
+ "overtime_private": false,
+ "goal_stops_time_private": true,
+ "carry_points_over_private": false,
+ "standard_chassis_private": true,
+ "disc_curve_private": false,
+ "disc_spawn_private": 1,
  "round_rules": {
   "round_time": 300.0,
   "sudden_death_round_over_time": 5.0,

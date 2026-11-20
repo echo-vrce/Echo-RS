@@ -58,6 +58,46 @@ pub const STAT_NAMES: [&str; 12] = [
     "Passes",
 ];
 
+/// An arena player's counts the awards need beyond the screen stats
+/// (`awards::ARENA`). Possession runs are in server frames.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct ArenaExtra {
+    pub three_point_goals: u32,
+    /// Dunker's count: 1-point goals and slam dunks (carried in, 2 points).
+    pub dunks: u32,
+    pub bounce_goals: u32,
+    pub hat_tricks: u32,
+    pub clears: u32,
+    pub jousts_won: u32,
+    pub longest_possession: u32,
+    pub possession_run: u32,
+}
+
+impl ArenaExtra {
+    /// A goal of theirs: `goals` is their total with it.
+    pub fn goal(&mut self, points: u32, goal_type: u16, goals: u32) {
+        match points {
+            3 => self.three_point_goals += 1,
+            _ => {}
+        }
+        if points == 1 || goal_type == GOAL_SLAM_DUNK {
+            self.dunks += 1;
+        }
+        if matches!(goal_type, GOAL_BOUNCE_SHOT | GOAL_LONG_BOUNCE_SHOT) {
+            self.bounce_goals += 1;
+        }
+        if goals > 0 && goals % 3 == 0 {
+            self.hat_tricks += 1;
+        }
+    }
+
+    /// One more server frame with the disc in their hand.
+    pub fn holding(&mut self) {
+        self.possession_run += 1;
+        self.longest_possession = self.longest_possession.max(self.possession_run);
+    }
+}
+
 /// One player's running totals. Possession is counted in server frames.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct Stats {
@@ -124,6 +164,10 @@ const BOUNCE_MIN_SPEED: f32 = 1.0;
 const BOUNCE_COS: f32 = 0.9;
 /// Turns are ignored for this many samples after the release (see `Flight::free`).
 const BOUNCE_AFTER: u8 = 3;
+/// A turn is a bounce only with arena geometry this close (metres) to the
+/// disc around it, the way it was pushed from (the disc is 0.15 m across the
+/// rim; samples come every 10-20 ms, up to 0.4 m apart at shot speeds).
+const BOUNCE_REACH: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -149,7 +193,19 @@ struct Flight {
     /// span the hand's last positions, and a throw's flick turned them enough
     /// to call most inside shots bounce shots (pub, 2026-11-19).
     free: u8,
+    /// Already judged as a clear (or not).
+    clear_judged: bool,
+    /// Already came off the goal it was headed into (`posts`).
+    posted: bool,
 }
+
+/// A clear (`clears`, the long_arm award): a throw released in the thrower's
+/// own half at least this far from centre (mm), heading out of it. Native's
+/// own rule is unrecorded.
+pub const CLEAR_FROM_MM: f32 = 12_000.0;
+/// A shot on goal that bounces off a surface within this much of the goal's
+/// plane came off the goal (its ring, or the wall around it).
+const POST_REACH_MM: i32 = 3_000;
 
 /// What the tracker reports about a goal.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -180,7 +236,28 @@ pub struct DiscTracker {
     /// owner has the disc in a hand.
     bumped: Option<(u16, u8, [i32; 3])>,
     pub credits: Vec<(u16, Stat)>,
+    /// Clears (slots), for the awards: not a screen stat.
+    pub clears: Vec<u16>,
+    /// A throw being timed: (thrower, samples since the release, top speed).
+    timing: Option<(u16, u8, f32)>,
+    /// Throws timed (thrower, release speed m/s), for the cheat checks.
+    pub throw_speeds: Vec<(u16, f32)>,
+    /// Shots on goal that came off the goal or the wall around it instead
+    /// of going in (thrower slots), for the announcer.
+    pub posts: Vec<u16>,
+    /// The other team took a disc nobody had held for
+    /// `announcer::POSSESSION_LOOSE_S` (slot, team), for the announcer.
+    pub pickups: Vec<(u16, u8)>,
+    /// When the disc was last in a hand.
+    last_held_us: u64,
 }
+
+/// A throw's speed is its fastest step among the first `THROW_STEPS` after
+/// the release. The release's own step is left out: it still spans the
+/// hand's last held position, and a flick moves the hand faster than the
+/// disc leaves it. (Our pubs, 2026-11-19: 147 throws, fastest 18.52 m/s;
+/// the game caps a throw at 18.95.)
+const THROW_STEPS: u8 = 3;
 
 fn sub(a: [i32; 3], b: [i32; 3]) -> [f32; 3] {
     [(a[0] - b[0]) as f32, (a[1] - b[1]) as f32, (a[2] - b[2]) as f32]
@@ -207,6 +284,8 @@ impl DiscTracker {
         self.flight = None;
         self.shot_credited = false;
         self.bumped = None;
+        self.timing = None;
+        self.last_held_us = 0;
     }
 
     /// The disc in flight is a bumper shot for `scoring_team` if it goes in
@@ -239,6 +318,26 @@ impl DiscTracker {
         }
         let d = sub(b.p, a.p);
         Some([d[0] / dt, d[1] / dt, d[2] / dt])
+    }
+
+    /// Whether the disc's last turn was at a surface of the arena: from the
+    /// samples around it, level geometry within `BOUNCE_REACH` the way the
+    /// turn pushed it from (a bounce pushes the disc off what it hit; a turn
+    /// in open air, a player's hand or body, has nothing there).
+    fn at_a_surface(&self) -> bool {
+        let Some(w) = super::walls::of(super::msg::LEVEL_ARENA) else { return true };
+        let (Some(v0), Some(v1)) = (self.velocity(0), self.velocity(1)) else { return false };
+        let into = sub_f(v1, v0);
+        let l = len(into);
+        if l < 1e-3 {
+            return false;
+        }
+        let into = [into[0] / l * BOUNCE_REACH, into[1] / l * BOUNCE_REACH, into[2] / l * BOUNCE_REACH];
+        let n = self.hist.len();
+        self.hist.iter().skip(n.saturating_sub(3)).any(|s| {
+            let p = [s.p[0] as f32 / 1000.0, s.p[1] as f32 / 1000.0, s.p[2] as f32 / 1000.0];
+            w.blocked(p, [p[0] + into[0], p[1] + into[1], p[2] + into[2]], 0.0)
+        })
     }
 
     /// Straight, steady and fast over the last three intervals.
@@ -282,14 +381,34 @@ impl DiscTracker {
         if self.hist.len() > HISTORY {
             self.hist.pop_front();
         }
+        // A throw's speed: headbutts (hit) and catches end the timing.
+        if let Some((thrower, steps, top)) = self.timing {
+            if held != Some(false) || hit || thrower != owner {
+                self.timing = None;
+            } else {
+                let top = top.max(self.velocity(0).map_or(0.0, len));
+                if steps + 1 >= THROW_STEPS {
+                    self.throw_speeds.push((thrower, top));
+                    self.timing = None;
+                } else {
+                    self.timing = Some((thrower, steps + 1, top));
+                }
+            }
+        }
+        if held == Some(true) || (held.is_none() && self.flight.is_none() && !self.in_free_flight()) {
+            self.last_held_us = t_us;
+        }
         if held == Some(true) {
             self.flight = None; // carried, however fast
             self.bumped = None; // caught: theirs now
             return;
         }
         if held == Some(false) && self.flight.is_none() {
+            if !hit {
+                self.timing = Some((owner, 0, 0.0));
+            }
             // Just released: the flight starts at the last held position.
-            self.flight = Some(Flight { thrower: owner, start: release.unwrap_or(p), on_goal: false, hit, bounced: false, free: 0 });
+            self.flight = Some(Flight { thrower: owner, start: release.unwrap_or(p), on_goal: false, hit, bounced: false, free: 0, clear_judged: false, posted: false });
             self.shot_credited = false;
         }
         let turned = match (self.velocity(0), self.velocity(1)) {
@@ -298,6 +417,8 @@ impl DiscTracker {
             }
             _ => false,
         };
+        // Only a turn at the arena's own surfaces is a bounce.
+        let off_a_surface = turned && self.at_a_surface();
         if let Some(f) = self.flight.as_mut() {
             f.free = f.free.saturating_add(1);
             if hit && !f.hit {
@@ -305,8 +426,13 @@ impl DiscTracker {
                 // release (its long headbutt goal: thrown, then hit 2.4 s
                 // later, reported 8.86 m). The hit's own turn is no bounce.
                 f.hit = true;
-            } else if turned && f.free > BOUNCE_AFTER {
+            } else if turned && f.free > BOUNCE_AFTER && off_a_surface {
                 f.bounced = true;
+                let near_goal = self.hist.back().is_some_and(|s| s.p[2] as f32 * attack_sign(team) >= (GOAL_DEPTH - POST_REACH_MM) as f32);
+                if f.on_goal && !f.posted && f.thrower == owner && near_goal {
+                    f.posted = true;
+                    self.posts.push(owner);
+                }
             }
         }
         if held == Some(false) || self.in_free_flight() {
@@ -315,8 +441,20 @@ impl DiscTracker {
                 let n = self.hist.len();
                 let start = self.hist[n.saturating_sub(4)].p;
                 // Already straight for three steps: turns count from here.
-                self.flight = Some(Flight { thrower: owner, start, on_goal: false, hit, bounced: false, free: BOUNCE_AFTER });
+                self.flight = Some(Flight { thrower: owner, start, on_goal: false, hit, bounced: false, free: BOUNCE_AFTER, clear_judged: false, posted: false });
                 self.shot_credited = false;
+            }
+            let v0 = self.velocity(0);
+            if let (Some(f), Some(v)) = (self.flight.as_mut(), v0)
+                && f.thrower == owner
+                && !f.clear_judged
+                && len(v) >= FLIGHT_MIN_SPEED
+            {
+                f.clear_judged = true;
+                let sign = attack_sign(team);
+                if -(f.start[2] as f32) * sign >= CLEAR_FROM_MM && v[2] * sign > 0.0 {
+                    self.clears.push(owner);
+                }
             }
             let on_goal = self.flight.as_ref().is_some_and(|f| f.thrower == owner) && self.heading_into_goal(team);
             if let Some(f) = self.flight.as_mut() {
@@ -329,6 +467,16 @@ impl DiscTracker {
         } else if self.flight.is_some_and(|f| f.thrower == owner) && self.velocity(0).is_some_and(|v| len(v) < FLIGHT_MIN_SPEED * 0.5) {
             // Caught again by the thrower, or stopped dead.
             self.flight = None;
+        }
+    }
+
+    /// The other team took a disc nobody had held for
+    /// `POSSESSION_LOOSE_S`: a loose pickup, not a pass picked off or a
+    /// disc taken from a hand.
+    fn loose_pickup(&mut self, t_us: u64, to: u16, to_team: u8) {
+        let loose_us = (super::announcer::POSSESSION_LOOSE_S * 1e6) as u64;
+        if self.last_held_us > 0 && t_us.saturating_sub(self.last_held_us) >= loose_us {
+            self.pickups.push((to, to_team));
         }
     }
 
@@ -348,8 +496,14 @@ impl DiscTracker {
                 }
                 (true, None) => {}
                 (false, Some(f)) if f.on_goal => self.credits.push((to, Stat::Saves)),
-                (false, Some(_)) => self.credits.push((to, Stat::Interceptions)),
-                (false, None) => self.credits.push((to, Stat::Steals)),
+                (false, Some(_)) => {
+                    self.credits.push((to, Stat::Interceptions));
+                    self.loose_pickup(t_us, to, to_team);
+                }
+                (false, None) => {
+                    self.credits.push((to, Stat::Steals));
+                    self.loose_pickup(t_us, to, to_team);
+                }
             }
             self.handoff = Some((from, from_team, t_us));
         }
@@ -652,20 +806,86 @@ mod held_tests {
         assert_eq!((g.points, g.goal_type), (2, GOAL_INSIDE_SHOT), "{g:?}");
     }
 
+    /// A disc nobody had held for 2 s, taken by the other team, is a loose
+    /// pickup (the announcer's possession call); one taken from a hand isn't.
+    #[test]
+    fn loose_pickups_are_told_from_steals() {
+        let mut t = DiscTracker::new();
+        for i in 0..4 {
+            t.sample(i * 16_000, None, 2, 0, [0, 0, i as i32 * 10], Some(true), false);
+        }
+        t.sample(1_000_000, None, 5, 1, [0, 0, 40], Some(true), false);
+        assert!(t.pickups.is_empty(), "taken from a hand");
+        assert!(t.credits.contains(&(5, Stat::Steals)));
+        // Dropped and left lying: still the owner's, out of every hand.
+        t.sample(1_016_000, None, 5, 1, [0, 0, 41], Some(false), false);
+        t.sample(2_000_000, None, 5, 1, [0, 0, 42], Some(false), false);
+        t.sample(3_500_000, None, 5, 1, [0, 0, 43], Some(false), false);
+        t.sample(3_600_000, None, 2, 0, [0, 0, 44], Some(true), false);
+        assert_eq!(t.pickups, vec![(2, 0)]);
+    }
+
+    /// Throws are timed after the release's own step; headbutts aren't.
+    #[test]
+    fn throws_are_timed() {
+        let throw = |mm_per_step: i32, flick: i32, hit: bool| {
+            let mut t = DiscTracker::new();
+            for i in 0..5 {
+                t.sample(i * 16_000, None, 2, 0, [0, 0, i as i32 * 50], Some(true), false);
+            }
+            // The release step: the hand's flick.
+            let mut z = 4 * 50 + flick;
+            t.sample(5 * 16_000, None, 2, 0, [0, 0, z], Some(false), hit);
+            for i in 6..12 {
+                z += mm_per_step;
+                t.sample(i * 16_000, None, 2, 0, [0, 0, z], Some(false), hit);
+            }
+            t.throw_speeds
+        };
+        // 15 m/s (240 mm a 16 ms step), with a 30 m/s flick at the release.
+        let v = throw(240, 480, false);
+        assert_eq!(v.len(), 1);
+        assert!((v[0].1 - 15.0).abs() < 0.01, "{v:?}");
+        assert_eq!(v[0].0, 2);
+        // 25 m/s: over the game's most.
+        assert!(throw(400, 400, false)[0].1 > crate::engine::checks::MAX_THROW_SPEED);
+        // A headbutt isn't a throw.
+        assert!(throw(400, 400, true).is_empty());
+    }
+
     #[test]
     fn a_throw_off_a_wall_is_a_bounce_shot() {
-        let mut t = DiscTracker::new();
-        t.sample(0, None, 0, 0, [3_000, 0, 33_000], Some(true), false);
-        // Out to the side at 5 m/s, then back in off the wall.
-        for i in 1..20u64 {
-            t.sample(i * 16_000, None, 0, 0, [3_000 + i as i32 * 80, 0, 33_000 + i as i32 * 20], Some(false), false);
-        }
-        for i in 20..40u64 {
-            t.sample(i * 16_000, None, 0, 0, [4_520 - (i as i32 - 19) * 80, 0, 33_380 + (i as i32 - 19) * 20], Some(false), false);
-        }
-        let g = t.goal(700_000, [0, 0, 36_000], 0);
-        assert_eq!((g.points, g.goal_type), (2, GOAL_BOUNCE_SHOT), "{g:?}");
+        // The arena's side wall at z 25 is at x 16.02.
+        let throw = |x0: i32| {
+            let mut t = DiscTracker::new();
+            t.sample(0, None, 0, 0, [x0, 0, 25_000], Some(true), false);
+            // Out to the side at 5 m/s, then back in.
+            for i in 1..20u64 {
+                t.sample(i * 16_000, None, 0, 0, [x0 + i as i32 * 80, 0, 25_000 + i as i32 * 20], Some(false), false);
+            }
+            for i in 20..40u64 {
+                t.sample(i * 16_000, None, 0, 0, [x0 + 1_520 - (i as i32 - 19) * 80, 0, 25_380 + (i as i32 - 19) * 20], Some(false), false);
+            }
+            t.goal(700_000, [0, 0, 36_000], 0)
+        };
+        // Turned 10 cm from the wall: off it.
+        let g = throw(14_400);
+        assert!(matches!(g.goal_type, GOAL_BOUNCE_SHOT | GOAL_LONG_BOUNCE_SHOT), "{g:?}");
         assert!(g.speed > 4.0, "{g:?}");
+        // The same turn in open air, 10 m from any wall, is no bounce.
+        let g = throw(3_000);
+        assert!(!matches!(g.goal_type, GOAL_BOUNCE_SHOT | GOAL_LONG_BOUNCE_SHOT), "{g:?}");
+    }
+
+    /// Dunker counts slam dunks (2 points) and 1-point goals; other goals not.
+    #[test]
+    fn dunker_counts_slam_dunks() {
+        let mut x = ArenaExtra::default();
+        x.goal(2, GOAL_SLAM_DUNK, 1);
+        x.goal(2, GOAL_INSIDE_SHOT, 2);
+        x.goal(1, GOAL_INSIDE_SHOT, 3);
+        x.goal(3, GOAL_LONG_SHOT, 4);
+        assert_eq!((x.dunks, x.three_point_goals, x.hat_tricks), (2, 1, 1));
     }
 
     #[test]
@@ -700,6 +920,19 @@ mod held_tests {
 /// with the running totals, `{}` for a player with none.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct CombatStats {
+    /// For the awards only (not sent): eliminations since the last death and
+    /// the best run, eliminations by a head hit, with nobody's help, stun
+    /// field stuns, capture-point captures (on the point when the team took
+    /// it) and defends (eliminating someone on the team's own point).
+    pub streak: u32,
+    pub best_streak: u32,
+    pub headshot_kills: u32,
+    pub solo_kills: u32,
+    pub stuns: u32,
+    pub hill_captures: u32,
+    pub hill_defends: u32,
+    /// Health their REPAIR MATRIX gave back (to them and teammates).
+    pub healing: f32,
     pub objective_damage: f32,
     pub eliminations: u32,
     pub objective_eliminations: u32,
@@ -778,12 +1011,29 @@ impl CombatStats {
         format!("{{{}}}", out.join(","))
     }
 
-    /// Native's MVP: the most to show for the match (no formula recorded;
-    /// it went to the player ahead on eliminations and objective time in
-    /// every recording).
-    pub fn score(&self) -> u64 {
-        (self.eliminations as f32 * 100.0 + self.objective_eliminations as f32 * 50.0 + self.objective_time * 10.0 + self.damage + self.objective_damage) as u64
+    /// An award's stat (`awards::COMBAT`).
+    /// `CombatDamageAbsorbed` is what native's screen calls DAMAGE TAKEN.
+    pub fn award_value(&self, stat: &str) -> f32 {
+        match stat {
+            "CombatEliminations" => self.eliminations as f32,
+            "CombatObjectiveEliminations" => self.objective_eliminations as f32,
+            "CombatObjectiveTime" => self.objective_time,
+            "CombatObjectiveDamage" => self.objective_damage,
+            "CombatBestEliminationStreak" => self.best_streak as f32,
+            "CombatKills" => self.kills as f32,
+            "CombatAssists" => self.assists as f32,
+            "CombatDamage" => self.damage,
+            "CombatHeadshotKills" => self.headshot_kills as f32,
+            "CombatDamageAbsorbed" => self.damage_taken,
+            "CombatHealing" => self.healing,
+            "CombatStuns" => self.stuns as f32,
+            "CombatSoloKills" => self.solo_kills as f32,
+            "CombatHillCaptures" => self.hill_captures as f32,
+            "CombatHillDefends" => self.hill_defends as f32,
+            _ => 0.0,
+        }
     }
+
 }
 
 /// XP for a match (native, all four recorded maps): 1200 for a win, 1000 for

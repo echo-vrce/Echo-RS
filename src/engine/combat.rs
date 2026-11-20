@@ -220,6 +220,10 @@ const GS_CHECKPOINT: [u64; 2] = [0xc768_c939_9081_44b4, 0xba83_a3cc_7939_f10a];
 /// Gauss's own at its checkpoint 1, on the same handle in another module.
 const MOD_GAUSS_CHECKPOINT: u64 = 0x3e75_99b2_76e2_031a;
 const GAUSS_CHECKPOINT: [u64; 2] = [0xe37e_071c_0a59_9abb, 0x85fd_88ca_2c40_93e0];
+/// ... and in the same module 21.36 s after it, as its door has opened
+/// (native Gauss, 479.30 s and 500.67 s).
+const GAUSS_DOOR_OPEN: u64 = 0x4e31_3900_d6bd_9f8c;
+const GAUSS_DOOR_OPEN_AFTER: f32 = 21.36;
 /// Native, in the team room after a capture round: a global event (module
 /// and handle all ones, filter 5) 3.07 s and 4.05 s in (Dyson and Combustion
 /// both, 18.57 s and 19.55 s after the round's win).
@@ -777,6 +781,9 @@ pub struct Combat {
     script: Script,
     /// Slots with a hand on the payload (their touch states).
     holders: Vec<u8>,
+    /// Each player's place in their team (slot, team slot): the capture
+    /// point's claimer bits are by team slot.
+    team_slots: Vec<(u8, u8)>,
     subphase: Option<u64>,
     team_room: bool,
     /// The round over flag, and how long until it clears (in a team room).
@@ -846,6 +853,7 @@ impl Combat {
             early_lock: false,
             script: Script::of(level),
             holders: Vec::new(),
+            team_slots: Vec::new(),
             subphase: None,
             team_room: true,
             round_over: false,
@@ -1194,6 +1202,11 @@ impl Combat {
         self.holders = slots;
     }
 
+    /// Who is where in their team: (slot, team slot).
+    pub fn set_team_slots(&mut self, slots: Vec<(u8, u8)>) {
+        self.team_slots = slots;
+    }
+
     fn event(&self, sym: u64) -> Out {
         Out::Event(sym, MOD_COMBAT_MATCH, self.match_handle, FILTER_ALL)
     }
@@ -1217,6 +1230,11 @@ impl Combat {
     /// A capture point map (else a payload map).
     pub fn is_capture(&self) -> bool {
         self.capture.is_some()
+    }
+
+    /// The team that holds the capture point (0 blue, 1 orange), if any.
+    pub fn capture_owner(&self) -> Option<u8> {
+        self.capture.as_ref().filter(|c| c.possession < NEUTRAL).map(|c| c.possession as u8)
     }
 
     /// The match has begun and is not over yet: stats count and are sent.
@@ -1501,6 +1519,7 @@ impl Combat {
         let mut finished = false;
         let mut reached: Option<usize> = None;
         let mut first_reach: Option<(u16, u16)> = None;
+        let mut door_open = false;
         if let Some(p) = self.payload.as_mut() {
             let holders = &self.holders;
             let near = |team: u8| players.iter().filter(|(t, alive, _, slot)| *t == team && *alive && holders.contains(slot)).count() as u8;
@@ -1601,6 +1620,8 @@ impl Combat {
             p.claimed_once |= att > 0;
             p.furthest = p.furthest.max(p.dist);
             if let Some(d) = p.door.as_mut() {
+                let at = GAUSS_DOOR_SECS - GAUSS_DOOR_OPEN_AFTER;
+                door_open |= *d > at && *d - dt <= at;
                 *d -= dt;
             }
             // Native Fission: `[handle][state u16][attackers u8][defenders u8]
@@ -1661,6 +1682,9 @@ impl Combat {
                     p.door = Some(GAUSS_DOOR_SECS);
                 }
             }
+        }
+        if door_open {
+            out.extend(self.announce(MOD_GAUSS_CHECKPOINT, &[GAUSS_DOOR_OPEN]));
         }
         let mut won = finished.then_some(Winner::Orange);
         // A private match's second half: the new attackers (orange now) win
@@ -1725,12 +1749,16 @@ impl Combat {
         let needs_claim = self.settings.pointer("/capture_point/point_accrual_requires_claim").and_then(Value::as_bool).unwrap_or(false);
         let space = self.level;
         let deciding = self.rounds_won.map(|r| r + 1 >= CAPTURE_ROUNDS_TO_WIN);
+        let team_slots = &self.team_slots;
         let Some(c) = self.capture.as_mut() else { return (Vec::new(), None) };
         let (mut claims, mut counts) = ([0u16; 2], [0u16; 2]);
         for &(team, alive, pos, slot) in players {
             let t = usize::from(team.min(1));
             if alive && pos.is_some_and(|p| c.inside(p)) {
-                claims[t] |= 1 << (slot & 15);
+                // Native: bit n is the team's player n (Dyson: blue 1, 2 and
+                // 3, orange 1 alongside), so each game sees itself on it.
+                let bit = team_slots.iter().find(|(s, _)| *s == slot).map_or(slot, |(_, t)| *t);
+                claims[t] |= 1 << (bit & 15);
                 counts[t] += 1;
             }
         }
@@ -1899,6 +1927,107 @@ impl Combat {
     pub fn payload_dist(&self) -> Option<f32> {
         self.payload.as_ref().map(|p| p.dist)
     }
+
+    /// The match area's object set with the payload where it is now, stamped
+    /// `now_us` (the server frame's time), for the physics mailbox.
+    pub fn payload_physics(&self, now_us: u64) -> Option<Vec<u8>> {
+        let p = self.payload.as_ref()?;
+        let (template, index) = match self.level {
+            LEVEL_GAUSS => (PAYLOAD_PHYS_GAUSS, 0),
+            LEVEL_FISSION => (PAYLOAD_PHYS_FISSION, 3),
+            _ => return None,
+        };
+        let mut d: Vec<u8> = (0..template.len() / 2).map(|i| u8::from_str_radix(&template[2 * i..2 * i + 2], 16).unwrap_or(0)).collect();
+        d[8..16].copy_from_slice(&(now_us & 0xffff_ffff).to_le_bytes());
+        let at = p.track.pos(p.dist);
+        let (a, b) = (p.track.pos((p.dist - 0.5).max(0.0)), p.track.pos(p.dist + 0.5));
+        let f = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let r = PHYS_HEAD_BITS + index * PHYS_RECORD_BITS;
+        let pos = [at[0], at[1] + PAYLOAD_RIDE, at[2]];
+        for (k, x) in pos.iter().enumerate() {
+            phys_set(&mut d, r + PHYS_POS + 19 * k, 19, (x * 1000.0 + 250_000.0).round().clamp(0.0, 524_287.0) as u32);
+        }
+        phys_set(&mut d, r + PHYS_ROT, 32, rotation_bits(look_along(f)));
+        // Its speed along the track (rolling back: x SLOW_REVERSE), 0 held.
+        let moving = p.hud.2 != 0 || p.autodrive_to.is_some();
+        let v = if !moving || p.hold > 0.0 { 0.0 } else if p.speed < 0.0 { p.speed * SLOW_REVERSE } else { p.speed };
+        let l = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt().max(1e-6);
+        for k in 0..3 {
+            phys_set(&mut d, r + PHYS_VEL + 12 * k, 12, (f[k] / l * v * 32.0 + 1536.0).round().clamp(0.0, 4095.0) as u32);
+        }
+        Some(d)
+    }
+}
+
+// ── The payload's physics (native Gauss and Fission recordings, 2026-11-16) ──
+// The native server sends the match area's object set (owner ffffffff, set id
+// = the area, 4 records) with each other server frame, its time = that frame's,
+// mailbox key 0x2824 + (frame % 90) x 0x11. Only the payload's record ever
+// changes (Gauss record 0, Fission record 3): position 0.651 m above the track,
+// its own +Z along the track and +Y up, velocity along it. Without it the
+// clients' payload never moved, whatever the trackpoints said.
+const PAYLOAD_PHYS_GAUSS: &str = "ffffffff193a620cce0cd104000000004001000000000000004903000008000000f0e618b8f4d247d87fff510c600006609020416ae518c9f3fe4808103500008000000000d90b42ab6efc75ff47f17f000660000609122448e841420f127a005903000008000000a8b8a445f2c25ed87fff510c6000066090204182841e24f420a1071036000080000000800adac23b0f867ffdf7dfff000660000609122448e841420f127a0000";
+const PAYLOAD_PHYS_FISSION: &str = "ffffffffd483a3dff8b1d20400000000400100000000000000490300000800000070c19d98fdf4a0d77fff01006000066090204182841e24f420a1071035000080000000806f3e8a29af127afdf71f00000660000609122448e841420f127a00590300000800000008c9aa9df716a1d77fff01006000066090204182841e24f420a1071036000080000000802e7489048f1d78fd07e0ff00066000060912a406745dfa4e1e780000";
+const PHYS_HEAD_BITS: usize = 192;
+const PHYS_RECORD_BITS: usize = 284;
+const PHYS_POS: usize = 75;
+const PHYS_ROT: usize = 132;
+const PHYS_VEL: usize = 164;
+/// The payload stands this far above its track's points.
+const PAYLOAD_RIDE: f32 = 0.651;
+pub const PAYLOAD_PHYS_KEY: u64 = 0x2824;
+
+fn phys_set(d: &mut [u8], at: usize, n: usize, v: u32) {
+    for k in 0..n {
+        let i = at + k;
+        if v >> k & 1 == 1 {
+            d[i >> 3] |= 1 << (i & 7);
+        } else {
+            d[i >> 3] &= !(1 << (i & 7));
+        }
+    }
+}
+
+/// A rotation (x, y, z, w) whose +Z is `f` and +Y as near world up as it can be.
+fn look_along(f: [f32; 3]) -> [f32; 4] {
+    let norm = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let z = norm(f);
+    let x = norm(cross([0.0, 1.0, 0.0], z));
+    let y = cross(z, x);
+    // Columns x, y, z of the rotation matrix to a quaternion.
+    let (m00, m11, m22) = (x[0], y[1], z[2]);
+    let tr = m00 + m11 + m22;
+    let q = if tr > 0.0 {
+        let s = (tr + 1.0).sqrt() * 2.0;
+        [(y[2] - z[1]) / s, (z[0] - x[2]) / s, (x[1] - y[0]) / s, 0.25 * s]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [0.25 * s, (y[0] + x[1]) / s, (z[0] + x[2]) / s, (y[2] - z[1]) / s]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [(y[0] + x[1]) / s, 0.25 * s, (z[1] + y[2]) / s, (z[0] - x[2]) / s]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [(z[0] + x[2]) / s, (z[1] + y[2]) / s, 0.25 * s, (x[1] - y[0]) / s]
+    };
+    q
+}
+
+/// A rotation in a physics record: the index of the largest component (left
+/// out, made positive), then the other three, 10 bits each over +-1/sqrt 2.
+fn rotation_bits(q: [f32; 4]) -> u32 {
+    let largest = (0..4).max_by(|a, b| q[*a].abs().total_cmp(&q[*b].abs())).unwrap_or(3);
+    let sign = if q[largest] < 0.0 { -1.0 } else { 1.0 };
+    let mut raw = largest as u32;
+    for (i, c) in (0..4).filter(|i| *i != largest).enumerate() {
+        let v = ((q[c] * sign * std::f32::consts::SQRT_2 + 1.0) / 2.0 * 1023.0).round().clamp(0.0, 1023.0) as u32;
+        raw |= v << (2 + 10 * i);
+    }
+    raw
 }
 
 /// `UpdateMiscState`: `[handle][state u16][attackers u8][defenders u8][direction i8][0]`.
@@ -2121,6 +2250,25 @@ mod tests {
     /// Native Dyson (netrec-dyson-20261116-server): no round start, a locked
     /// point says nothing, 4 s to take it, 1 point a second on it alone, 0.5
     /// empty, none with an enemy on it, 75 wins the round, two rounds.
+    /// The claimer bits are by team slot, as native's (Dyson: blue 1, 2, 3
+    /// and orange 1 at once): players in slots 3 and 4, each their team's
+    /// first, are both bit 0, so each one's game sees itself on the point.
+    #[test]
+    fn capture_claims_are_by_team_slot() {
+        let mut c = capture_map(LEVEL_DYSON);
+        c.set_team_slots(vec![(3, 0), (4, 0), (6, 1)]);
+        let orange = (1u8, true, Some([0.0, 0.0, 0.0]), 3);
+        let blue = (0u8, true, Some([1.0, 0.0, 0.0]), 4);
+        let blue2 = (0u8, true, Some([1.0, 0.0, 0.0]), 6);
+        run(&mut c, 30.5, &[orange]);
+        run(&mut c, 15.0, &[orange]);
+        run(&mut c, 44.5, &[orange]);
+        let v = run(&mut c, 1.0, &[orange, blue, blue2]);
+        let u = updates(&v).into_iter().last().expect("update");
+        let claims = |t: usize| u16::from_le_bytes([u[24 + 8 * t], u[25 + 8 * t]]);
+        assert_eq!((claims(0), claims(1)), (0b11, 0b01));
+    }
+
     #[test]
     fn dyson_rounds_follow_the_native_match() {
         let mut c = capture_map(LEVEL_DYSON);
@@ -2367,6 +2515,47 @@ mod tests {
 
     /// Native Gauss 411.5-412.9: slot 2's touch states as the attacker count
     /// went 1, 0, 1 (a hand on entry 105, either hand).
+    /// The payload's physics record at the start of each track matches the
+    /// native server's first frame: the same position (to the millimetres the
+    /// track file keeps) and rotation, and only the payload's record and the
+    /// time differ from the template.
+    #[test]
+    fn payload_physics_matches_native_at_the_start() {
+        let get = |d: &[u8], at: usize, n: usize| (0..n).fold(0u32, |v, k| v | u32::from((d[(at + k) >> 3] >> ((at + k) & 7)) & 1) << k);
+        let quat = |raw: u32| {
+            let largest = (raw & 3) as usize;
+            let mut rest = (0..3).map(|i| ((raw >> (2 + 10 * i) & 1023) as f32 / 1023.0 * 2.0 - 1.0) / std::f32::consts::SQRT_2);
+            let mut q = [0.0f32; 4];
+            let mut sum = 0.0;
+            for (i, c) in q.iter_mut().enumerate() {
+                if i != largest {
+                    *c = rest.next().unwrap_or(0.0);
+                    sum += *c * *c;
+                }
+            }
+            q[largest] = (1.0 - sum).max(0.0).sqrt();
+            q
+        };
+        for (c, template, index) in [(gauss(), PAYLOAD_PHYS_GAUSS, 0usize), (fission(), PAYLOAD_PHYS_FISSION, 3)] {
+            let native: Vec<u8> = (0..template.len() / 2).map(|i| u8::from_str_radix(&template[2 * i..2 * i + 2], 16).expect("hex")).collect();
+            let ours = c.payload_physics(0x1234_5678).expect("payload map");
+            assert_eq!(ours.len(), 168);
+            assert_eq!(&ours[8..12], &0x1234_5678u32.to_le_bytes());
+            let r = PHYS_HEAD_BITS + index * PHYS_RECORD_BITS;
+            for k in 0..3 {
+                let (a, b) = (get(&native, r + PHYS_POS + 19 * k, 19) as i64, get(&ours, r + PHYS_POS + 19 * k, 19) as i64);
+                assert!((a - b).abs() < 120, "axis {k}: native {a}, ours {b}");
+            }
+            let (qa, qb) = (quat(get(&native, r + PHYS_ROT, 32)), quat(get(&ours, r + PHYS_ROT, 32)));
+            let dot: f32 = (0..4).map(|i| qa[i] * qb[i]).sum();
+            assert!(dot.abs() > 0.995, "rotation: native {qa:?}, ours {qb:?}");
+            // Nothing outside the payload's record changes (bar the time).
+            for i in (128..PHYS_HEAD_BITS).chain(PHYS_HEAD_BITS..168 * 8).filter(|i| !(r..r + PHYS_RECORD_BITS).contains(i)) {
+                assert_eq!(get(&native, i, 1), get(&ours, i, 1), "bit {i}");
+            }
+        }
+    }
+
     #[test]
     fn a_hand_on_the_payload_is_the_claim() {
         let t = |tail: [u8; 3]| payload_touch(&[0x19, 0x3a, 0x62, 0x0c, 2, 0, 1, 0, tail[0], tail[1], tail[2], 0, 0, 0, 0, 0]);
@@ -2498,8 +2687,11 @@ mod tests {
         assert_eq!(var(&c, 0x1856_51ce_8e5f_1fb4), Some(Val::Raw(0x0000_022c_0000_0002)));
         assert!(matches!(var(&c, VAR_GAUSS_DOOR), Some(Val::Lo32(19 | 20))));
         let away = [(1u8, true, Some([500.0, 0.0, 0.0]), 0)];
-        run(&mut c, 25.0, &away);
+        let open = |v: &[Out]| v.iter().filter(|o| matches!(o, Out::Event(GAUSS_DOOR_OPEN, MOD_GAUSS_CHECKPOINT, 0x15b, _))).count();
+        assert_eq!(open(&run(&mut c, 18.0, &away)), 0, "not before 21.36 s");
+        assert_eq!(open(&run(&mut c, 7.0, &away)), 1, "once, as the door opens");
         assert_eq!(var(&c, VAR_GAUSS_DOOR), Some(Val::Lo32(0)));
+        assert_eq!(open(&run(&mut c, 10.0, &away)), 0);
     }
 
     /// A private match waits for every team with players to be ready

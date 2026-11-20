@@ -8,7 +8,9 @@
 //! it wakes at 100 Hz for retransmits and at 20 Hz for the server frame.
 
 pub mod announcer;
+pub mod awards;
 pub mod balance;
+pub mod checks;
 pub mod combat;
 pub mod gear;
 pub mod filter;
@@ -20,6 +22,7 @@ pub mod session;
 pub mod stats;
 pub mod transport;
 pub mod veilnet;
+pub mod walls;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -261,6 +264,14 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
                     info!(instance = idx, lobby = %s.info.lobby, "session empty; ending");
                     outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
                     session = None;
+                } else if s.finished() {
+                    // A public match is over and everyone went back to the
+                    // lobby: idle now, so nobody rejoins the finished game.
+                    info!(instance = idx, lobby = %s.info.lobby, players = s.peer_count(), "public match over; ending the session");
+                    s.close();
+                    send_udp(socket, s).await;
+                    outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
+                    session = None;
                 }
             }
         }
@@ -306,7 +317,12 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil
     if let Some((kind, id)) = veilnet::parse(d) {
         veil.sync_session(session.as_ref().map(|s| (s.info.lobby, s.info.mode, s.info.level)));
         let mut out = veilnet::Out::new();
-        veil.handle(from, kind, id, Instant::now(), &mut out);
+        let fresh = veil.handle(from, kind, id, Instant::now(), &mut out);
+        if fresh && kind == b'P'
+            && let Some(s) = session.as_mut()
+        {
+            s.point_token(from);
+        }
         send_veil(socket, out).await;
         return;
     }

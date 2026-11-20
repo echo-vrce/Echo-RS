@@ -74,6 +74,13 @@ pub const ROW_DISC_SPAWN: usize = 4;
 pub const ROW_ROUNDS_PLAYED: usize = 9;
 /// Row 2.3 "CARRY POINTS OVER" (assumed row): scores carry into the next round.
 pub const ROW_CARRY_POINTS: usize = 11;
+/// Row 3.3 "STANDARD CHASSIS" (default on) and row 4.3 "DISC CURVE"
+/// (default off): the server only passes them on; the games apply them.
+pub const ROW_STANDARD_CHASSIS: usize = 15;
+pub const ROW_DISC_CURVE: usize = 19;
+/// Row 5.1 "TEAM ONLY VOICE": players hear only their own team until the
+/// match is over (the screen's default is off; private matches start on).
+pub const ROW_TEAM_VOICE: usize = 21;
 
 /// The names the client's API uses for each row (rows 1.1, 2.3 and 5.1 are
 /// matched to the three remaining names by elimination and panel grouping).
@@ -166,10 +173,13 @@ pub fn parse_press(d: &[u8]) -> Option<(u32, u32)> {
 impl Rules {
     /// A private match's starting rules: the stock RULES screen with the
     /// host's `mp_arena_rules` private values (`round_time_private` and the
-    /// rest; the stock ones are the screen's own defaults) and this server's
-    /// `goalie_ping_advantage_private`.
-    pub fn from_private(r: &serde_json::Value, goalie: Option<bool>) -> Self {
+    /// rest; the stock ones are the screen's own defaults). `server` holds
+    /// this server's own keys (`balance::SERVER_ARENA_KEYS`), for the rows
+    /// the game has no private setting for. Team-only voice starts on unless
+    /// the host turned it off.
+    pub fn from_private(r: &serde_json::Value, server: &serde_json::Value) -> Self {
         let mut rules = Self::default();
+        rules.set(ROW_TEAM_VOICE, 1);
         let rr = r.get("round_rules");
         let num = |v: Option<&serde_json::Value>| v.and_then(serde_json::Value::as_f64);
         let round = |k: &str| num(rr.and_then(|x| x.get(k)));
@@ -178,7 +188,13 @@ impl Rules {
             rules.set(0, t / 60);
             rules.set(1, t % 60);
         }
-        for (k, row) in [("round_count_private", ROW_ROUND_COUNT), ("rounds_played_private", ROW_ROUNDS_PLAYED), ("team_room_wait_time_private", ROW_START_COUNT), ("wait_for_launch_time_private", ROW_CATAPULT_TIME)] {
+        for (k, row) in [
+            ("round_count_private", ROW_ROUND_COUNT),
+            ("rounds_played_private", ROW_ROUNDS_PLAYED),
+            ("team_room_wait_time_private", ROW_START_COUNT),
+            ("wait_for_launch_time_private", ROW_CATAPULT_TIME),
+            ("point_score_celebration_time_private", ROW_RESPAWN_TIME),
+        ] {
             if let Some(v) = round(k) {
                 rules.set(row, v.round() as i32);
             }
@@ -186,12 +202,30 @@ impl Rules {
         if let Some(v) = num(r.get("mercy_win_point_spread_private")) {
             rules.set(ROW_MERCY_MARGIN, v.round() as i32);
         }
-        for (v, row) in [(r.get("mercy_rule_private_enabled").and_then(serde_json::Value::as_bool), ROW_MERCY_ON), (r.get("self_goaling_private").and_then(serde_json::Value::as_bool), ROW_SELF_GOALING), (goalie, ROW_GOALIE_PING)] {
+        if let Some(v) = num(server.get("disc_spawn_private")) {
+            rules.set(ROW_DISC_SPAWN, v.round() as i32);
+        }
+        let flag = |v: &serde_json::Value, k: &str| v.get(k).and_then(serde_json::Value::as_bool);
+        for (v, row) in [
+            (flag(r, "mercy_rule_private_enabled"), ROW_MERCY_ON),
+            (flag(r, "self_goaling_private"), ROW_SELF_GOALING),
+            (flag(server, "goalie_ping_advantage_private"), ROW_GOALIE_PING),
+            (flag(server, "team_only_voice_private"), ROW_TEAM_VOICE),
+            (flag(server, "overtime_private"), ROW_OVERTIME),
+            (flag(server, "goal_stops_time_private"), ROW_GOAL_STOPS_TIME),
+            (flag(server, "carry_points_over_private"), ROW_CARRY_POINTS),
+            (flag(server, "standard_chassis_private"), ROW_STANDARD_CHASSIS),
+            (flag(server, "disc_curve_private"), ROW_DISC_CURVE),
+        ] {
             if let Some(on) = v {
                 rules.set(row, i32::from(on));
             }
         }
         rules
+    }
+
+    pub fn team_only_voice(&self) -> bool {
+        self.v[ROW_TEAM_VOICE] != 0
     }
 
     pub fn goalie_ping_advantage(&self) -> bool {
@@ -306,13 +340,30 @@ mod tests {
             "team_room_wait_time_private":59.0,"wait_for_launch_time_private":12.0}}"#,
         )
         .expect("json");
-        assert_eq!(Rules::from_private(&stock, None).v, Rules::default().v);
+        let mut on = Rules::default();
+        on.set(ROW_TEAM_VOICE, 1);
+        let none = serde_json::Value::Null;
+        assert_eq!(Rules::from_private(&stock, &none).v, on.v, "the screen's defaults, team-only voice on");
+        let stock_celebration = serde_json::json!({"round_rules": {"point_score_celebration_time_private": 3.0}});
+        assert_eq!(Rules::from_private(&stock_celebration, &none).v, on.v, "the stock celebration time is the screen's respawn time");
+        assert!(!Rules::from_private(&stock, &serde_json::json!({"team_only_voice_private": false})).team_only_voice());
         let host: serde_json::Value = serde_json::from_str(
             r#"{"mercy_win_point_spread_private":8,"mercy_rule_private_enabled":false,"self_goaling_private":false,
             "round_rules":{"round_count_private":5,"round_time_private":330.0,"wait_for_launch_time_private":5.0}}"#,
         )
         .expect("json");
-        let r = Rules::from_private(&host, Some(true));
+        let server = serde_json::json!({
+            "goalie_ping_advantage_private": true, "overtime_private": true, "goal_stops_time_private": false,
+            "carry_points_over_private": true, "standard_chassis_private": false, "disc_curve_private": true, "disc_spawn_private": 2,
+        });
+        let mut host = host;
+        host["round_rules"]["point_score_celebration_time_private"] = serde_json::json!(7.0);
+        let r = Rules::from_private(&host, &server);
+        assert_eq!(r.respawn_secs(), 7.0);
+        assert!(r.overtime());
+        assert!(!r.goal_stops_time());
+        assert!(r.carry_points());
+        assert_eq!((r.v[ROW_STANDARD_CHASSIS], r.v[ROW_DISC_CURVE], r.v[ROW_DISC_SPAWN]), (0, 1, 2));
         assert_eq!(r.round_secs(), 330.0);
         assert_eq!(r.v[ROW_ROUND_COUNT], 5);
         assert_eq!(r.catapult_secs(), 5.0);

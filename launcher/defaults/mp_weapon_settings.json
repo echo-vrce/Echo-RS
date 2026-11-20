@@ -554,7 +554,7 @@
       "death_effect_size": 0.5
     },
     "dot": {
-      "radius": 3.5,
+      "radius": 2.5,
       "lifetime": 8,
       "damage_per_tick": 4,
       "ticks_per_second": 3,

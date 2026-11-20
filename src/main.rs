@@ -18,6 +18,7 @@ mod services;
 #[allow(dead_code, reason = "full protocol surface; not every field is consumed")]
 mod sns;
 mod store;
+mod upnp;
 mod upstream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -86,6 +87,17 @@ struct Args {
     /// this as a stock server and hide the mod's new gear.
     #[arg(long, env = "ERS_NO_VEILNET")]
     no_veilnet: bool,
+
+    /// Checks on what clients claim (damage, fire rate, hit positions, speed,
+    /// disc throw speed):
+    /// `log` warns per flag; `enforce` also caps impossible damage and drops
+    /// shots over the rate and hits far from their victim; `off`.
+    #[arg(long, env = "ERS_CHEAT_CHECKS", default_value = "log", value_parser = engine::checks::parse_mode)]
+    cheat_checks: engine::checks::Mode,
+
+    /// Don't ask the router (UPnP) to forward the server's ports.
+    #[arg(long, env = "ERS_NO_UPNP")]
+    no_upnp: bool,
 
     /// Balance changes (the launcher's Settings page): JSON `{"<balance file
     /// name>": {partial values}}`, merged into the settings sent to players.
@@ -271,6 +283,7 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log)))
         .with_target(false)
         .init();
+    engine::checks::set_mode(args.cheat_checks);
     engine::balance::set_base(engine::balance::Base { echocombat: !args.no_veilnet, medigun: engine::veilnet::medigun_from_file() });
     if let Some(path) = &args.balance
         && let Err(e) = engine::balance::load(path)
@@ -347,6 +360,18 @@ async fn main() -> Result<()> {
 
     let listener = bind_tcp(args.bind).with_context(|| format!("binding {}", args.bind))?;
     let hub_port = listener.local_addr()?.port();
+    if !args.no_upnp {
+        // The hub's TCP port only matters to players when this server is
+        // their login and matchmaking (the built-in backend).
+        let hub_too = matches!(backend, upstream::Backend::Builtin);
+        upnp::enable();
+        std::thread::spawn(move || {
+            upnp::start();
+            if hub_too {
+                upnp::open(upnp::Proto::Tcp, hub_port);
+            }
+        });
+    }
     // IPv6: players with the Ipv6Bridge plugin ask a game port which IPv4
     // they were given for us, then reach us over IPv6 instead.
     match detect_ipv6() {
@@ -436,5 +461,6 @@ async fn main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
     pool.shutdown().await;
+    tokio::task::spawn_blocking(upnp::close_all).await.ok();
     Ok(())
 }

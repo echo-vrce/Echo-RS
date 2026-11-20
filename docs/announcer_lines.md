@@ -360,6 +360,29 @@ each pick expression from the script DLL; `src/engine/announcer.rs` holds them e
 | `nevt_rampage` | arena: 0090A-I_RAMPAGE; social: the same + `_Lobby` | none | no |
 | round/match results, round start, round over, overtime | 0050, 0060, 0070, 0080, 0100, 0120, OT_ROUND | none | yes (before this change) |
 
+## Our own calls (`src/engine/announcer.rs`, 2026-11-20)
+
+The stock groups our server could not raise as native does, and the scenes no stock server sends. When each plays
+is this server's choice:
+
+| Call | Lines | When | Delay |
+|---|---|---|---|
+| Dunk | MPL_ARENA_DUNK_A1-I1; G1 ("Dipsy-doo Dunk-a-roo.") on half | a slam dunk goal | none |
+| Bounce | MPL_ARENA_BOUNCE_A1-I1 | a bounce shot goal | none |
+| Hat trick | MPL_ARENA_TRICK_A1-E1 | a player's 3rd, 6th, ... goal (before dunk/bounce) | none |
+| Pass | MPL_ARENA_PASS_A1-H1 (E1 unnamed `047b21118ee4bdd0`) | half of assisted goals | none |
+| Punch | 0040A-I_PUNCH, MPL_ARENA_PUNCH_A1-H1 | a stun | 0.5 s |
+| Rampage | 0090A-I_RAMPAGE | the 4th stun within 6 s; then 15 s quiet | 0.5 s |
+| Clear | 0160A-C/E, 0150D_BLUE / 0150A-E_RED, MPL_ARENA_CLEAR_A1-G1 | a clear (`stats::CLEAR_FROM_MM`) | none |
+| Post | 0170A-L_HIT_POST | a shot on goal bouncing off a surface within 3 m of the goal plane | 0.75 s |
+| Near miss | MPL_ARENA_SHOTONGOAL_A1-E1, F2 | a shot on goal with no goal, save, catch or post within 3.5 s | 3.5 s |
+| Joust | MPL_ARENA_JOUST_A1/C1 (blue), B1/D1 (orange), E1 (unnamed `61aa93e1405d2d86`), F1-H1 | the first grab after a launch | none |
+| Possession | 0140*_BLUE / 0130*_RED | the other team takes a disc nobody held for 2 s (instead of steal/interception) | none |
+| Save | + MPL_ARENA_SAVE_F1 | a save (one more entry in native's pick) | none |
+
+Clears, possession, near misses, jousts and punches skip if another call went out within 2 s. The BLOCK scenes have
+no trigger: no block event reaches the server.
+
 "Silent" entries are hashes that no client announcer script listens for. Native sends them as well, and nothing plays.
 
 Native's public overtime recording (`H:\EVR\captures\netrec-pub-ot-20261119`) ties the save, interception and steal

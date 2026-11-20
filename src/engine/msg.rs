@@ -108,16 +108,9 @@ pub const TEAM_STATS: [u64; 12] = [
     0x41d2_d73c_0930_020d, // Passes
 ];
 pub const TS_POSSESSION: usize = 4;
-/// TopAwards: MVP (its own stat), then stat awards (native, two matches:
-/// four awards each, drawn from these and one unnamed stat).
+/// TopAwards: the MVP's award and stat (`score`); the others: `awards`.
 pub const AWARD_MVP_ID: u64 = 0xc8e8_d0b1_a89d_f4fa;
 pub const AWARD_MVP_STAT: u64 = 0xe32d_c7c9_da80_56b5;
-pub const AWARD_GOALS_ID: u64 = 0x4303_0e90_92f3_c421;
-pub const AWARD_PASSES_ID: u64 = 0x4fce_de87_b2b2_913b;
-pub const AWARD_CATCHES_ID: u64 = 0xdafa_9a46_0fe1_0167;
-/// `bruiser`: the arena's stuns award.
-pub const AWARD_BRUISER_ID: u64 = 0x2fd5_9d8a_5767_5298;
-pub const TOP_AWARDS_MAX: usize = 4;
 /// `SR15NetTierRewardMsg` `[stat u64][tier u64][slot u64][xp u64]`, to the
 /// player only (native: gold/silver/bronze in Goals, Assists, Saves).
 pub const TIER_REWARD: u64 = h("SR15NetTierRewardMsg");
@@ -435,6 +428,10 @@ pub fn captured() -> &'static Captured {
             (super::combat::LEVEL_DYSON, hex(include_str!("data/combat_dyson_ids.hex"))),
             (super::combat::LEVEL_COMBUSTION, hex(include_str!("data/combat_combustion_ids.hex"))),
             (super::combat::LEVEL_FISSION, hex(include_str!("data/combat_fission_ids.hex"))),
+            // Fission's `mpl_combat_fission_climax` sublevel asks for its own
+            // (native Fission, 2026-11-16): without them the client waits on
+            // it forever and the match never loads.
+            (LEVEL_FISSION_CLIMAX, hex(include_str!("data/combat_fission_climax_ids.hex"))),
             (super::combat::LEVEL_GAUSS, hex(include_str!("data/combat_gauss_ids.hex"))),
         ],
         // Clients play with these values; the host's changes are merged in.
@@ -494,13 +491,14 @@ pub fn arena_public() -> super::balance::ArenaPublic {
 pub fn arena_private_rules() -> super::rules::Rules {
     static R: std::sync::OnceLock<super::rules::Rules> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        let goalie = super::balance::server_arena_flag("goalie_ping_advantage_private");
+        let server = super::balance::server_arena();
+        let none = serde_json::Value::Null;
         captured()
             .balance
             .iter()
             .find(|(l, _)| *l == LEVEL_ARENA)
             .and_then(|(_, b)| super::balance::document(b, "mp_arena_rules"))
-            .map_or_else(super::rules::Rules::default, |r| super::rules::Rules::from_private(&r, goalie))
+            .map_or_else(|| super::rules::Rules::from_private(&none, &server), |r| super::rules::Rules::from_private(&r, &server))
     })
     .clone()
 }
@@ -518,6 +516,9 @@ pub fn baseline(level: u64, mode: u64) -> Option<&'static [Vec<u8>]> {
 }
 
 /// IdsResponse body for a level; the session's own level gets its mode's.
+/// `mpl_combat_fission_climax`, a Fission sublevel with net ids of its own.
+pub const LEVEL_FISSION_CLIMAX: u64 = 0xf919_f210_bbda_872c;
+
 pub fn ids_response(level: u64, session_level: u64, mode: u64) -> Option<&'static [u8]> {
     if level == session_level && private_arena(level, mode) {
         return Some(captured().private_ids.as_slice());
@@ -701,13 +702,6 @@ pub fn equip_in_loadout(d: &mut [u8], slot_type: u64, item: u64) -> bool {
 #[cfg(test)]
 mod loadout_tests {
     use super::*;
-
-    #[test]
-    fn award_ids_are_the_games_names() {
-        for (name, id) in [("mvp", AWARD_MVP_ID), ("unstoppable", AWARD_GOALS_ID), ("eagle_eye", AWARD_PASSES_ID), ("quick_reflexes", AWARD_CATCHES_ID), ("bruiser", AWARD_BRUISER_ID)] {
-            assert_eq!(crate::sns::symbol(name), id, "{name}");
-        }
-    }
 
     #[test]
     fn equip_symbols_match_the_capture() {

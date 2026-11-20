@@ -68,6 +68,9 @@ pub const EXPLOSION_NOTHING_HIT: u64 = h("SR15NetExplosionNothingHit");
 pub const EXPLOSION_PLAYER_DAMAGE: u64 = 0xc9bf_5b1d_bb88_8def;
 pub const STUN_MSG: u64 = 0x1feb_4959_6855_9bc3;
 pub const HEALTH_BROADCAST: u64 = 0x97bb_bd24_5d46_7354;
+/// `[damageable 8][slot u32][0 u32]`: native sends it with each INSTANT REPAIR
+/// that gives a player's shield back.
+pub const SHIELD_REPAIRED: u64 = h("SR15NetDamageableShieldRepaired");
 pub const PLAYER_KILLED: u64 = h("SR15NetDamageablePlayerKilled");
 pub const COOLDOWN_REFUND: u64 = h("SR15NetCooldownRefund");
 pub const DEPOSIT_MAGAZINE: u64 = h("SR15NetGameDepositMagazine");
@@ -113,6 +116,8 @@ const MARK_SCOUT: [u8; 8] = [0xe7, 0xda, 0xbe, 0xe8, 0x48, 0x77, 0x82, 0x03];
 const GUN_SCOUT: u8 = 0x1e;
 /// `DamageableHealthBroadcast` damage kinds (u32 at 20): explosions 4, ordnance 2.
 const HURT_EXPLOSION: u32 = 4;
+/// A shot's body part for the head (`multiplier`'s markers).
+const PART_HEAD: u32 = 5;
 const HURT_ORDNANCE: u32 = 2;
 /// DETONATOR damage (native: 65 on a dummy, killed a player at 27).
 const DET_DAMAGE: f32 = 65.0;
@@ -135,6 +140,15 @@ const ITEM_DET: [u8; 8] = [0xfe, 0xe7, 0x94, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
 const ITEM_STUN: [u8; 8] = [0xbe, 0x0b, 0x67, 0x29, 0x48, 0x3e, 0xc3, 0xc8];
 const ITEM_DOT: [u8; 8] = [0xfe, 0xed, 0x94, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
 const ITEM_DRONE: [u8; 8] = [0xb5, 0x4a, 0x80, 0xcb, 0xde, 0xc7, 0x2d, 0xe3];
+/// PHASE SHIFT's tac mod in `SR15NetPlayerEquipmentUpdate` bytes 16..24
+/// (the symbol of its `mp_equipment` name, `wraith`).
+const TAC_WRAITH: u64 = 0x41d2_d02f_1b2a_1316;
+/// ARC MINE (`grenade_properties.arc`).
+const ITEM_ARC: [u8; 8] = [0xe9, 0xf0, 0x91, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
+/// NEUTRON's tac mod (EchoCombat's `point`; `CSymbol64("point")`).
+const TAC_POINT: u64 = 0xe32d_c7ca_d686_4aa4;
+/// INSTANT REPAIR (`grenade_properties.burst`).
+const ITEM_BURST: [u8; 8] = [0xe9, 0xed, 0x9c, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
 /// A bullet collision's target (bytes 32..40) is a pool handle when its kind
 /// (bytes 36..40) is 1: `[index u16][generation u16]`.
 const HANDLE_KIND: [u8; 4] = [1, 0, 0, 0];
@@ -142,6 +156,16 @@ const HANDLE_KIND: [u8; 4] = [1, 0, 0, 0];
 const PART_BARRIER: u64 = 6;
 /// A barrier the level data does not list (the stock maximum).
 const BARRIER_HEALTH: f32 = 230.0;
+/// ENERGY BARRIER (and NEUTRON) walls: the pooled actor template of the
+/// 96-byte `PooledActorCreate`, their health (native: a DETONATOR's 140 left
+/// one at 275; drone bullets took Gauss's from 415 down by ones), and when
+/// native's server removes them (`PooledActorDestroy` to everyone, the placer
+/// too, 18.04 s after the create in all ten recorded).
+const WALL_TEMPLATE: [u8; 8] = [0x26, 0x29, 0x29, 0xd5, 0xa4, 0x8c, 0x8b, 0x3d];
+const WALL_HEALTH: f32 = 415.0;
+const WALL_LIFETIME: Duration = Duration::from_millis(18_040);
+/// A wall's box in its own frame (the level barriers' 230-health box).
+const WALL_BOX: [f32; 3] = [1.5, 1.0, 0.15];
 /// Native's barrier break / respawn event (`ComponentEvent` to the barrier's
 /// net handle, all clients, around a `DealDamage` with its new health).
 /// Wire bytes `ff278203989fcc2b` / `c4b6bab2ee99ea6a` (u64s little-endian;
@@ -149,12 +173,15 @@ const BARRIER_HEALTH: f32 = 230.0;
 /// the break and kept broken barriers up).
 const BARRIER_EVENT: u64 = 0x2bcc_9f98_0382_27ff;
 pub const BARRIER_MODULE: u64 = 0x6aea_99ee_b2ba_b6c4;
-use super::msg::COMPONENT_EVENT;
+use super::msg::{ACTOR_DESTROY, COMPONENT_EVENT};
 
 /// A level's damageable net components (`tools/gen_combat_maps.py`): pool
 /// slot, net handle, max health, respawn seconds (0: stays down).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Barrier {
+    /// The space its damageable is in: the level's, or a sublevel's (Fission's
+    /// climax).
+    space: [u8; 8],
     pool: u16,
     handle: u16,
     max: f32,
@@ -185,6 +212,45 @@ impl Barrier {
         let p = [self.pos[0] + r[0], self.pos[1] + r[1], self.pos[2] + r[2]];
         Some((p, dist(at, p)))
     }
+
+    /// Whether the segment `a`..`b` passes through the barrier's box, past
+    /// its first `skip` metres.
+    fn crosses(&self, a: [f32; 3], b: [f32; 3], skip: f32) -> bool {
+        if self.half.iter().all(|h| *h <= 0.0) {
+            return false;
+        }
+        let [x, y, z, w] = self.rot;
+        let local = |p: [f32; 3]| {
+            let mut l = rotate([-x, -y, -z, w], [p[0] - self.pos[0], p[1] - self.pos[1], p[2] - self.pos[2]]);
+            l[2] -= self.off_z;
+            l
+        };
+        let (la, lb) = (local(a), local(b));
+        let len = dist(a, b);
+        if len <= skip + skip {
+            return false;
+        }
+        let (mut t0, mut t1) = (skip / len, 1.0 - skip / len);
+        for i in 0..3 {
+            let d = lb[i] - la[i];
+            if d.abs() < 1e-9 {
+                if la[i].abs() > self.half[i] {
+                    return false;
+                }
+                continue;
+            }
+            let (mut e, mut f) = ((-self.half[i] - la[i]) / d, (self.half[i] - la[i]) / d);
+            if e > f {
+                std::mem::swap(&mut e, &mut f);
+            }
+            t0 = t0.max(e);
+            t1 = t1.min(f);
+            if t0 > t1 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// `v` rotated by the unit quaternion `q` (x, y, z, w).
@@ -206,12 +272,23 @@ fn barriers_of(space: [u8; 8]) -> Vec<Barrier> {
         _ if space == AREA => include_str!("data/lobby_combat_barriers.txt"),
         _ => "",
     };
+    let mut v = parse_barriers(space, text);
+    // Fission's climax sublevel has its own damageables (1000 health; native
+    // dealt them damage in their own space, pool slot 2 = handle 258).
+    if u64::from_le_bytes(space) == LEVEL_FISSION {
+        v.extend(parse_barriers(super::msg::LEVEL_FISSION_CLIMAX.to_le_bytes(), include_str!("data/combat_fission_climax_barriers.txt")));
+    }
+    v
+}
+
+fn parse_barriers(space: [u8; 8], text: &str) -> Vec<Barrier> {
     text.lines()
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
             let n = |i: usize| f.get(i).and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.0);
             Some(Barrier {
+                space,
                 pool: f.first()?.parse().ok()?,
                 handle: f.get(1)?.parse().ok()?,
                 max: f.get(2)?.parse().ok()?,
@@ -229,12 +306,21 @@ fn barrier_event(handle: u16) -> [u8; 24] {
     super::msg::component_event(BARRIER_EVENT, BARRIER_MODULE, handle, super::msg::FILTER_ALL_ALT)
 }
 /// OVERCHARGE (the user's spec, 2026-11-16): the user and linked teammates
-/// take 25% less damage; linked teammates cannot die for 8 s from their first
+/// take 25% less damage; linked teammates cannot die for `cheat_death()` from their first
 /// link, until the link breaks or they leave.
 const OVERCHARGE_DR: f32 = 0.25;
 /// DOT FIELD's time on the ground (the user's choice, 2026-11-16; stock 8 s).
 const DOT_LIFETIME: Duration = Duration::from_secs(11);
-const CHEAT_DEATH: Duration = Duration::from_secs(8);
+/// OVERCHARGE's cheat death: `ability_properties.buff.cheat_death_seconds`
+/// (EchoCombat: 5) from a teammate's first link in a use, or none when
+/// `do_rez_buff` is 0.
+fn cheat_death() -> Duration {
+    let b = |k: &str| weapons().pointer(&format!("/ability_properties/buff/{k}")).and_then(Value::as_f64);
+    if b("do_rez_buff").is_some_and(|x| x == 0.0) {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(b("cheat_death_seconds").unwrap_or(5.0).clamp(0.0, 600.0))
+}
 
 /// How long an OVERCHARGE boost lasts (`ability_properties.buff.dr_duration`).
 fn overcharge_duration() -> Duration {
@@ -244,6 +330,30 @@ fn overcharge_duration() -> Duration {
 /// A player's damageable id is this with its low byte xor the slot.
 const PLAYER_ID: [u8; 8] = [0xf2, 0x34, 0xd5, 0x09, 0x99, 0x74, 0x11, 0x3f];
 const NO_PLAYER: [u8; 8] = [0xff; 8];
+
+/// A player's damageable id: `PLAYER_ID` with bytes 0..2 xor their slot and
+/// bytes 4..6 xor their generation (a player who rejoined, generation 1, is
+/// `f7 34 d5 09 98 74 11 3f` at slot 5: hits on them carry that).
+fn player_id(slot: u16, generation: u16) -> [u8; 8] {
+    let mut id = PLAYER_ID;
+    let (s, g) = (slot.to_le_bytes(), generation.to_le_bytes());
+    id[0] ^= s[0];
+    id[1] ^= s[1];
+    id[4] ^= g[0];
+    id[5] ^= g[1];
+    id
+}
+
+/// The (slot, generation) a player's damageable id names, if it is one.
+fn id_handle(id: [u8; 8]) -> Option<(u16, u16)> {
+    if id[2..4] != PLAYER_ID[2..4] || id[6..8] != PLAYER_ID[6..8] {
+        return None;
+    }
+    let x = |i: usize| id[i] ^ PLAYER_ID[i];
+    let (slot, generation) = (u16::from_le_bytes([x(0), x(1)]), u16::from_le_bytes([x(4), x(5)]));
+    // Real slots and generations are small: anything else is another object.
+    (slot < 64 && generation < 256).then_some((slot, generation))
+}
 /// The damageable id every health message starts with.
 const DAMAGEABLE: [u8; 8] = [0x8e, 0xc2, 0x1d, 0x00, 0xd3, 0x15, 0x99, 0x3f];
 /// A dead player's client asks to respawn after 6.5 s; if it never does, the
@@ -287,8 +397,19 @@ const WAR_ROOM_CODE: u32 = 1 << 31;
 const PLAYER_CODE: u32 = 0x17;
 /// OVERCHARGE's heal bubble (`HealBubbleParamUpdate` bytes 8..16: heal 3, 10 s, radius 12).
 const OVERCHARGE_BUBBLE: [u8; 8] = [0x41, 0xe3, 0x5b, 0x49, 0x67, 0x32, 0x83, 0xb9];
-/// Full health, as native broadcasts it.
+/// REPAIR MATRIX's heal bubble (`HealBubbleParamUpdate`: heal 114, 12 s, radius 8,
+/// `ability_properties.heal`).
+const REPAIR_BUBBLE: [u8; 8] = [0xd1, 0xeb, 0x3d, 0x3f, 0xa8, 0xa2, 0xfd, 0xb1];
+/// A full shield, as native broadcasts it (the first of the two values).
+/// Every hit, healing and regeneration seen in native moves this one.
 const FULL_HEALTH: f32 = 112.0;
+/// The health under the shield (the second value: 7.0 alive, 0 dead). The
+/// game's `ProcessDamageServer` (EchoCombat's powerboost.cpp): the shield takes
+/// a hit first; health only loses what the shield did not take, and only once
+/// the shield is down or the hit is at least twice the shield. So no single hit
+/// kills from a full shield (a charged COMET head hit, 120, leaves 0 shield and
+/// 7 health: native Fission, 2026-11-16, then regenerated); the next one does.
+const FULL_CORE: f32 = 7.0;
 /// The position native reports is the body's, a little lower.
 const BODY_DROP: f32 = 0.35;
 const BODY_RADIUS: f32 = 0.3;
@@ -297,7 +418,10 @@ const BODY_RADIUS: f32 = 0.3;
 /// [hit position][12 zero][cause]`. Native keeps the last hurt's fields.
 #[derive(Clone, Copy)]
 struct Life {
+    /// The shield (see `FULL_HEALTH`).
     health: f32,
+    /// The health under it (see `FULL_CORE`).
+    core: f32,
     hurt: Option<(u32, [f32; 3], [u8; 8])>,
     dead: bool,
     died_at: Option<Instant>,
@@ -306,9 +430,15 @@ struct Life {
     regen_at: Option<Instant>,
 }
 
+impl Life {
+    fn full(&self) -> bool {
+        self.health >= FULL_HEALTH && self.core >= FULL_CORE
+    }
+}
+
 impl Default for Life {
     fn default() -> Self {
-        Self { health: FULL_HEALTH, hurt: None, dead: false, died_at: None, lost_at: None, regen_at: None }
+        Self { health: FULL_HEALTH, core: FULL_CORE, hurt: None, dead: false, died_at: None, lost_at: None, regen_at: None }
     }
 }
 
@@ -320,9 +450,9 @@ fn health_body(owner: [u8; 8], slot: u32, life: &Life, entry: bool) -> Vec<u8> {
     let mut b = owner.to_vec();
     b.extend_from_slice(&slot.to_le_bytes());
     b.extend_from_slice(&life.health.to_le_bytes());
-    // 7.0 while alive, 0 once dead (native's broadcast at a kill). Always 7.0
-    // left a player at 0 health standing: "critical", never dying.
-    b.extend_from_slice(&(if life.dead { 0f32 } else { 7f32 }).to_le_bytes());
+    // The health under the shield: 7.0 at full, 0 once dead (native's
+    // broadcast at a kill).
+    b.extend_from_slice(&(if life.dead { 0f32 } else { life.core }).to_le_bytes());
     let (kind, pos, cause) = life.hurt.unwrap_or((0, [0.0; 3], if entry { [0xff; 8] } else { [0; 8] }));
     b.extend_from_slice(&kind.to_le_bytes());
     b.extend_from_slice(&[0; 4]);
@@ -335,11 +465,35 @@ fn health_body(owner: [u8; 8], slot: u32, life: &Life, entry: bool) -> Vec<u8> {
     b
 }
 
+/// A health broadcast for health coming back (regen, heals), as native's
+/// regen sends it: the regen kind until full, and ffffffff at 28 (no hit).
+fn regen_body(owner: [u8; 8], slot: u32, life: &Life) -> Vec<u8> {
+    let mut shown = *life;
+    shown.hurt = if life.full() { None } else { Some((HURT_REGEN, [0.0; 3], [0; 8])) };
+    let mut b = health_body(owner, slot, &shown, false);
+    b[28..32].copy_from_slice(&[0xff; 4]);
+    b
+}
+
+/// A hit of `amount` on `shield` over `core` (`ProcessDamageServer`): what
+/// each loses.
+fn split_hit(shield: f32, core: f32, amount: f32) -> (f32, f32) {
+    if shield > 0.0 {
+        let to_core = if amount >= shield + shield { amount - shield } else { 0.0 };
+        (amount.min(shield), to_core.min(core.max(0.0)))
+    } else {
+        (0.0, amount.min(core.max(0.0)))
+    }
+}
+
 /// The combat area's id as it appears in messages.
 const AREA: [u8; 8] = [0x26, 0x45, 0x2b, 0xfc, 0xf7, 0x77, 0x99, 0xcb];
 /// Magazine states (`SetMagazineState` bytes 16..24).
 const MAG_THROWN: [u8; 8] = [0xa9, 0x50, 0x9f, 0xd4, 0xdf, 0xc7, 0x2d, 0xe3];
 const MAG_USED: [u8; 8] = [0x62, 0x81, 0xfb, 0x26, 0x1b, 0x84, 0xf5, 0x33];
+/// Ordnance in hand (spawned, or picked back up) and let go of.
+const MAG_HELD: [u8; 8] = [0x1b, 0x0b, 0x21, 0x1b, 0x29, 0xd4, 0xd2, 0x41];
+const MAG_RELEASED: [u8; 8] = [0x63, 0x88, 0xfd, 0x28, 0x03, 0x87, 0xe3, 0x23];
 /// Second half of every `CooldownActive` the native server sent.
 const COOLDOWN_TAIL: [u8; 8] = [0x58, 0xc5, 0x1a, 0x93, 0x3f, 0xe3, 0x35, 0x56];
 const DESTROY_AFTER: Duration = Duration::from_millis(2500);
@@ -355,7 +509,8 @@ fn cooldown(item: [u8; 8]) -> Duration {
         ITEM_STUN => "stun",
         ITEM_DOT => "dot",
         ITEM_DRONE => "drone",
-        [0xe9, 0xed, 0x9c, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8] => "burst",
+        ITEM_ARC => "arc",
+        ITEM_BURST => "burst",
         _ => "",
     };
     let secs = weapons().pointer(&format!("/grenade_properties/{name}/cooldown")).and_then(Value::as_f64).unwrap_or(30.0);
@@ -418,11 +573,44 @@ fn out(to: To, ty: u64, body: &[u8]) -> Out {
     Out { to, ty, body: body.to_vec() }
 }
 
+#[derive(Clone, Copy)]
 struct Mag {
     owner: [u8; 8],
     item: [u8; 8],
     thrower: SocketAddr,
     ending: bool,
+}
+
+/// An ARC MINE let go of: where it is (its last thrown position until it
+/// arms), when it arms, and when it goes off once something set it off.
+struct Mine {
+    mag: [u8; 8],
+    owner: [u8; 8],
+    /// `SetMagazineState` bytes 0..8, for the used state the server sends.
+    head: [u8; 8],
+    thrower: SocketAddr,
+    at: Option<[f32; 3]>,
+    armed_at: Instant,
+    fire_at: Option<Instant>,
+    /// When a shot first hit it: its owner's client then says it is used
+    /// (native); the server takes it down itself if that never comes.
+    shot_at: Option<Instant>,
+}
+
+/// How long the server waits for a shot ARC MINE's owner to say it is used
+/// (native: 16 ms after the hits) before taking it down itself.
+const MINE_SHOT_GRACE: Duration = Duration::from_millis(500);
+
+/// How far apart a NEUTRON's wall and its VeilNet `P` token may come.
+const POINT_TOKEN_WINDOW: Duration = Duration::from_millis(1500);
+
+/// A NEUTRON wall: where it stands, whose it is, its actor (the blast's id)
+/// and when it goes off.
+struct Neutron {
+    at: [f32; 3],
+    thrower: SocketAddr,
+    actor: [u8; 8],
+    fire_at: Instant,
 }
 
 /// A STUN FIELD or DOT FIELD on the ground.
@@ -435,6 +623,8 @@ struct Field {
     next: Instant,
     every: Duration,
     radius: f32,
+    /// When it went off (a STUN FIELD grows from then).
+    start: Instant,
     /// Victims a stun field already stunned.
     hit: Vec<[u8; 8]>,
 }
@@ -443,6 +633,22 @@ struct Field {
 type Hit = ([u8; 8], [f32; 3], f32, Option<SocketAddr>, u32);
 
 /// An OVERCHARGE running: its self-damage ticks.
+/// OVERCHARGE's small heal at work: its user, until when, when it last
+/// healed, and how much each player has had from it (capped).
+struct OcHeal {
+    who: SocketAddr,
+    until: Instant,
+    last: Instant,
+    given: HashMap<SocketAddr, f32>,
+}
+
+/// A REPAIR MATRIX at work: its user, until when, and when it last healed.
+struct Matrix {
+    who: SocketAddr,
+    until: Instant,
+    last: Instant,
+}
+
 struct Drain {
     who: SocketAddr,
     owner: [u8; 8],
@@ -454,7 +660,12 @@ struct Drain {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Credit {
     Damage { by: Option<SocketAddr>, victim: SocketAddr, amount: f32 },
-    Kill { by: Option<SocketAddr>, victim: SocketAddr },
+    /// `head`: the killing blow was a shot to the head (body part 5).
+    Kill { by: Option<SocketAddr>, victim: SocketAddr, head: bool },
+    /// A stun field stunned a player.
+    Stun { by: SocketAddr },
+    /// A REPAIR MATRIX or INSTANT REPAIR gave back health (to its user or a teammate).
+    Heal { by: SocketAddr, amount: f32 },
 }
 
 pub struct Gear {
@@ -467,8 +678,19 @@ pub struct Gear {
     bodies: HashMap<SocketAddr, (u16, [f32; 3])>,
     /// Each player's team (0 blue, 1 orange, else not playing), kept by the session.
     pub teams: HashMap<SocketAddr, u8>,
+    /// Each player's lobby slot, kept by the session: whose gear stations to
+    /// free when a player leaves before any body physics came from them.
+    pub slots: HashMap<SocketAddr, u32>,
+    /// Each player's generation (1 once they rejoined into a used slot), kept
+    /// by the session: part of their damageable id and handle.
+    pub gens: HashMap<SocketAddr, u16>,
+    /// What clients claim, checked (see `checks`).
+    checks: super::checks::Checks,
     /// Where each player's thrown ordnance is.
     thrown_at: HashMap<SocketAddr, [f32; 3]>,
+    /// Where it was before its last move, and whether it has stopped since
+    /// (stuck to a surface): a DETONATOR's blast does not go through that surface.
+    thrown_from: HashMap<SocketAddr, ([f32; 3], bool)>,
     fields: Vec<Field>,
     /// Heal bubble parameters by bubble, and each player's bubble owner id.
     bubbles: Vec<([u8; 8], Vec<u8>)>,
@@ -477,6 +699,9 @@ pub struct Gear {
     lives: HashMap<SocketAddr, Life>,
     /// Shots by explosion id: (weapon byte, projectile damage), from `GameFireGun`.
     shots: HashMap<[u8; 8], (u8, f32)>,
+    /// DRONE hits the server found from a shooter's shots (drone, shooter):
+    /// how many their client's own hit reports still have to match.
+    drone_rays: HashMap<([u8; 8], SocketAddr), u32>,
     drains: Vec<Drain>,
     /// Players inside the combat area (entered with the `SetOwner` burst).
     inside: Vec<SocketAddr>,
@@ -493,11 +718,36 @@ pub struct Gear {
     /// The space's barriers (level data) and when broken ones come back.
     barriers: Vec<Barrier>,
     respawns: Vec<(Instant, [u8; 8], Barrier)>,
+    /// Standing ENERGY BARRIER walls by actor id: their box (pool and handle
+    /// unused) and placer.
+    walls: HashMap<[u8; 8], (Barrier, SocketAddr)>,
     /// OVERCHARGE users and until when their boost lasts (PowerBoost: their gun
     /// hits deal more, the hits they take less).
     boosted: HashMap<SocketAddr, Instant>,
+    /// Each player's tac mod (equipment update bytes 16..24).
+    tactical: HashMap<SocketAddr, u64>,
+    /// PHASE SHIFT users and until when it lasts at most.
+    phased: HashMap<SocketAddr, Instant>,
+    /// NEUTRON walls waiting to go off.
+    neutrons: Vec<Neutron>,
+    /// Each player's last wall that wasn't taken as a NEUTRON (when, what):
+    /// a VeilNet `P` token that comes just after it makes it one.
+    last_wall: HashMap<SocketAddr, (Instant, Vec<u8>)>,
+    /// Each player's last VeilNet `P` token not yet matched to a wall.
+    point_tokens: HashMap<SocketAddr, Instant>,
+    /// ARC MINEs out.
+    mines: Vec<Mine>,
+    /// Running OVERCHARGE heals, and each linked teammate's OVERCHARGE user.
+    oc_heals: Vec<OcHeal>,
+    oc_linked: HashMap<SocketAddr, SocketAddr>,
+    /// Running REPAIR MATRIXes.
+    matrices: Vec<Matrix>,
     /// Teammates an OVERCHARGE bubble linked, and when their cheat death ends.
     links: HashMap<SocketAddr, Instant>,
+    /// When each OVERCHARGE user's current use began, and which use each
+    /// linked teammate's cheat death came from: one cheat death per use.
+    oc_use: HashMap<SocketAddr, Instant>,
+    link_use: HashMap<SocketAddr, (SocketAddr, Instant)>,
     /// The space combat objects live in: the lobby's combat area, or a combat
     /// map's level (native's Gauss server uses the level's id).
     space: [u8; 8],
@@ -540,22 +790,39 @@ impl Gear {
             later: Vec::new(),
             bodies: HashMap::new(),
             teams: HashMap::new(),
+            slots: HashMap::new(),
+            gens: HashMap::new(),
+            checks: super::checks::Checks::default(),
             thrown_at: HashMap::new(),
+            thrown_from: HashMap::new(),
             fields: Vec::new(),
             bubbles: Vec::new(),
             bubble_owner: HashMap::new(),
             lives: HashMap::new(),
             shots: HashMap::new(),
+            drone_rays: HashMap::new(),
             drains: Vec::new(),
+            matrices: Vec::new(),
+            oc_heals: Vec::new(),
+            oc_linked: HashMap::new(),
+            mines: Vec::new(),
+            neutrons: Vec::new(),
+            last_wall: HashMap::new(),
+            point_tokens: HashMap::new(),
+            tactical: HashMap::new(),
+            phased: HashMap::new(),
             inside: Vec::new(),
             left: HashMap::new(),
             leaving: HashMap::new(),
             area_events: HashSet::new(),
             area_health: HashMap::new(),
             barriers: barriers_of(AREA),
+            walls: HashMap::new(),
             respawns: Vec::new(),
             boosted: HashMap::new(),
             links: HashMap::new(),
+            oc_use: HashMap::new(),
+            link_use: HashMap::new(),
             space: AREA,
             in_match: false,
         }
@@ -565,12 +832,128 @@ impl Gear {
     pub fn set_match(&mut self, level: u64) {
         self.space = level.to_le_bytes();
         self.barriers = barriers_of(self.space);
+        self.walls.clear();
         self.in_match = true;
+        // Load the map's walls now, not at the first DETONATOR.
+        let _ = super::walls::of(level);
     }
 
     /// In combat: the lobby's combat area, or anywhere in a match.
     fn in_combat(&self, who: &SocketAddr) -> bool {
         self.in_match || self.inside.contains(who)
+    }
+
+    /// A player's equipment update: remembers their tac mod (PHASE SHIFT
+    /// or not); a change of tac mod ends a running phase.
+    pub fn set_equipment(&mut self, who: SocketAddr, d: &[u8]) {
+        let Some(b) = d.get(16..24) else { return };
+        let tac = u64::from_le_bytes(b.try_into().expect("8"));
+        if tac != TAC_WRAITH {
+            self.phased.remove(&who);
+        }
+        self.tactical.insert(who, tac);
+    }
+
+    /// A shot (`GameFireGun`: origin at 20, velocity at 36, damage at 48) at
+    /// the DRONEs out: the nearest one the shot's line passes within
+    /// `DRONE_HIT_RADIUS` of, with no wall between, takes the shot's damage,
+    /// if the shooter may hurt it (its thrower's opponents, or the thrower).
+    /// Clients often report no hit on a drone, so the server decides.
+    fn shot_at_drones(&mut self, from: SocketAddr, d: &[u8], now: Instant) -> Vec<Out> {
+        let (origin, vel) = (f3(d, 20), f3(d, 36));
+        let damage = f32::from_le_bytes(d[48..52].try_into().expect("4"));
+        let speed = (vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]).sqrt();
+        if speed < 1e-3 || damage <= 0.0 || !damage.is_finite() {
+            return Vec::new();
+        }
+        let dir = vel.map(|c| c / speed);
+        let mut best: Option<([u8; 8], f32)> = None;
+        for (mag, m) in &self.mags {
+            if m.item != ITEM_DRONE || !m.ending || self.area_health.get(mag).is_some_and(|h| *h <= 0.0) || !self.may_hurt(Some(from), m.thrower) {
+                continue;
+            }
+            let Some(&p) = self.thrown_at.get(&m.thrower) else { continue };
+            let rel = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+            let t = rel[0] * dir[0] + rel[1] * dir[1] + rel[2] * dir[2];
+            if !(0.0..=DRONE_SHOT_RANGE).contains(&t) {
+                continue;
+            }
+            let near = [origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t];
+            if dist(near, p) > DRONE_HIT_RADIUS || best.is_some_and(|(_, bt)| bt <= t) || self.line_blocked(origin, p, BLAST_SKIP) {
+                continue;
+            }
+            best = Some((*mag, t));
+        }
+        let Some((mag, _)) = best else { return Vec::new() };
+        let health = self.area_health.entry(mag).or_insert(ordnance_health(ITEM_DRONE));
+        *health = (*health - damage).max(0.0);
+        let left = *health;
+        *self.drone_rays.entry((mag, from)).or_default() += 1;
+        info!(%from, mag = %hex8(mag), damage, left, "DRONE shot");
+        let mut v = vec![self.deal(mag, left)];
+        if left <= 0.0 {
+            v.extend(self.drone_down(mag, now));
+        }
+        v
+    }
+
+    /// Whether a blast at `at` reaches the player whose head is at `head`: a
+    /// clear line to the head or to the body below it.
+    fn reaches(&self, at: [f32; 3], head: [f32; 3]) -> bool {
+        let body = [head[0], head[1] - BLAST_BODY_BELOW, head[2]];
+        !self.line_blocked(at, head, BLAST_SKIP) || !self.line_blocked(at, body, BLAST_SKIP)
+    }
+
+    /// `reaches`; with `through_walls` (the DOT FIELD) only a standing ENERGY
+    /// BARRIER stops it: it goes through the level's walls and barriers.
+    fn reaches_in(&self, at: [f32; 3], head: [f32; 3], through_walls: bool) -> bool {
+        if !through_walls {
+            return self.reaches(at, head);
+        }
+        let body = [head[0], head[1] - BLAST_BODY_BELOW, head[2]];
+        !self.tac_wall_blocked(at, head, BLAST_SKIP) || !self.tac_wall_blocked(at, body, BLAST_SKIP)
+    }
+
+    /// `line_blocked` with `skip` `BLAST_SKIP`, or with `through_walls` only
+    /// a standing ENERGY BARRIER.
+    fn blocked_in(&self, a: [f32; 3], b: [f32; 3], through_walls: bool) -> bool {
+        if through_walls { self.tac_wall_blocked(a, b, BLAST_SKIP) } else { self.line_blocked(a, b, BLAST_SKIP) }
+    }
+
+    /// Whether a standing ENERGY BARRIER wall stands between `a` and `b`.
+    fn tac_wall_blocked(&self, a: [f32; 3], b: [f32; 3], skip: f32) -> bool {
+        self.walls.values().any(|(w, _)| w.crosses(a, b, skip))
+    }
+
+    /// Whether the level's own walls stand between `a` and `b`.
+    fn level_blocked(&self, a: [f32; 3], b: [f32; 3], skip: f32) -> bool {
+        super::walls::of(u64::from_le_bytes(self.space)).is_some_and(|w| w.blocked(a, b, skip))
+    }
+
+    /// Whether level geometry or a standing barrier stands between `a` and `b`
+    /// (the first `skip` metres left out: the surface a blast sits on).
+    fn line_blocked(&self, a: [f32; 3], b: [f32; 3], skip: f32) -> bool {
+        if self.level_blocked(a, b, skip) {
+            return true;
+        }
+        self.barriers.iter().any(|bar| {
+            let mut target = [0u8; 8];
+            target[..2].copy_from_slice(&bar.pool.to_le_bytes());
+            target[4] = 1;
+            !self.area_health.get(&target).is_some_and(|h| *h <= 0.0) && bar.crosses(a, b, skip)
+        }) || self.tac_wall_blocked(a, b, skip)
+    }
+
+    /// Whether PHASE SHIFT is on for this player now.
+    fn phased(&self, who: &SocketAddr) -> bool {
+        self.phased.get(who).is_some_and(|t| Instant::now() < *t)
+    }
+
+    /// PHASE SHIFT's immunities (`ability_properties.wraith`): `dmg_imm`
+    /// (shots), `exp_imm` (explosions, ordnance), `stun_imm`; and
+    /// `disable_objectives` keeps its user off the objective.
+    pub fn immune(&self, who: &SocketAddr, what: &str) -> bool {
+        self.phased(who) && weapons().pointer(&format!("/ability_properties/wraith/{what}")).and_then(Value::as_bool).unwrap_or(true)
     }
 
     /// Whether a player is alive (not dead and waiting to respawn).
@@ -616,30 +999,59 @@ impl Gear {
 
     /// A client's 64-byte physics update: its body, or its thrown ordnance.
     pub fn observe_physics(&mut self, from: SocketAddr, d: &[u8]) {
+        self.observe_physics_at(from, d, Instant::now());
+    }
+
+    fn observe_physics_at(&mut self, from: SocketAddr, d: &[u8], now: Instant) {
         if d.len() != 64 {
             return;
         }
         let pos = transform(d);
         if d[4..8] == BODY_OBJECT {
+            if self.in_combat(&from) {
+                self.checks.moved(from, pos, now);
+            }
             self.bodies.insert(from, (u16::from_le_bytes([d[0], d[1]]), pos));
         } else if d[4..8] == self.space[..4] {
-            self.thrown_at.insert(from, pos);
+            if let Some(last) = self.thrown_at.insert(from, pos) {
+                if dist(last, pos) > STILL {
+                    self.thrown_from.insert(from, (last, false));
+                } else if let Some(f) = self.thrown_from.get_mut(&from) {
+                    f.1 = true;
+                }
+            }
         }
     }
 
     /// A player is gone: what the others must be told (their stations freed).
     pub fn forget(&mut self, who: SocketAddr) -> Vec<Out> {
-        let outs = if self.inside.contains(&who) { self.free_stations(self.slot_of(&who)) } else { Vec::new() };
+        self.checks.forget(who);
+        let outs = match self.station_slot(&who) {
+            Some(slot) if self.inside.contains(&who) => self.free_stations(slot),
+            _ => Vec::new(),
+        };
+        self.slots.remove(&who);
         self.bodies.remove(&who);
         self.thrown_at.remove(&who);
+        self.thrown_from.remove(&who);
         self.bubble_owner.remove(&who);
         self.lives.remove(&who);
         self.drains.retain(|d| d.who != who);
+        self.matrices.retain(|m| m.who != who);
+        self.oc_heals.retain(|h| h.who != who);
+        self.oc_linked.retain(|t, u| *t != who && *u != who);
+        self.mines.retain(|m| m.thrower != who);
+        self.tactical.remove(&who);
+        self.last_wall.remove(&who);
+        self.point_tokens.remove(&who);
+        self.phased.remove(&who);
         self.inside.retain(|a| *a != who);
         self.left.remove(&who);
         self.leaving.remove(&who);
         self.boosted.remove(&who);
         self.links.remove(&who);
+        self.oc_use.remove(&who);
+        self.link_use.retain(|t, (u, _)| *t != who && *u != who);
         // The leaver itself is gone: these go to the others.
         outs.into_iter().map(|o| Out { to: To::Others, ..o }).collect()
     }
@@ -678,32 +1090,37 @@ impl Gear {
 
     /// Everything an explosion at `at` from `by` reaches: (victim id, reported position, distance, player).
     fn victims(&self, at: [f32; 3], radius: f32, by: Option<SocketAddr>) -> Vec<Hit> {
+        self.victims_in(at, radius, by, false)
+    }
+
+    /// `victims`; with `through_walls` (the DOT FIELD, the one effect that
+    /// reaches through walls) only a standing ENERGY BARRIER shields.
+    fn victims_in(&self, at: [f32; 3], radius: f32, by: Option<SocketAddr>, through_walls: bool) -> Vec<Hit> {
         let mut v = Vec::new();
         for (a, (slot, p)) in &self.bodies {
             // Only players in the combat area can be hit (no stun or damage in the lobby).
-            if !self.in_combat(a) || !self.may_hurt(by, *a) {
+            if !self.in_combat(a) || !self.may_hurt(by, *a) || self.immune(a, "exp_imm") {
                 continue;
             }
             // The tracked position is the head: a blast at the feet is measured
             // to the body below it, not to the head 1.5 m up.
             let d = body_dist(at, *p);
-            if d <= radius + BODY_RADIUS {
-                let mut id = PLAYER_ID;
-                id[0] ^= *slot as u8;
+            if d <= radius + BODY_RADIUS && self.reaches_in(at, *p, through_walls) {
+                let id = self.id_of(a, *slot);
                 v.push((id, [p[0], p[1] - BODY_DROP, p[2]], d, Some(*a), PLAYER_CODE));
             }
         }
         // The lobby's training dummies (none in a match).
         for (p, code) in DUMMIES.iter().filter(|_| !self.in_match) {
             let d = dist(at, *p);
-            if d <= radius + DUMMY_RADIUS {
+            if d <= radius + DUMMY_RADIUS && !self.blocked_in(at, *p, through_walls) {
                 v.push((NO_PLAYER, *p, d, None, *code));
             }
         }
         // A match's war room dummies.
         for (i, p) in WAR_ROOM_DUMMIES.iter().enumerate().filter(|_| self.in_match) {
             let d = dist(at, *p);
-            if d <= radius + WAR_ROOM_DUMMY_RADIUS {
+            if d <= radius + WAR_ROOM_DUMMY_RADIUS && !self.blocked_in(at, *p, through_walls) {
                 v.push((NO_PLAYER, *p, d, None, WAR_ROOM_CODE | i as u32));
             }
         }
@@ -712,18 +1129,110 @@ impl Gear {
 
     /// Damage to a player: their new health to everyone, and `PlayerKilled` at 0.
     /// A player's slot, from their body physics.
+    /// With their generation above it (`gen << 16 | slot`, the player handle
+    /// health broadcasts and kills carry: a player who rejoined is generation 1).
     pub fn slot_of(&self, who: &SocketAddr) -> u32 {
-        self.bodies.get(who).map_or(0, |b| u32::from(b.0))
+        let slot = self.bodies.get(who).map(|b| u32::from(b.0)).or_else(|| self.slots.get(who).copied()).unwrap_or(0);
+        (u32::from(self.gens.get(who).copied().unwrap_or(0)) << 16) | (slot & 0xffff)
     }
 
-    /// The player a damageable id names (`PLAYER_ID` with the low byte xor
-    /// their slot), in the combat area.
-    fn player_by_id(&self, id: [u8; 8]) -> Option<SocketAddr> {
-        if id[1..] != PLAYER_ID[1..] {
-            return None;
+    /// The slot whose gear stations are a player's: the session's, else their
+    /// body's; none if neither is known. (Falling back to 0 freed slot 0's
+    /// stations when a player who never sent body physics left: whoever was
+    /// slot 0 lost their gun.)
+    fn station_slot(&self, who: &SocketAddr) -> Option<u32> {
+        self.slots.get(who).copied().or_else(|| self.bodies.get(who).map(|b| u32::from(b.0)))
+    }
+
+    /// An arena throw faster than the game allows (logged only).
+    pub fn flag_throw(&mut self, who: SocketAddr, speed: f32) {
+        self.checks.flag(who, super::checks::Flag::ThrowSpeed, &format!("a disc thrown at {speed:.2} m/s (the game's most is 18.95)"));
+    }
+
+    /// A shot (`GameFireGun`, damage at 48, the gun's instance at 0) checked:
+    /// its damage one some gun does, its gun under its fire rate. None: drop
+    /// it (enforce mode). The damage capped at the most any gun does.
+    fn check_shot(&mut self, from: SocketAddr, d: &[u8], now: Instant) -> Option<Vec<u8>> {
+        use super::checks::{Flag, Mode, mode};
+        let w = if self.in_match { combat_weapons() } else { weapons() };
+        let damage = f32_at(d, 48);
+        let in_rate = self.checks.fired(w, from, d[0], damage, now);
+        let most = super::checks::most_damage(w, 0);
+        let mut d = d.to_vec();
+        if !damage.is_finite() || damage > most + 0.01 {
+            self.checks.flag(from, Flag::Damage, &format!("a shot claiming {damage} damage (most {most})"));
+            if mode() == Mode::Enforce {
+                d[48..52].copy_from_slice(&most.to_le_bytes());
+            }
         }
-        let slot = u16::from(id[0] ^ PLAYER_ID[0]);
-        self.bodies.iter().find(|(a, (s, _))| *s == slot && self.in_combat(a)).map(|(a, _)| *a)
+        (in_rate || mode() != Mode::Enforce).then_some(d)
+    }
+
+    /// A hit (`DamageableBulletCollision`: gun at 0, damage at 44) checked:
+    /// damage over its gun's most is flagged, and capped in enforce mode.
+    fn check_hit_damage(&mut self, from: SocketAddr, d: &[u8]) -> Vec<u8> {
+        use super::checks::{Flag, Mode, mode};
+        let mut d = d.to_vec();
+        if mode() == Mode::Off {
+            return d;
+        }
+        let w = if self.in_match { combat_weapons() } else { weapons() };
+        let gun = u64::from_le_bytes(arr8(&d, 0));
+        let most = super::checks::most_damage(w, gun);
+        let base = f32_at(&d, 44);
+        if !base.is_finite() || base > most + 0.01 {
+            self.checks.flag(from, Flag::Damage, &format!("a hit claiming {base} damage (its gun's most {most})"));
+            if mode() == Mode::Enforce {
+                d[44..48].copy_from_slice(&most.to_le_bytes());
+            }
+        }
+        d
+    }
+
+    /// A hit on `victim` at `at`: near their body (else flagged, and dropped
+    /// in enforce mode), and no level wall between the shooter and it
+    /// (flagged only). Whether to apply it.
+    fn check_hit_position(&mut self, from: SocketAddr, victim: SocketAddr, at: [f32; 3], gun: u64) -> bool {
+        use super::checks::{FAR_FROM_VICTIM, Flag, Mode, mode};
+        if mode() == Mode::Off {
+            return true;
+        }
+        let w = if self.in_match { combat_weapons() } else { weapons() };
+        // A drone's shots come from the drone's own aim, not the thrower's:
+        // only hand guns are checked.
+        if !super::checks::hand_gun(w, gun) {
+            return true;
+        }
+        let Some(&(_, head)) = self.bodies.get(&victim) else { return true };
+        // Nearest to where the victim was over the last second.
+        let off = self.checks.trail(victim).map(|p| body_dist(at, p)).fold(body_dist(at, head), f32::min);
+        if off > FAR_FROM_VICTIM {
+            self.checks.flag(from, Flag::FarFromVictim, &format!("a hit {off:.1} m from {victim}'s body"));
+            return mode() != Mode::Enforce;
+        }
+        // From the head and the chest both: a gun held out past a corner
+        // sees round it.
+        if let Some(&(_, eye)) = self.bodies.get(&from)
+            && self.level_blocked(eye, at, HIT_WALL_SKIP)
+            && self.level_blocked([eye[0], eye[1] - 0.45, eye[2]], at, HIT_WALL_SKIP)
+        {
+            self.checks.flag(from, Flag::ThroughWall, &format!("a hit on {victim} with a level wall in between"));
+        }
+        true
+    }
+
+    /// The player a damageable id names (see `player_id`), in the combat area:
+    /// the one with that slot and generation, else (generation unknown) the slot.
+    fn player_by_id(&self, id: [u8; 8]) -> Option<SocketAddr> {
+        let (slot, generation) = id_handle(id)?;
+        let here = |a: &&SocketAddr| self.in_combat(a);
+        let at_slot = || self.bodies.iter().filter(|(_, (s, _))| *s == slot).map(|(a, _)| a).filter(here);
+        at_slot().find(|a| self.gens.get(*a).copied().unwrap_or(0) == generation).or_else(|| at_slot().next()).copied()
+    }
+
+    /// A player's damageable id (see `player_id`).
+    fn id_of(&self, who: &SocketAddr, slot: u16) -> [u8; 8] {
+        player_id(slot, self.gens.get(who).copied().unwrap_or(0))
     }
 
     /// OVERCHARGE's bonus on a gun hit by `shooter` (PowerBoost): +body, or +head
@@ -750,22 +1259,38 @@ impl Gear {
             return;
         }
         let id = arr8(d, 8);
-        let Some(target) = self.player_by_id(id).or_else(|| (id[1..] == PLAYER_ID[1..]).then_some(from)) else {
+        let Some(target) = self.player_by_id(id).or_else(|| id_handle(id).is_some().then_some(from)) else {
             return;
         };
         let m = marker as u32;
         if (6_000_000..7_000_000).contains(&m) {
             info!(%from, %target, "OVERCHARGE link broken");
             self.links.remove(&target);
+            self.oc_linked.remove(&target);
             self.boosted.remove(&target);
             return;
         }
         let link = (2_000_000..3_000_000).contains(&m) || (4_000_000..5_000_000).contains(&m);
+        // This use of the user's: its start (a use marker, else the first
+        // link once the last use is over).
+        let fresh = |t: &Instant| now.saturating_duration_since(*t) > overcharge_duration() + Duration::from_secs(1);
+        if self.oc_use.get(&from).is_none_or(fresh) {
+            self.oc_use.insert(from, now);
+        }
+        let use_start = self.oc_use.get(&from).copied().unwrap_or(now);
         if link && target != from {
-            // Cheat death runs from the first link of this use.
-            let ends = self.links.get(&target).copied().filter(|t| *t > now).unwrap_or(now + CHEAT_DEATH);
-            info!(%from, %target, "OVERCHARGE linked: damage cut, cannot die for 8 s");
+            // Cheat death runs from the first link of this use, once: later
+            // links of the same use don't start it again (they did, so a
+            // teammate kept linked could never die).
+            let ends = if self.link_use.get(&target) == Some(&(from, use_start)) {
+                self.links.get(&target).copied().unwrap_or(now)
+            } else {
+                self.link_use.insert(target, (from, use_start));
+                now + cheat_death()
+            };
+            info!(%from, %target, cheat_death = ?ends.saturating_duration_since(now), "OVERCHARGE linked: damage cut, cannot die");
             self.links.insert(target, ends);
+            self.oc_linked.insert(target, from);
         } else {
             info!(%from, "OVERCHARGE use marker");
         }
@@ -773,16 +1298,14 @@ impl Gear {
     }
 
     /// What a hit on `who` really costs after OVERCHARGE: 25% off while boosted
-    /// or linked, and a linked teammate is left at 1 health instead of dying.
-    fn after_overcharge(&self, who: SocketAddr, amount: f32, health: f32, now: Instant) -> f32 {
-        let mut a = amount;
-        if self.boosted.get(&who).is_some_and(|t| *t > now) {
-            a *= 1.0 - OVERCHARGE_DR;
-        }
-        if self.links.get(&who).is_some_and(|t| *t > now) && health - a < 1.0 {
-            a = (health - 1.0).max(0.0);
-        }
-        a
+    /// or linked.
+    fn after_overcharge(&self, who: SocketAddr, amount: f32, now: Instant) -> f32 {
+        if self.boosted.get(&who).is_some_and(|t| *t > now) { amount * (1.0 - OVERCHARGE_DR) } else { amount }
+    }
+
+    /// OVERCHARGE's cheat death: a linked teammate keeps at least 1 health.
+    fn cheats_death(&self, who: SocketAddr, now: Instant) -> bool {
+        self.links.get(&who).is_some_and(|t| *t > now)
     }
 
     /// A new round: every barrier back at full health (native Dyson, between
@@ -804,7 +1327,7 @@ impl Gear {
         }
         for b in &all {
             self.area_health.insert(target(b), b.max);
-            v.push((anyone, self.deal(target(b), b.max)));
+            v.push((anyone, self.deal_in(b.space, target(b), b.max)));
         }
         let echo = Instant::now() + RESPAWN_ECHO_AFTER;
         for b in &all {
@@ -819,7 +1342,7 @@ impl Gear {
             .area_health
             .iter()
             .filter(|(t, h)| **h <= 0.0 && t[4..8] == HANDLE_KIND)
-            .filter_map(|(t, _)| self.barrier(*t).map(|b| b.handle))
+            .filter_map(|(t, _)| self.barrier(*t).filter(|b| b.space == self.space).map(|b| b.handle))
             .collect();
         v.sort_unstable();
         v.dedup();
@@ -827,12 +1350,22 @@ impl Gear {
     }
 
     fn barrier(&self, target: [u8; 8]) -> Option<Barrier> {
+        self.barrier_in(&self.space, target)
+    }
+
+    /// The barrier at `target`'s pool slot in the space starting `space`.
+    fn barrier_in(&self, space: &[u8], target: [u8; 8]) -> Option<Barrier> {
         let pool = u16::from_le_bytes([target[0], target[1]]);
-        self.barriers.iter().find(|b| b.pool == pool).copied()
+        self.barriers.iter().find(|b| b.pool == pool && b.space[..space.len().min(8)] == space[..space.len().min(8)]).copied()
     }
 
     fn deal(&self, target: [u8; 8], health: f32) -> Out {
-        let mut b = self.space.to_vec();
+        self.deal_in(self.space, target, health)
+    }
+
+    /// `deal` in another space (a sublevel's barriers, a wall's).
+    fn deal_in(&self, space: [u8; 8], target: [u8; 8], health: f32) -> Out {
+        let mut b = space.to_vec();
         b.extend_from_slice(&target);
         b.extend_from_slice(&health.to_le_bytes());
         b.extend_from_slice(&0f32.to_le_bytes());
@@ -846,8 +1379,8 @@ impl Gear {
     /// no more), and after the level's respawn time the same with full health
     /// (exactly 30 s in the Gauss and Dyson recordings). A broken one takes no
     /// more.
-    fn hit_barrier(&mut self, from: SocketAddr, target: [u8; 8], amount: f32, now: Instant) -> Vec<Out> {
-        let known = self.barrier(target);
+    fn hit_barrier(&mut self, from: SocketAddr, known: Option<Barrier>, target: [u8; 8], amount: f32, now: Instant) -> Vec<Out> {
+        let space = known.map_or(self.space, |b| b.space);
         let max = known.map_or(BARRIER_HEALTH, |b| b.max);
         let health = self.area_health.entry(target).or_insert(max);
         if *health <= 0.0 || amount <= 0.0 {
@@ -855,7 +1388,7 @@ impl Gear {
         }
         *health = (*health - amount).max(0.0);
         let left = *health;
-        let v = vec![self.deal(target, left)];
+        let v = vec![self.deal_in(space, target, left)];
         if left > 0.0 {
             info!(%from, barrier = %hex8(target), amount, left, "barrier hit");
             return v;
@@ -863,7 +1396,7 @@ impl Gear {
         info!(%from, barrier = %hex8(target), "barrier destroyed");
         if let Some(b) = known {
             let ev = barrier_event(b.handle);
-            let zero = self.deal(target, 0.0);
+            let zero = self.deal_in(space, target, 0.0);
             self.later.push((now + BREAK_EVENT_AFTER, from, out(To::All, COMPONENT_EVENT, &ev)));
             self.later.push((now + BREAK_EVENT_AFTER, from, zero));
             self.later.push((now + BREAK_ECHO_AFTER, from, out(To::All, COMPONENT_EVENT, &ev)));
@@ -888,7 +1421,7 @@ impl Gear {
         let mut hit: Vec<(Barrier, [f32; 3], f32)> = self
             .barriers
             .iter()
-            .filter_map(|b| b.nearest(at).filter(|(_, d)| *d <= reach).map(|(p, d)| (*b, p, d)))
+            .filter_map(|b| b.nearest(at).filter(|(p, d)| *d <= reach && !self.level_blocked(at, *p, BLAST_SKIP)).map(|(p, d)| (*b, p, d)))
             .collect();
         hit.sort_by(|a, b| a.2.total_cmp(&b.2));
         let mut v = Vec::new();
@@ -904,9 +1437,67 @@ impl Gear {
                 continue;
             }
             info!(%from, barrier = b.handle, distance = d, amount, "explosion reached a barrier");
-            v.extend(self.hit_barrier(from, target, amount, now));
-            v.push(out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&self.space, kind, p, NO_PLAYER, id)));
+            v.extend(self.hit_barrier(from, Some(b), target, amount, now));
+            v.push(out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&b.space, kind, p, NO_PLAYER, id)));
         }
+        // ENERGY BARRIER walls (native Fission: the wall's DealDamage, then
+        // `ExplosionPlayerDamage` at the wall's place with the wall as victim).
+        let mut walls: Vec<([u8; 8], Barrier, f32)> = self
+            .walls
+            .iter()
+            .filter_map(|(a, (w, _))| w.nearest(at).filter(|(p, d)| *d <= reach && !self.level_blocked(at, *p, BLAST_SKIP)).map(|(_, d)| (*a, *w, d)))
+            .collect();
+        walls.sort_by(|a, b| a.2.total_cmp(&b.2));
+        for (actor, w, d) in walls {
+            let amount = damage(d) * scale;
+            if amount <= 0.0 {
+                continue;
+            }
+            info!(%from, wall = %hex8(actor), distance = d, amount, "explosion reached an ENERGY BARRIER");
+            v.extend(self.hit_wall(from, actor, amount, now));
+            v.push(out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&w.space, kind, w.pos, actor, id)));
+        }
+        v
+    }
+
+    /// A wall placed (a 96-byte `PooledActorCreate` of the wall template:
+    /// `[rotation 16][place 12][scale 4][template 8][space 8][actor 8]..`):
+    /// native's health, and native's removal 18.04 s later.
+    fn add_wall(&mut self, from: SocketAddr, d: &[u8], now: Instant) {
+        if d.len() != 96 || d[32..40] != WALL_TEMPLATE {
+            return;
+        }
+        let (space, actor) = (arr8(d, 40), arr8(d, 48));
+        let q = [f32_at(d, 0), f32_at(d, 4), f32_at(d, 8), f32_at(d, 12)];
+        let norm = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let rot = if norm > 0.5 && norm.is_finite() { q.map(|x| x / norm) } else { [0.0, 0.0, 0.0, 1.0] };
+        let bar = Barrier { space, pool: 0, handle: 0, max: WALL_HEALTH, respawn: 0.0, pos: f3(d, 16), rot, half: WALL_BOX, off_z: 0.0 };
+        info!(%from, wall = %hex8(actor), "ENERGY BARRIER wall up");
+        self.walls.insert(actor, (bar, from));
+        self.area_health.insert(actor, WALL_HEALTH);
+        self.later.push((now + WALL_LIFETIME, from, out(To::All, ACTOR_DESTROY, &d[40..56])));
+    }
+
+    /// A hit on a standing wall: its health down for everyone, and at 0 it
+    /// is gone (removed now rather than at the end of its lifetime).
+    fn hit_wall(&mut self, from: SocketAddr, actor: [u8; 8], amount: f32, now: Instant) -> Vec<Out> {
+        let Some((w, _)) = self.walls.get(&actor).copied() else { return Vec::new() };
+        let health = self.area_health.entry(actor).or_insert(WALL_HEALTH);
+        if *health <= 0.0 || amount <= 0.0 {
+            return Vec::new();
+        }
+        *health = (*health - amount).max(0.0);
+        let left = *health;
+        let v = vec![self.deal_in(w.space, actor, left)];
+        if left > 0.0 {
+            info!(%from, wall = %hex8(actor), amount, left, "ENERGY BARRIER hit");
+            return v;
+        }
+        info!(%from, wall = %hex8(actor), "ENERGY BARRIER broken");
+        let body = [w.space, actor].concat();
+        self.later.retain(|(_, _, o)| !(o.ty == ACTOR_DESTROY && o.body == body));
+        self.walls.remove(&actor);
+        self.later.push((now + BREAK_EVENT_AFTER, from, out(To::All, ACTOR_DESTROY, &body)));
         v
     }
 
@@ -915,27 +1506,38 @@ impl Gear {
         let owner = self.bubble_owner.get(&who).copied().unwrap_or(DAMAGEABLE);
         let slot = self.slot_of(&who);
         let killer = by.map_or(slot, |a| self.slot_of(&a));
-        let health = self.lives.get(&who).map_or(FULL_HEALTH, |l| l.health);
         if !self.may_hurt(by, who) {
             return Vec::new();
         }
-        let amount = self.after_overcharge(who, amount, health, Instant::now());
+        let blast = matches!(kind, HURT_EXPLOSION | HURT_ORDNANCE);
+        if self.immune(&who, if blast { "exp_imm" } else { "dmg_imm" }) {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let amount = self.after_overcharge(who, amount, now);
+        let cheat = self.cheats_death(who, now);
         let life = self.lives.entry(who).or_default();
         if life.dead || amount <= 0.0 {
             return Vec::new();
         }
-        let before = life.health;
-        life.health = (life.health - amount).max(0.0);
-        let landed = before - life.health;
+        let (off_shield, mut off_core) = split_hit(life.health, life.core, amount);
+        if cheat {
+            off_core = off_core.min((life.core - 1.0).max(0.0));
+        }
+        life.health = (life.health - off_shield).max(0.0);
+        life.core = (life.core - off_core).max(0.0);
+        let landed = off_shield + off_core;
         life.hurt = Some((kind, pos, cause));
-        life.lost_at = Some(Instant::now());
+        life.lost_at = Some(now);
         life.regen_at = None;
         let mut v = Vec::new();
-        if life.health <= 0.0 {
+        if life.core <= 0.0 {
+            life.health = 0.0;
             life.dead = true;
             life.died_at = Some(Instant::now());
             info!(%who, cause = %hex8(cause), "player killed");
-            self.credits.push(Credit::Kill { by: by.filter(|a| *a != who), victim: who });
+            // Shots pass their body part as the kind (explosions 4, ordnance 2).
+            self.credits.push(Credit::Kill { by: by.filter(|a| *a != who), victim: who, head: kind == PART_HEAD && by.is_some() });
             // `[id][cause][victim slot][killer slot]` (Gauss match).
             v.push(out(To::All, PLAYER_KILLED, &[owner.as_slice(), &cause, &slot.to_le_bytes(), &killer.to_le_bytes()].concat()));
         }
@@ -966,6 +1568,7 @@ impl Gear {
         self.drains.retain(|d| d.who != from);
         let life = self.lives.entry(from).or_default();
         life.health = FULL_HEALTH;
+        life.core = FULL_CORE;
         life.dead = false;
         life.died_at = None;
         let life = *life;
@@ -1028,8 +1631,12 @@ impl Gear {
         self.leaving.remove(&from);
         self.left.insert(from, Instant::now());
         self.drains.retain(|d| d.who != from);
-        info!(%from, still_inside = self.inside.len(), "combat area left: gear stations freed");
-        self.free_stations(self.slot_of(&from))
+        let Some(slot) = self.station_slot(&from) else {
+            info!(%from, "combat area left: slot unknown, no gear stations freed");
+            return Vec::new();
+        };
+        info!(%from, slot, still_inside = self.inside.len(), "combat area left: gear stations freed");
+        self.free_stations(slot)
     }
 
     /// `SetBits fcffffff` at a player's bit of every station set (index
@@ -1083,11 +1690,26 @@ impl Gear {
                 self.drains.retain(|x| x.who != from);
                 self.drains.push(Drain { who: from, owner: arr8(d, 0), next: now + Duration::from_secs_f32(every), left });
                 self.boosted.insert(from, now + overcharge_duration());
+                self.oc_heals.retain(|h| h.who != from);
+                self.oc_linked.retain(|_, u| *u != from);
+                self.oc_heals.push(OcHeal { who: from, until: now + overcharge_duration(), last: now, given: HashMap::new() });
                 info!(%from, ticks = left, "OVERCHARGE on");
                 vec![out(To::Others, ty, d)]
             }
             FIRE_GUN => {
                 self.using_gear(from, now);
+                let checked;
+                let d = if d.len() == 64 && self.in_combat(&from) {
+                    match self.check_shot(from, d, now) {
+                        Some(c) => {
+                            checked = c;
+                            checked.as_slice()
+                        }
+                        None => return Vec::new(),
+                    }
+                } else {
+                    d
+                };
                 // Remember which gun fired each explosive shot (by its explosion id).
                 if d.len() == 64 {
                     if self.shots.len() > 256 {
@@ -1095,6 +1717,19 @@ impl Gear {
                     }
                     self.shots.insert(arr8(d, 56), (d[0], f32::from_le_bytes(d[48..52].try_into().expect("4"))));
                 }
+                let mut v = vec![out(To::Others, ty, d)];
+                if d.len() == 64 {
+                    v.extend(self.shot_at_drones(from, d, now));
+                }
+                v
+            }
+            HEAL_BUBBLE_ACTIVATE if d.len() >= 16 && arr8(d, 8) == REPAIR_BUBBLE => {
+                // Native heals everyone in it a little each frame (114 over
+                // 12 s: about 9.5 a second) and broadcasts their health.
+                let secs = heal_setting("heal_duration", 12.0).max(0.1);
+                self.matrices.retain(|m| m.who != from);
+                self.matrices.push(Matrix { who: from, until: now + Duration::from_secs_f32(secs), last: now });
+                info!(%from, secs, "REPAIR MATRIX on");
                 vec![out(To::Others, ty, d)]
             }
             HEAL_BUBBLE_ACTIVATE => vec![out(To::Others, ty, d)],
@@ -1102,6 +1737,7 @@ impl Gear {
                 self.bubble_owner.insert(from, arr8(d, 0));
                 let life = self.lives.entry(from).or_default();
                 life.health = FULL_HEALTH;
+                life.core = FULL_CORE;
                 life.dead = false;
                 life.died_at = None;
                 life.hurt = None;
@@ -1114,6 +1750,7 @@ impl Gear {
             DEPOSIT_MAGAZINE if d.len() == 16 => {
                 info!(%from, mag = %hex8(arr8(d, 8)), "ordnance put back");
                 self.mags.remove(&arr8(d, 8));
+                self.mines.retain(|m| m.mag != arr8(d, 8));
                 vec![out(To::Others, ty, d)]
             }
             // Native answers each cooldown with two.
@@ -1127,6 +1764,18 @@ impl Gear {
                 self.bubble_owner.insert(from, arr8(d, 0));
                 vec![out(To::All, ty, d)]
             }
+            // `[slot u32][on u32]`, for every tac mod: PHASE SHIFT's user is
+            // phased from on to off (or its duration, if off never comes).
+            ABILITY_ACTIVATE if d.len() == 8 && self.tactical.get(&from) == Some(&TAC_WRAITH) => {
+                if d[4..8] != [0; 4] {
+                    let secs = wraith_setting("duration", 10.0).max(0.1) + WRAITH_SLACK;
+                    self.phased.insert(from, now + Duration::from_secs_f32(secs));
+                    info!(%from, "PHASE SHIFT on");
+                } else if self.phased.remove(&from).is_some() {
+                    info!(%from, "PHASE SHIFT off");
+                }
+                vec![out(To::All, ty, d)]
+            }
             ABILITY_ACTIVATE | HEAL_BUBBLE_PARAMS => vec![out(To::All, ty, d)],
             // `[gun 8][direction 12][hit point 12][target 8][target space u32]
             // [damage f32][body part u8 + pad][shooter 8]`: the target is what
@@ -1135,6 +1784,8 @@ impl Gear {
             // the area's.
             BULLET_COLLISION if d.len() == 64 => {
                 self.using_gear(from, now);
+                let checked = self.check_hit_damage(from, d);
+                let d = checked.as_slice();
                 let at = f3(d, 20);
                 let target = arr8(d, 32);
                 let part = u64::from(d[48]);
@@ -1148,8 +1799,16 @@ impl Gear {
                 // In a match native marks nothing itself: the shooter's client does.
                 let mark = !self.in_match;
                 if d[40..44] == BODY_OBJECT {
-                    let mut v = if mark { vec![out(To::Sender, TRACKED_DAMAGE, &marker)] } else { Vec::new() };
-                    match self.player_by_id(target).filter(|a| *a != from) {
+                    let shot = self.player_by_id(target).filter(|a| *a != from);
+                    // No marker on a PHASE SHIFT user: the shot does nothing.
+                    let through = shot.is_some_and(|a| self.immune(&a, "dmg_imm"));
+                    let mut v = if mark && !through { vec![out(To::Sender, TRACKED_DAMAGE, &marker)] } else { Vec::new() };
+                    if let Some(victim) = shot
+                        && !self.check_hit_position(from, victim, at, u64::from_le_bytes(arr8(d, 0)))
+                    {
+                        return v;
+                    }
+                    match shot {
                         Some(victim) => {
                             info!(%from, %victim, amount, part, "shot hit a player");
                             v.extend(self.hurt(victim, amount, part as u32, at, arr8(d, 0), Some(from)));
@@ -1160,14 +1819,43 @@ impl Gear {
                 }
                 let index = u32::from(u16::from_le_bytes([target[0], target[1]]));
                 let dummy = DUMMIES.iter().any(|(_, c)| *c == index);
-                if d[40..44] == space[..4] && target[4..8] == HANDLE_KIND && !dummy && (part == PART_BARRIER || self.barrier(target).is_some()) {
-                    return self.hit_barrier(from, target, amount, now);
+                if target[4..8] == HANDLE_KIND && !dummy {
+                    // The level's barriers, or a sublevel's (Fission's climax).
+                    let known = self.barrier_in(&d[40..44], target);
+                    if known.is_some() || (d[40..44] == space[..4] && part == PART_BARRIER) {
+                        return self.hit_barrier(from, known, target, amount, now);
+                    }
+                }
+                if self.walls.contains_key(&target) {
+                    return self.hit_wall(from, target, amount, now);
                 }
                 if d[40..44] == space[..4] && self.mags.contains_key(&target) {
-                    let health = self.area_health.entry(target).or_insert(ORDNANCE_HEALTH);
+                    // An ARC MINE or DRONE: only its thrower's opponents (or
+                    // the thrower) shoot it down.
+                    let (item, thrower) = self.mags.get(&target).map(|m| (m.item, m.thrower)).expect("known");
+                    if matches!(item, ITEM_ARC | ITEM_DRONE) && !self.may_hurt(Some(from), thrower) {
+                        return Vec::new();
+                    }
+                    if item == ITEM_DRONE
+                        && let Some(n) = self.drone_rays.get_mut(&(target, from)).filter(|n| **n > 0)
+                    {
+                        // Already dealt from the shot itself.
+                        *n -= 1;
+                        return Vec::new();
+                    }
+                    if let Some(i) = self.mines.iter().position(|m| m.mag == target) {
+                        info!(%from, mag = %hex8(target), "ARC MINE shot");
+                        self.mines[i].shot_at.get_or_insert(now);
+                    }
+                    let health = self.area_health.entry(target).or_insert(ordnance_health(item));
+                    let was = *health;
                     *health = (*health - amount).max(0.0);
                     let left = *health;
-                    return vec![self.deal(target, left)];
+                    let mut v = vec![self.deal(target, left)];
+                    if item == ITEM_DRONE && left <= 0.0 && was > 0.0 {
+                        v.extend(self.drone_down(target, now));
+                    }
+                    return v;
                 }
                 if mark {
                     vec![out(To::Sender, TRACKED_DAMAGE, &marker)]
@@ -1212,6 +1900,10 @@ impl Gear {
                 // blast does not (scout_aoe's 0).
                 let table = if comet { "scout_aoe" } else { "rocket_aoe" };
                 let walls = self.splash_barriers(from, kind, id, at, radius + BODY_RADIUS, table, &*damage, now);
+                // Splash that deals damage (not an unknown blast's 0) takes mines down.
+                if damage(0.0) > 0.0 {
+                    v.extend(self.blast_mines(from, at, radius, &*damage, now));
+                }
                 if !walls.is_empty() && hits.is_empty() {
                     v.retain(|o| o.ty != EXPLOSION_NOTHING_HIT);
                 }
@@ -1242,6 +1934,19 @@ impl Gear {
                 let (id, state) = (arr8(d, 8), arr8(d, 16));
                 info!(%from, mag = %hex8(id), state = %hex8(state), known = self.mags.contains_key(&id), "ordnance state");
                 let mut v = vec![out(To::Others, ty, d)];
+                // ARC MINE: let go of, it sticks and arms; picked back up or
+                // used up (shot, or the client's own say), it is gone.
+                if state == MAG_RELEASED
+                    && let Some(m) = self.mags.get(&id).filter(|m| !m.ending && m.item == ITEM_ARC)
+                {
+                    let armed_at = now + Duration::from_secs_f32(arc_setting("arming_length", 3.5).max(0.0));
+                    let mine = Mine { mag: id, owner: m.owner, head: arr8(d, 0), thrower: m.thrower, at: None, armed_at, fire_at: None, shot_at: None };
+                    self.mines.retain(|x| x.mag != id);
+                    self.mines.push(mine);
+                    info!(%from, mag = %hex8(id), "ARC MINE placed");
+                } else if state == MAG_HELD || state == MAG_USED {
+                    self.mines.retain(|x| x.mag != id);
+                }
                 let thrown = self.mags.get(&id).filter(|m| !m.ending && state == MAG_THROWN).map(|m| (m.item, m.thrower));
                 if let Some((item, thrower)) = thrown
                     && let Some(at) = self.thrown_at.get(&thrower).copied()
@@ -1253,6 +1958,19 @@ impl Gear {
                         // drew several blasts.
                         let radius = weapons().pointer("/grenade_properties/det/radius").and_then(Value::as_f64).unwrap_or(DET_RADIUS) as f32;
                         let (mut o, mut hits) = self.explode(EX_DET, id, at, radius, thrower);
+                        // Stuck to a wall, it does not hurt the far side.
+                        if let Some(&(from_pos, true)) = self.thrown_from.get(&thrower) {
+                            let before = hits.len();
+                            hits.retain(|h| !behind_surface(at, from_pos, h.3.and_then(|a| self.bodies.get(&a)).map_or(h.1, |b| b.1)));
+                            if hits.len() != before {
+                                info!(%thrower, behind = before - hits.len(), "DETONATOR: victims behind the surface it stuck to, not hit");
+                                o = if hits.is_empty() {
+                                    vec![out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &EX_DET, &id].concat())]
+                                } else {
+                                    Vec::new()
+                                };
+                            }
+                        }
                         hits.sort_by(|x, y| x.2.total_cmp(&y.2));
                         if !hits.is_empty() {
                             o.truncate(0);
@@ -1261,6 +1979,7 @@ impl Gear {
                         // Barriers: native's dets broke Dyson's 101s outright
                         // (65 x 2.15) and left one 2 m off at 4 (97 taken).
                         let walls = self.splash_barriers(thrower, EX_DET, id, at, radius.max(DET_BARRIER_REACH), "det", &det_barrier_falloff, now);
+                        v.extend(self.blast_mines(thrower, at, radius.max(DET_BARRIER_REACH), &det_barrier_falloff, now));
                         if !walls.is_empty() && hits.is_empty() {
                             o.retain(|x| x.ty != EXPLOSION_NOTHING_HIT);
                         }
@@ -1280,9 +1999,9 @@ impl Gear {
                             weapons().pointer(&format!("/grenade_properties/{}/{k}", if dot { "dot" } else { "stun" })).and_then(Value::as_f64).unwrap_or(def) as f32
                         };
                         let every = if dot { Duration::from_secs_f32(1.0 / g("ticks_per_second", 3.0).max(0.5)) } else { Duration::from_millis(8) };
-                        let radius = if dot { g("radius", 3.5) } else { 3.0 };
+                        let radius = if dot { g("radius", 2.5) } else { stun_reach(Duration::MAX) };
                         let kind = if dot { EX_DOT } else { EX_STUN };
-                        self.fields.push(Field { kind, mag: id, at, thrower, until: now + lifetime(item), next: now, every, radius, hit: Vec::new() });
+                        self.fields.push(Field { kind, mag: id, at, thrower, until: now + lifetime(item), next: now, every, radius, start: now, hit: Vec::new() });
                     }
                 }
                 if let Some(m) = self.mags.get_mut(&id).filter(|m| !m.ending) {
@@ -1299,6 +2018,16 @@ impl Gear {
                         self.later.push((used + DESTROY_AFTER, from, out(To::All, DESTROY_MAGAZINE, &id)));
                     } else if state == MAG_USED {
                         m.ending = true;
+                        let (item, thrower) = (m.item, m.thrower);
+                        if item == ITEM_BURST {
+                            // INSTANT REPAIR: its thrower's client says when it
+                            // pops (native: held, released, then used ~1 s later).
+                            let at = self.thrown_at.get(&thrower).or_else(|| self.bodies.get(&thrower).map(|b| &b.1)).copied();
+                            if let Some(at) = at {
+                                v.extend(self.burst_heal(thrower, at));
+                            }
+                        }
+                        let Some(m) = self.mags.get(&id) else { return v };
                         v.push(out(To::Sender, COOLDOWN_ACTIVE, &[m.owner, COOLDOWN_TAIL].concat()));
                         self.later.push((now + cooldown(m.item), m.thrower, out(To::Sender, COOLDOWN_REFUND, &[m.owner, COOLDOWN_TAIL].concat())));
                         self.later.push((now + DESTROY_AFTER, from, out(To::All, DESTROY_MAGAZINE, &id)));
@@ -1308,6 +2037,408 @@ impl Gear {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// INSTANT REPAIR popping at `at`: `grenade_properties.burst.heal_amount`
+    /// (50) at once to its thrower and their teammates within `radius` (3.5 m).
+    fn burst_heal(&mut self, thrower: SocketAddr, at: [f32; 3]) -> Vec<Out> {
+        let b = |k: &str, def: f64| weapons().pointer(&format!("/grenade_properties/burst/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32;
+        let (amount, radius) = (b("heal_amount", 50.0), b("radius", 3.5));
+        let team = self.teams.get(&thrower).copied().filter(|t| *t < 2);
+        let near: Vec<SocketAddr> = self
+            .bodies
+            .iter()
+            .filter(|(a, (_, p))| (**a == thrower || (team.is_some() && self.teams.get(*a).copied() == team)) && self.in_combat(a) && body_dist(at, *p) <= radius + BODY_RADIUS && self.reaches(at, *p))
+            .map(|(a, _)| *a)
+            .collect();
+        let mut v = Vec::new();
+        for a in near {
+            if let Some(o) = self.give_health(a, amount, thrower) {
+                let slot = self.slot_of(&a);
+                let owner = self.bubble_owner.get(&a).copied().unwrap_or(DAMAGEABLE);
+                v.push(out(To::All, SHIELD_REPAIRED, &[owner.as_slice(), &slot.to_le_bytes(), &[0; 4]].concat()));
+                v.push(o);
+            }
+        }
+        info!(%thrower, healed = v.len() / 2, "INSTANT REPAIR");
+        v
+    }
+
+    /// Health back for `who` (never past full), credited to `by`: the
+    /// broadcast, or None when there was nothing to give.
+    fn give_health(&mut self, who: SocketAddr, amount: f32, by: SocketAddr) -> Option<Out> {
+        let slot = self.slot_of(&who);
+        let owner = self.bubble_owner.get(&who).copied().unwrap_or(DAMAGEABLE);
+        // No life yet: never hurt, so at full health.
+        let life = self.lives.get_mut(&who)?;
+        if life.dead || life.full() {
+            return None;
+        }
+        // The health under the shield comes back first, then the shield.
+        let to_core = amount.min(FULL_CORE - life.core).max(0.0);
+        let to_shield = (amount - to_core).min(FULL_HEALTH - life.health).max(0.0);
+        let got = to_core + to_shield;
+        if got <= 0.0 {
+            return None;
+        }
+        life.core += to_core;
+        life.health += to_shield;
+        if life.full() {
+            life.lost_at = None;
+        }
+        // As native's regen broadcasts: no hit in it. It carried the last
+        // hit (kind, place, cause), so every heal tick (REPAIR MATRIX: each
+        // 50 ms) played as a fresh hit on the healed player's game.
+        life.hurt = None;
+        let b = regen_body(owner, slot, life);
+        self.credits.push(Credit::Heal { by, amount: got });
+        Some(out(To::All, HEALTH_BROADCAST, &b))
+    }
+
+    /// A tac mod's wall placed (`SR15NetPooledActorCreate`, 96 bytes:
+    /// rotation 0..16, position 16..28 in metres, then template, space and
+    /// the actor at 48..56). From a player with NEUTRON equipped it is a
+    /// NEUTRON: EchoCombat's wall script (tools/fix_point.py) hides it, waits
+    /// `charge_up_time`, then sets off the STUN FIELD's own explosion
+    /// (`25905b54e61d3f10`) with NEUTRON's `radius`. That blast is the
+    /// server's alone (the clients' copy is switched off), so it is done here.
+    pub fn wall_placed(&mut self, from: SocketAddr, d: &[u8], now: Instant) {
+        if d.len() != 96 {
+            return;
+        }
+        self.add_wall(from, d, now);
+        // EchoCombat's NEUTRON script sends a VeilNet `P` token with each use,
+        // so a token close to the wall marks it whatever the equipment said.
+        let token = self.point_tokens.get(&from).is_some_and(|t| now.saturating_duration_since(*t) <= POINT_TOKEN_WINDOW);
+        if !token && self.tactical.get(&from) != Some(&TAC_POINT) {
+            self.last_wall.insert(from, (now, d.to_vec()));
+            return;
+        }
+        self.point_tokens.remove(&from);
+        self.arm_neutron(from, d, now);
+    }
+
+    /// A VeilNet `P` (NEUTRON used) from this player: their wall just placed,
+    /// or the next one, is a NEUTRON.
+    pub fn point_token(&mut self, from: SocketAddr, now: Instant) {
+        match self.last_wall.remove(&from) {
+            Some((at, d)) if now.saturating_duration_since(at) <= POINT_TOKEN_WINDOW => {
+                info!(%from, "NEUTRON token for a wall placed just before");
+                self.arm_neutron(from, &d, at);
+            }
+            _ => {
+                self.point_tokens.insert(from, now);
+            }
+        }
+    }
+
+    fn arm_neutron(&mut self, from: SocketAddr, d: &[u8], placed: Instant) {
+        let at = f3(d, 16);
+        let delay = Duration::from_secs_f32(point_setting("charge_up_time", 1.25).max(0.0));
+        info!(%from, ?at, "NEUTRON placed");
+        // Its wall is the field itself, not an ENERGY BARRIER: it neither
+        // blocks nor takes damage (native still removes it at 18 s).
+        let actor = arr8(d, 48);
+        if self.walls.remove(&actor).is_some() {
+            self.area_health.remove(&actor);
+        }
+        self.neutrons.push(Neutron { at, thrower: from, actor: arr8(d, 48), fire_at: placed + delay });
+    }
+
+    /// NEUTRONs whose charge is up: every enemy within `radius` (to the
+    /// body's line, as the field players are shown) is stunned, as a STUN
+    /// FIELD stuns, credited to its owner.
+    fn neutron_blasts(&mut self, now: Instant, ready: &mut Vec<(SocketAddr, Out)>) {
+        if self.neutrons.is_empty() {
+            return;
+        }
+        let space = self.space;
+        let radius = point_setting("radius", 2.5);
+        let due: Vec<Neutron> = {
+            let (go, wait): (Vec<Neutron>, Vec<Neutron>) = std::mem::take(&mut self.neutrons).into_iter().partition(|n| n.fire_at <= now);
+            self.neutrons = wait;
+            go
+        };
+        for n in due {
+            // A bubble going off around its user (where they are now), 2.5 m
+            // to the body; walls and barriers in the way shield (`victims`).
+            let at = self.bodies.get(&n.thrower).map_or(n.at, |b| b.1);
+            let hits: Vec<Hit> = self
+                .victims(at, (radius - BODY_RADIUS).max(0.0), Some(n.thrower))
+                .into_iter()
+                .filter(|h| h.3.is_some_and(|a| a != n.thrower && self.alive(a) && !self.immune(&a, "stun_imm")))
+                .collect();
+            info!(thrower = %n.thrower, ?at, stunned = hits.len(), "NEUTRON went off around its user");
+            if hits.is_empty() {
+                ready.push((n.thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &EX_STUN, &n.actor].concat())));
+            }
+            for (victim, pos, _, _, _) in hits {
+                self.credits.push(Credit::Stun { by: n.thrower });
+                ready.push((n.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, EX_STUN, pos, victim, n.actor))));
+                let target = u64::from(id_handle(victim).map_or(0, |(s, g)| (u32::from(g) << 16) | u32::from(s)));
+                ready.push((n.thrower, out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())));
+            }
+        }
+    }
+
+    /// ARC MINEs (`grenade_properties.arc`): `arming_length` after it is let
+    /// go of, an enemy within `detect_radius` sets it off `detect_delay_length`
+    /// later; it then stuns every enemy within `radius` (as a STUN FIELD's
+    /// stun does) and sets off the same team's other armed mines within
+    /// `chain_radius` `chain_delay` later. Then it is used up: native's used
+    /// state, cooldown and destroy, as for the other ordnance.
+    fn arc_mines(&mut self, now: Instant, ready: &mut Vec<(SocketAddr, Out)>) {
+        if self.mines.is_empty() {
+            return;
+        }
+        let space = self.space;
+        let (detect, radius, chain) = (arc_setting("detect_radius", 3.5), arc_setting("radius", 4.5), arc_setting("chain_radius", 4.0));
+        let detect_delay = Duration::from_secs_f32(arc_setting("detect_delay_length", 1.0).max(0.0));
+        let chain_delay = Duration::from_secs_f32(arc_setting("chain_delay", 1.25).max(0.0));
+        // Until it arms it may still be flying: follow the thrown position.
+        for m in &mut self.mines {
+            if (m.at.is_none() || now < m.armed_at)
+                && let Some(p) = self.thrown_at.get(&m.thrower)
+            {
+                m.at = Some(*p);
+            }
+        }
+        let enemy_near = |g: &Gear, m: &Mine, r: f32| -> Vec<Hit> {
+            let Some(at) = m.at else { return Vec::new() };
+            g.victims(at, r, Some(m.thrower)).into_iter().filter(|h| h.3.is_some_and(|a| a != m.thrower && g.alive(a) && !g.immune(&a, "stun_imm"))).collect()
+        };
+        for i in 0..self.mines.len() {
+            let m = &self.mines[i];
+            if m.fire_at.is_none() && now >= m.armed_at && !enemy_near(self, m, detect).is_empty() {
+                info!(mag = %hex8(m.mag), "ARC MINE set off");
+                self.mines[i].fire_at = Some(now + detect_delay);
+            }
+        }
+        // Shot down and its owner never said so: gone, without going off.
+        let shot: Vec<usize> = (0..self.mines.len()).filter(|&i| self.mines[i].shot_at.is_some_and(|t| t + MINE_SHOT_GRACE <= now)).collect();
+        let mut gone = Vec::new();
+        for i in shot {
+            let m = &self.mines[i];
+            info!(mag = %hex8(m.mag), "ARC MINE shot down (server)");
+            let (mag, owner, head, thrower) = (m.mag, m.owner, m.head, m.thrower);
+            self.use_up(mag, owner, head, thrower, now, ready);
+            gone.push(mag);
+        }
+        let firing: Vec<usize> = (0..self.mines.len()).filter(|&i| !gone.contains(&self.mines[i].mag) && self.mines[i].fire_at.is_some_and(|t| t <= now)).collect();
+        for i in firing {
+            let m = &self.mines[i];
+            let hits = enemy_near(self, m, radius);
+            let (mag, owner, head, thrower, at) = (m.mag, m.owner, m.head, m.thrower, m.at);
+            info!(mag = %hex8(mag), stunned = hits.len(), "ARC MINE went off");
+            if hits.is_empty() {
+                ready.push((thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &EX_STUN, &mag].concat())));
+            }
+            for (victim, pos, _, _, _) in hits {
+                self.credits.push(Credit::Stun { by: thrower });
+                ready.push((thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, EX_STUN, pos, victim, mag))));
+                let target = u64::from(id_handle(victim).map_or(0, |(s, g)| (u32::from(g) << 16) | u32::from(s)));
+                ready.push((thrower, out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())));
+            }
+            // The chain: the same team's armed mines nearby.
+            let team = self.teams.get(&thrower).copied().filter(|t| *t < 2);
+            let teams = &self.teams;
+            for (j, o) in self.mines.iter_mut().enumerate() {
+                let same = o.thrower == thrower || (team.is_some() && teams.get(&o.thrower).copied() == team);
+                if j != i && same && o.fire_at.is_none() && now >= o.armed_at && at.zip(o.at).is_some_and(|(a, b)| dist(a, b) <= chain) {
+                    o.fire_at = Some(now + chain_delay);
+                }
+            }
+            self.use_up(mag, owner, head, thrower, now, ready);
+            gone.push(mag);
+        }
+        self.mines.retain(|m| !gone.contains(&m.mag));
+    }
+
+    /// A blast (or a DOT FIELD tick) at `at` reaching `reach`: the thrower's
+    /// opponents' (or the blast owner's own) placed ARC MINEs and flying DRONEs in it take its damage at their
+    /// distance, as a shot's, and are taken down the same way (their owner's
+    /// client says used, or the server after `MINE_SHOT_GRACE`).
+    fn blast_mines(&mut self, by: SocketAddr, at: [f32; 3], reach: f32, damage: &dyn Fn(f32) -> f32, now: Instant) -> Vec<Out> {
+        self.blast_mines_in(by, at, reach, damage, now, false)
+    }
+
+    /// `blast_mines`; with `through_walls` (the DOT FIELD) only a standing
+    /// ENERGY BARRIER shields them.
+    fn blast_mines_in(&mut self, by: SocketAddr, at: [f32; 3], reach: f32, damage: &dyn Fn(f32) -> f32, now: Instant, through_walls: bool) -> Vec<Out> {
+        let mut v = Vec::new();
+        for i in 0..self.mines.len() {
+            let (mag, thrower, pos) = (self.mines[i].mag, self.mines[i].thrower, self.mines[i].at);
+            let Some(p) = pos else { continue };
+            let d = dist(at, p);
+            if d > reach || !self.may_hurt(Some(by), thrower) || self.blocked_in(at, p, through_walls) {
+                continue;
+            }
+            info!(%by, mag = %hex8(mag), "ARC MINE caught in a blast");
+            self.mines[i].shot_at.get_or_insert(now);
+            let health = self.area_health.entry(mag).or_insert(ORDNANCE_HEALTH);
+            *health = (*health - damage(d).max(1.0)).max(0.0);
+            let left = *health;
+            v.push(self.deal(mag, left));
+        }
+        // DRONEs in flight (thrown, not yet down), where their thrower's
+        // thrown object is: native dealt a blast's damage to one too.
+        let drones: Vec<([u8; 8], SocketAddr)> = self
+            .mags
+            .iter()
+            .filter(|(k, m)| m.item == ITEM_DRONE && m.ending && self.area_health.get(*k).is_none_or(|h| *h > 0.0))
+            .map(|(k, m)| (*k, m.thrower))
+            .collect();
+        for (mag, thrower) in drones {
+            let Some(p) = self.thrown_at.get(&thrower).copied() else { continue };
+            let d = dist(at, p);
+            if d > reach || !self.may_hurt(Some(by), thrower) || self.blocked_in(at, p, through_walls) {
+                continue;
+            }
+            let health = self.area_health.entry(mag).or_insert(ordnance_health(ITEM_DRONE));
+            *health = (*health - damage(d).max(1.0)).max(0.0);
+            let left = *health;
+            info!(%by, mag = %hex8(mag), left, "DRONE caught in a blast");
+            v.push(self.deal(mag, left));
+            if left <= 0.0 {
+                v.extend(self.drone_down(mag, now));
+            }
+        }
+        v
+    }
+
+    /// A DRONE shot down (its health gone): it ends now, not at the end of its
+    /// lifetime. What its lifetime's end would send (the used state, the
+    /// thrower's cooldown and refund, the destroy) goes out from now instead.
+    fn drone_down(&mut self, mag: [u8; 8], now: Instant) -> Vec<Out> {
+        let Some(m) = self.mags.get(&mag).copied() else { return Vec::new() };
+        let cool = [m.owner, COOLDOWN_TAIL].concat();
+        self.later.retain(|(_, from, o)| {
+            let this_mag = (o.ty == MAGAZINE_STATE && o.body.get(8..16) == Some(mag.as_slice())) || (o.ty == DESTROY_MAGAZINE && o.body == mag);
+            let its_cooldown = *from == m.thrower && matches!(o.ty, COOLDOWN_ACTIVE | COOLDOWN_REFUND) && o.body == cool;
+            !this_mag && !its_cooldown
+        });
+        self.drone_rays.retain(|(d, _), _| *d != mag);
+        info!(mag = %hex8(mag), thrower = %m.thrower, "DRONE shot down: destroyed");
+        let used = [self.space.as_slice(), &mag, &MAG_USED].concat();
+        self.later.push((now + cooldown(m.item), m.thrower, out(To::Sender, COOLDOWN_REFUND, &cool)));
+        self.later.push((now + DRONE_DOWN_DESTROY, m.thrower, out(To::All, DESTROY_MAGAZINE, &mag)));
+        self.later.push((now, m.thrower, out(To::Sender, COOLDOWN_ACTIVE, &cool)));
+        vec![out(To::All, MAGAZINE_STATE, &used)]
+    }
+
+    /// An ARC MINE the server used up, as the other ordnance: the used state
+    /// to everyone, the thrower's cooldown (and refund), then destroyed.
+    fn use_up(&mut self, mag: [u8; 8], owner: [u8; 8], head: [u8; 8], thrower: SocketAddr, now: Instant, ready: &mut Vec<(SocketAddr, Out)>) {
+        let used = [head.as_slice(), &mag, &MAG_USED].concat();
+        let cool = [owner, COOLDOWN_TAIL].concat();
+        ready.push((thrower, out(To::All, MAGAZINE_STATE, &used)));
+        ready.push((thrower, out(To::Sender, COOLDOWN_ACTIVE, &cool)));
+        self.later.push((now + cooldown(ITEM_ARC), thrower, out(To::Sender, COOLDOWN_REFUND, &cool)));
+        self.later.push((now + DESTROY_AFTER, thrower, out(To::All, DESTROY_MAGAZINE, &mag)));
+        if let Some(x) = self.mags.get_mut(&mag) {
+            x.ending = true;
+        }
+    }
+
+    /// OVERCHARGE's heal (EchoCombat, tools/fix_buff.py): its bubble heals
+    /// each teammate it links `heal_amt` over `dr_duration`
+    /// (EchoCombat: `heal_amt_on_success` x `heal_fraction`, 60 x 0.05 = 3),
+    /// at most `max_healing` each per use, so REPAIR MATRIX stays the healer.
+    fn overcharge_heal(&mut self, now: Instant, ready: &mut Vec<(SocketAddr, Out)>) {
+        if self.oc_heals.is_empty() {
+            return;
+        }
+        let b = |k: &str| weapons().pointer(&format!("/ability_properties/buff/{k}")).and_then(Value::as_f64).map(|x| x as f32);
+        let amount = b("heal_amt").unwrap_or_else(|| b("heal_amt_on_success").unwrap_or(60.0) * b("heal_fraction").unwrap_or(0.05));
+        let capped = weapons().pointer("/ability_properties/buff/cap_healing").and_then(Value::as_bool).unwrap_or(true);
+        let cap = if capped { b("max_healing").unwrap_or(amount) } else { f32::INFINITY };
+        let secs = b("heal_duration").or_else(|| b("dr_duration")).unwrap_or(10.0).max(0.1);
+        let rate = amount / secs;
+        let mut hs = std::mem::take(&mut self.oc_heals);
+        for h in &mut hs {
+            let end = now.min(h.until);
+            if now < h.until && end < h.last + REGEN_STEP {
+                continue;
+            }
+            let dt = end.saturating_duration_since(h.last).as_secs_f32();
+            h.last = end;
+            if !self.alive(h.who) {
+                h.until = now;
+                continue;
+            }
+            // Linked teammates only: native's recorded drain (112, 107, ... in
+            // whole 5s) shows the user never healed, `self_heal_mult` aside.
+            let targets: Vec<SocketAddr> = self.oc_linked.iter().filter(|(t, u)| **u == h.who && **t != h.who).map(|(t, _)| *t).collect();
+            for a in targets {
+                let had = h.given.get(&a).copied().unwrap_or(0.0);
+                let want = (rate * dt).min(cap - had);
+                if want <= 0.0 {
+                    continue;
+                }
+                // Not through a wall: a clear line from its user to them.
+                if let (Some((_, from)), Some((_, to))) = (self.bodies.get(&h.who), self.bodies.get(&a))
+                    && !self.reaches(*from, *to)
+                {
+                    continue;
+                }
+                let before = self.lives.get(&a).map_or(FULL_HEALTH + FULL_CORE, |l| l.health + l.core);
+                if let Some(o) = self.give_health(a, want, h.who) {
+                    let after = self.lives.get(&a).map_or(before, |l| l.health + l.core);
+                    *h.given.entry(a).or_default() += after - before;
+                    ready.push((a, o));
+                }
+            }
+        }
+        hs.retain(|h| h.until > now);
+        self.oc_heals = hs;
+    }
+
+    /// REPAIR MATRIX healing: every `REGEN_STEP`, its user and the teammates
+    /// within `heal_radius` of them get `heal_amt / heal_duration` a second
+    /// (the user times `self_heal_mult`), one matrix per player at a time
+    /// (`unique_healing_only`). It stops early when its user dies or leaves.
+    fn repair(&mut self, now: Instant, ready: &mut Vec<(SocketAddr, Out)>) {
+        if self.matrices.is_empty() {
+            return;
+        }
+        let rate = heal_setting("heal_amt", 114.0) / heal_setting("heal_duration", 12.0).max(0.1);
+        let radius = heal_setting("heal_radius", 8.0);
+        let self_mult = heal_setting("self_heal_mult", 1.0);
+        let mut healed: HashSet<SocketAddr> = HashSet::new();
+        let mut ms = std::mem::take(&mut self.matrices);
+        for m in &mut ms {
+            let end = now.min(m.until);
+            if now < m.until && end < m.last + REGEN_STEP {
+                continue;
+            }
+            let dt = end.saturating_duration_since(m.last).as_secs_f32();
+            m.last = end;
+            let Some(&(_, at)) = self.bodies.get(&m.who) else {
+                m.until = now;
+                continue;
+            };
+            if !self.alive(m.who) {
+                m.until = now;
+                continue;
+            }
+            let team = self.teams.get(&m.who).copied().filter(|t| *t < 2);
+            let near: Vec<SocketAddr> = self
+                .bodies
+                .iter()
+                .filter(|(a, (_, p))| (**a == m.who || (team.is_some() && self.teams.get(*a).copied() == team)) && self.in_combat(a) && dist(at, *p) <= radius && (**a == m.who || self.reaches(at, *p)))
+                .map(|(a, _)| *a)
+                .collect();
+            for a in near {
+                if !healed.insert(a) {
+                    continue;
+                }
+                if let Some(o) = self.give_health(a, rate * dt * if a == m.who { self_mult } else { 1.0 }, m.who) {
+                    ready.push((a, o));
+                }
+            }
+        }
+        ms.retain(|m| m.until > now);
+        self.matrices = ms;
     }
 
     /// Replies whose time has come, with the client each `To` is relative to.
@@ -1334,7 +2465,10 @@ impl Gear {
                     if life.dead {
                         continue;
                     }
-                    life.health = (life.health - tick).max(if lethal { 0.0 } else { 1.0 });
+                    // The shield first, then the health under it.
+                    let off_shield = tick.min(life.health);
+                    life.health -= off_shield;
+                    life.core = (life.core - (tick - off_shield)).max(if lethal { 0.0 } else { 1.0 });
                     life.lost_at = Some(now);
                     life.regen_at = None;
                     let life = *life;
@@ -1367,7 +2501,7 @@ impl Gear {
         for (who, life) in &mut self.lives {
             let Some(lost) = life.lost_at else { continue };
             let slot = self.bodies.get(who).map_or(0, |b| u32::from(b.0));
-            if life.dead || life.health >= FULL_HEALTH || draining.contains(who) || now < lost + REGEN_DELAY {
+            if life.dead || life.full() || draining.contains(who) || now < lost + REGEN_DELAY {
                 continue;
             }
             let since = life.regen_at.unwrap_or(lost + REGEN_DELAY);
@@ -1376,26 +2510,32 @@ impl Gear {
             }
             let owner = self.bubble_owner.get(who).copied().unwrap_or(DAMAGEABLE);
             let gain = REGEN_PER_SEC * now.saturating_duration_since(since).as_secs_f32().max(REGEN_STEP.as_secs_f32());
+            // Native: the health under the shield fills alongside the shield.
+            life.core = (life.core + gain).min(FULL_CORE);
             life.health = (life.health + gain).min(FULL_HEALTH);
             life.regen_at = Some(now);
-            let full = life.health >= FULL_HEALTH;
+            let full = life.full();
             life.hurt = None;
-            let mut shown = *life;
-            if !full {
-                shown.hurt = Some((HURT_REGEN, [0.0; 3], [0; 8]));
-            } else {
+            if full {
                 life.lost_at = None;
             }
-            // Native's regen broadcasts keep ffffffff at 28 (no hit position).
-            let mut b = health_body(owner, slot, &shown, false);
-            b[28..32].copy_from_slice(&[0xff; 4]);
+            let b = regen_body(owner, slot, life);
             ready.push((*who, out(To::All, HEALTH_BROADCAST, &b)));
         }
+        self.repair(now, &mut ready);
+        self.overcharge_heal(now, &mut ready);
+        self.arc_mines(now, &mut ready);
+        self.neutron_blasts(now, &mut ready);
         let mut fields = std::mem::take(&mut self.fields);
         for f in &mut fields {
             while f.next <= now && f.next < f.until {
                 f.next += f.every;
-                let hits = self.victims(f.at, f.radius, Some(f.thrower));
+                // A DOT FIELD reaches exactly its radius (to the body's line, no
+                // body width added: the field players are shown is that size).
+                // A STUN FIELD grows to its full size (`stun_reach`), measured the same way.
+                let reach = if f.kind == EX_DOT { (f.radius - BODY_RADIUS).max(0.0) } else { (stun_reach(f.next.saturating_duration_since(f.start)) - BODY_RADIUS).max(0.0) };
+                // The DOT FIELD reaches through walls; a STUN FIELD does not.
+                let hits = self.victims_in(f.at, reach, Some(f.thrower), f.kind == EX_DOT);
                 if f.kind == EX_DOT {
                     let tick = weapons().pointer("/grenade_properties/dot/damage_per_tick").and_then(Value::as_f64).unwrap_or(4.0) as f32;
                     for (victim, pos, _, who, code) in &hits {
@@ -1409,16 +2549,23 @@ impl Gear {
                             }
                         }
                     }
+                    // Mines and drones in the field take its ticks too.
+                    for o in self.blast_mines_in(f.thrower, f.at, f.radius, &move |_| tick, now, true) {
+                        ready.push((f.thrower, o));
+                    }
                     continue;
                 }
-                let fresh: Vec<Hit> = hits.into_iter().filter(|h| !f.hit.contains(&h.0)).collect();
+                let fresh: Vec<Hit> = hits.into_iter().filter(|h| !f.hit.contains(&h.0) && !h.3.is_some_and(|a| self.immune(&a, "stun_imm"))).collect();
                 if fresh.is_empty() {
                     ready.push((f.thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &f.kind, &f.mag].concat())));
                 }
                 for (victim, pos, _, who, _) in fresh {
                     f.hit.push(victim);
+                    if who.is_some_and(|a| a != f.thrower) {
+                        self.credits.push(Credit::Stun { by: f.thrower });
+                    }
                     ready.push((f.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, f.kind, pos, victim, f.mag))));
-                    let target: u64 = if who.is_some() { u64::from(victim[0] ^ PLAYER_ID[0]) } else { 0x0c };
+                    let target: u64 = if who.is_some() { u64::from(id_handle(victim).map_or(0, |(s, g)| (u32::from(g) << 16) | u32::from(s))) } else { 0x0c };
                     ready.push((f.thrower, out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())));
                 }
             }
@@ -1435,7 +2582,7 @@ impl Gear {
             self.area_health.insert(target, b.max);
             let ev = barrier_event(b.handle);
             ready.push((anyone, out(To::All, COMPONENT_EVENT, &ev)));
-            ready.push((anyone, self.deal(target, b.max)));
+            ready.push((anyone, self.deal_in(b.space, target, b.max)));
             self.later.push((now + RESPAWN_ECHO_AFTER, anyone, out(To::All, COMPONENT_EVENT, &ev)));
         }
         self.later.retain(|(at, from, o)| {
@@ -1447,7 +2594,16 @@ impl Gear {
             }
         });
         for (_, o) in &ready {
+            if o.ty == ACTOR_DESTROY && o.body.len() == 16 {
+                let actor = arr8(&o.body, 8);
+                if self.walls.remove(&actor).is_some() {
+                    info!(wall = %hex8(actor), "ENERGY BARRIER wall down (its time)");
+                }
+                self.area_health.remove(&actor);
+            }
             if o.ty == DESTROY_MAGAZINE && o.body.len() == 8 {
+                let gone = arr8(&o.body, 0);
+                self.drone_rays.retain(|(d, _), _| *d != gone);
                 self.mags.remove(&arr8(&o.body, 0));
                 self.area_health.remove(&arr8(&o.body, 0));
             }
@@ -1457,6 +2613,11 @@ impl Gear {
 }
 
 /// A combat match's weapon settings (the EchoCombat block every combat level gets).
+#[cfg(test)]
+pub fn combat_weapons_for_tests() -> &'static Value {
+    combat_weapons()
+}
+
 fn combat_weapons() -> &'static Value {
     static W: OnceLock<Value> = OnceLock::new();
     W.get_or_init(|| serde_json::from_str(super::balance::ECHOCOMBAT_WEAPONS).unwrap_or_default())
@@ -1470,7 +2631,9 @@ fn weapons() -> &'static Value {
             .balance
             .iter()
             .find(|(l, _)| *l == super::msg::LEVEL_SOCIAL)
-            .and_then(|(_, b)| super::balance::document(b, "mp_weapon_settings"))
+            // As clients get it: this server's base with the host's changes,
+            // so the gear's reach and damage match what players are shown.
+            .and_then(|(_, b)| super::balance::document(&super::balance::apply(b.to_vec()), "mp_weapon_settings"))
             .unwrap_or_default()
     })
 }
@@ -1478,12 +2641,17 @@ fn weapons() -> &'static Value {
 /// Damage-table multiplier for a hit: the weapon is the one whose
 /// `projectile_damage` is the shot's base damage (else SCOUT/COMET, whose
 /// damage falls off), the part from the collision (2 arm, 4 torso, 5 head).
-fn multiplier(w: &Value, base: f32, part: u64) -> f32 {
-    let weapon = w
-        .get("weapon_properties")
-        .and_then(Value::as_object)
-        .and_then(|m| m.iter().find(|(_, v)| v.get("projectile_damage").and_then(Value::as_f64).is_some_and(|p| (p as f32 - base).abs() < 0.01)))
-        .map_or("scout", |(k, _)| k.as_str());
+fn multiplier(w: &Value, gun: [u8; 8], base: f32, part: u64) -> f32 {
+    // The hit's first 8 bytes are its gun: the symbol of the weapon's name
+    // (native: `assault`, `rifle`, `magnum`; drone shots `blaster`). Telling
+    // the gun by damage alone took an uncharged COMET (30) for a METEOR:
+    // barriers took x2 instead of x0.5.
+    let gun = u64::from_le_bytes(gun);
+    let props = w.get("weapon_properties").and_then(Value::as_object);
+    let weapon = props
+        .and_then(|m| m.keys().find(|k| crate::sns::symbol(k) == gun))
+        .or_else(|| props.and_then(|m| m.iter().find(|(_, v)| v.get("projectile_damage").and_then(Value::as_f64).is_some_and(|p| (p as f32 - base).abs() < 0.01)).map(|(k, _)| k)))
+        .map_or("scout", String::as_str);
     // Native's markers (blaster, scout): 0 and 1 legs, 2 and 3 arms, 4 torso, 5 head.
     let part = match part {
         0 | 1 => "leg",
@@ -1502,13 +2670,17 @@ fn tracked_damage(w: &Value, space: &[u8; 8], d: &[u8]) -> Vec<u8> {
     let part = u64::from_le_bytes(d[48..56].try_into().expect("8"));
     let mut b = space.to_vec();
     b.extend_from_slice(&d[0..8]);
-    b.extend_from_slice(&(base * multiplier(w, base, part)).to_le_bytes());
+    b.extend_from_slice(&(base * multiplier(w, arr8(d, 0), base, part)).to_le_bytes());
     b.extend_from_slice(&d[20..40]);
     b
 }
 
 fn hex8(b: [u8; 8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn f32_at(d: &[u8], o: usize) -> f32 {
+    f32::from_le_bytes(d[o..o + 4].try_into().expect("4"))
 }
 
 fn f3(d: &[u8], o: usize) -> [f32; 3] {
@@ -1524,6 +2696,92 @@ const BODY_PARTS: [(&str, f32); 4] = [("head", 0.0), ("arm", 0.45), ("torso", 0.
 
 /// Distance from `at` to a player's body: the vertical segment from the
 /// tracked head `head` down `BODY_HEIGHT`.
+/// A thrown ordnance's starting health: a DRONE's `grenade_properties.drone.
+/// health` (EchoVRCE: 70; native's DealDamage went 70, 40, 13, 11, 0 and it
+/// stopped firing), the rest native's 9999.
+fn ordnance_health(item: [u8; 8]) -> f32 {
+    if item == ITEM_DRONE {
+        return weapons().pointer("/grenade_properties/drone/health").and_then(Value::as_f64).unwrap_or(70.0) as f32;
+    }
+    ORDNANCE_HEALTH
+}
+
+/// A STUN FIELD's radius `t` after it went off (`grenade_properties.stun`):
+/// `target_aoe_radius` (1 m), growing by `aoe_radius_growth_rate` (6 m/s)
+/// for `growth_time` (0.5 s) to 4 m, eased out by `growth_exponent` (3:
+/// fast first, then slowing). No recording measured it; the settings'
+/// own numbers, read this way, make the field players see.
+fn stun_reach(t: Duration) -> f32 {
+    let g = |k: &str, def: f64| weapons().pointer(&format!("/grenade_properties/stun/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32;
+    let (start, rate, grow, exp) = (g("target_aoe_radius", 1.0), g("aoe_radius_growth_rate", 6.0), g("growth_time", 0.5).max(0.0), g("growth_exponent", 3.0).max(0.01));
+    let p = if grow <= 0.0 { 1.0 } else { (t.as_secs_f32() / grow).clamp(0.0, 1.0) };
+    start + rate * grow * (1.0 - (1.0 - p).powf(exp))
+}
+
+/// `ability_properties.point.<k>` (NEUTRON).
+fn point_setting(k: &str, def: f64) -> f32 {
+    weapons().pointer(&format!("/ability_properties/point/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32
+}
+
+/// `grenade_properties.arc.<k>` (ARC MINE).
+fn arc_setting(k: &str, def: f64) -> f32 {
+    weapons().pointer(&format!("/grenade_properties/arc/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32
+}
+
+/// `ability_properties.wraith.<k>` (PHASE SHIFT).
+fn wraith_setting(k: &str, def: f64) -> f32 {
+    weapons().pointer(&format!("/ability_properties/wraith/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32
+}
+
+/// How long past its duration a PHASE SHIFT may run before the server ends
+/// it itself (its user's off normally comes first).
+const WRAITH_SLACK: f32 = 0.5;
+
+/// `ability_properties.heal.<k>` (REPAIR MATRIX).
+fn heal_setting(k: &str, def: f64) -> f32 {
+    weapons().pointer(&format!("/ability_properties/heal/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32
+}
+
+/// A thrown object moving less than this between updates has stopped.
+const STILL: f32 = 0.01;
+/// Within this of a stuck DETONATOR a player is hit whichever side they are
+/// on (native hit what was within about 0.4 m, a det stuck on a player too).
+const DET_CLOSE: f32 = 0.5;
+/// A blast's line of sight leaves out 15 cm at each end (the surface the blast
+/// sits on, or the mine on one), and is tested to a player's head and to a
+/// point this far below it.
+const BLAST_SKIP: f32 = 0.15;
+/// A hit's wall check leaves this much out at each end: the gun is in the
+/// shooter's hand, not at their head, and the hit is on the victim's surface.
+const HIT_WALL_SKIP: f32 = 0.8;
+/// A shot whose line passes this close to a DRONE's centre hits it (its body
+/// is about 0.3 m across; the extra covers its movement between updates).
+const DRONE_HIT_RADIUS: f32 = 0.6;
+const DRONE_SHOT_RANGE: f32 = 150.0;
+/// A shot-down DRONE's destroy follows its used state this much later.
+const DRONE_DOWN_DESTROY: Duration = Duration::from_millis(200);
+const BLAST_BODY_BELOW: f32 = 0.7;
+/// How far past the surface a stuck DETONATOR's blast still reaches.
+const DET_SURFACE_SLACK: f32 = 0.1;
+
+/// Whether a player (head at `head`) is on the far side of the surface a thrown
+/// object stuck to at `at`, having come from `from`: the surface faces back
+/// along its flight, so the near point of their body lies ahead of it.
+fn behind_surface(at: [f32; 3], from: [f32; 3], head: [f32; 3]) -> bool {
+    let dir = [at[0] - from[0], at[1] - from[1], at[2] - from[2]];
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if len < STILL {
+        return false;
+    }
+    let y = at[1].clamp(head[1] - BODY_HEIGHT, head[1]);
+    let near = [head[0], y, head[2]];
+    if dist(at, near) <= DET_CLOSE {
+        return false;
+    }
+    let ahead = ((near[0] - at[0]) * dir[0] + (near[1] - at[1]) * dir[1] + (near[2] - at[2]) * dir[2]) / len;
+    ahead > DET_SURFACE_SLACK
+}
+
 fn body_dist(at: [f32; 3], head: [f32; 3]) -> f32 {
     let y = at[1].clamp(head[1] - BODY_HEIGHT, head[1]);
     dist(at, [head[0], y, head[2]])
@@ -1631,6 +2889,7 @@ mod tests {
     fn area_events_enter_and_free_the_stations_after_a_delay() {
         // Native lobby recording 2026-11-16: no SetOwner, no LoadoutNumberNotification.
         let mut g = Gear::new();
+        g.slots.insert(addr(), 0);
         let t0 = Instant::now();
         assert_eq!(AREA_ENTER_EVENT.to_le_bytes(), [0xc0, 0x64, 0x71, 0xff, 0xde, 0x09, 0x5d, 0x63]);
         assert!(!g.sends_area_events(addr()));
@@ -1876,8 +3135,24 @@ mod tests {
         // 3 (arm) 1.8, on 4 2, on 5 4; COMET on 2 (arm) x 0.9.
         let w = combat_weapons();
         for (part, want) in [(0, 0.75), (1, 0.75), (2, 0.9), (3, 0.9), (4, 1.0), (5, 2.0)] {
-            assert_eq!(multiplier(w, 2.0, part), want, "part {part}");
+            assert_eq!(multiplier(w, [0; 8], 2.0, part), want, "part {part}");
         }
+    }
+
+    /// The gun comes from the hit's gun symbol, as native's barrier damage
+    /// shows (Dyson/Gauss server recordings): PULSAR 9 -> 4.5, STARBURST
+    /// 11 -> 5.5, PROTOSTAR 45 -> 78.75, drone shots (`blaster`) 2 -> 1; an
+    /// uncharged COMET (30, same as METEOR's damage) x0.5, not METEOR's x2.
+    #[test]
+    fn barrier_damage_follows_the_gun() {
+        let w = combat_weapons();
+        let gun = |n: &str| crate::sns::symbol(n).to_le_bytes();
+        for (name, base, want) in [("assault", 9.0, 4.5), ("rifle", 11.0, 5.5), ("magnum", 45.0, 78.75), ("blaster", 2.0, 1.0), ("scout", 30.0, 15.0), ("rocket", 30.0, 60.0)] {
+            assert_eq!(base * multiplier(w, gun(name), base, PART_BARRIER), want, "{name}");
+        }
+        assert_eq!(unhex("9e5b615f8c9cd62f"), gun("assault").to_vec(), "native's PULSAR symbol");
+        // The COMET hits in the 2026-11-20 Dyson match (30 damage, 60 off a barrier then).
+        assert_eq!(unhex("a45180dac9c72de3"), gun("scout").to_vec(), "COMET symbol");
     }
 
     #[test]
@@ -1906,6 +3181,20 @@ mod tests {
         let damage = ticks.iter().filter(|(_, o)| o.ty == EXPLOSION_PLAYER_DAMAGE && o.body[32..40] != NO_PLAYER).count();
         assert!((3..=4).contains(&damage), "{damage} ticks in the first second");
         assert!(ticks.iter().any(|(_, o)| o.ty == TRACKED_DAMAGE && o.to == To::Sender));
+        // It goes through the level's walls, but not an ENERGY BARRIER.
+        let mut wall = vec![0u8; 96];
+        wall[12..16].copy_from_slice(&1f32.to_le_bytes());
+        for (k, x) in [41.25f32, 0.95, -24.15].iter().enumerate() {
+            wall[16 + 4 * k..20 + 4 * k].copy_from_slice(&x.to_le_bytes());
+        }
+        wall[28..32].copy_from_slice(&1f32.to_le_bytes());
+        wall[32..40].copy_from_slice(&WALL_TEMPLATE);
+        wall[40..48].copy_from_slice(&g.space);
+        wall[48..56].copy_from_slice(&[7; 8]);
+        g.wall_placed(addr(), &wall, t0);
+        let ticks = g.due(t0 + Duration::from_secs(2));
+        let damage = ticks.iter().filter(|(_, o)| o.ty == EXPLOSION_PLAYER_DAMAGE && o.body[32..40] != NO_PLAYER).count();
+        assert_eq!(damage, 0, "behind an ENERGY BARRIER");
     }
 
     /// The native recording's DETONATOR: spawn, armed, released, flying, detonated (twice).
@@ -1949,12 +3238,33 @@ mod tests {
     #[test]
     fn leaving_the_area_frees_the_gear_stations() {
         let mut g = Gear::new();
+        g.slots.insert(addr(), 0);
         assert!(g.left_area(addr()).is_empty(), "never entered");
         g.on_message(addr(), SET_OWNER, &[0; 8], Instant::now());
         let v = g.left_area(addr());
         assert_eq!(v.len(), 8);
         assert_eq!(v[1].body, unhex("fcffffff0f000000"));
         assert!(g.left_area(addr()).is_empty(), "second notification");
+    }
+
+    /// Our Combustion match (2026-11-19 20:06 recording): a player who used
+    /// gear but never sent body physics left, and slot 0's stations were
+    /// freed, taking slot 0's gun. A leaver frees their own slot's stations,
+    /// none if their slot is unknown.
+    #[test]
+    fn a_leaver_frees_only_their_own_stations() {
+        let mut g = Gear::new();
+        let (me, them) = (addr(), "10.0.0.9:7".parse().expect("addr"));
+        for a in [me, them] {
+            g.on_message(a, SET_OWNER, &[0; 8], Instant::now());
+        }
+        g.slots.insert(me, 0);
+        g.slots.insert(them, 3);
+        let v = g.forget(them);
+        assert_eq!(v.len(), 8);
+        assert_eq!(v[0].body, unhex("fcffffff03000000"), "slot 3's, not slot 0's");
+        g.slots.clear();
+        assert!(g.forget(me).is_empty(), "slot unknown: nothing freed");
     }
 
     /// The second native recording: METEOR on yourself (half of 40), then a
@@ -2032,6 +3342,68 @@ mod tests {
         (g, me, them, t0)
     }
 
+    /// ENERGY BARRIER walls (native Gauss, t 546.58: this create): 415
+    /// health, bullets take it down for everyone, native's removal 18.04 s
+    /// after placing, or right away when broken; a standing one stops blasts.
+    #[test]
+    fn energy_barrier_walls_have_health_and_go_after_18s() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.set_match(super::super::combat::LEVEL_GAUSS);
+        let wall = unhex("0e9d8bbe68f0ce3e8b710b3e81c65c3f0c98004252b41841f6fdde400000803f262929d5a48c8b3d193a620c7adae243d263e3b2e176fbcdf034d5099874113f8652624a9681de2f3c881a3f0a8cb73d37a60d3f6f0000000100000000000000");
+        let actor = arr8(&wall, 48);
+        g.wall_placed(them, &wall, t0);
+        assert_eq!(g.area_health.get(&actor), Some(&WALL_HEALTH));
+        // A shot on it, in the level's space.
+        let mut bc = head_shot_on_slot_1();
+        bc[32..40].copy_from_slice(&actor);
+        bc[40..44].copy_from_slice(&wall[40..44]);
+        let v = g.on_message(me, BULLET_COLLISION, &bc, t0);
+        let dd = v.iter().find(|o| o.ty == DEAL_DAMAGE).expect("wall's health");
+        assert_eq!(&dd.body[..16], &wall[40..56]);
+        let left = f32::from_le_bytes(dd.body[16..20].try_into().expect("4"));
+        assert!(left < WALL_HEALTH && left > 0.0, "{left}");
+        // It stands between: a blast behind it does not reach through.
+        let p = f3(&wall, 16);
+        assert!(g.line_blocked([p[0], p[1], p[2] - 2.0], [p[0], p[1], p[2] + 2.0], 0.0) || g.line_blocked([p[0] - 2.0, p[1], p[2]], [p[0] + 2.0, p[1], p[2]], 0.0));
+        // Native's removal, to everyone.
+        assert!(g.due(t0 + Duration::from_secs(18)).iter().all(|(_, o)| o.ty != ACTOR_DESTROY));
+        let v = g.due(t0 + Duration::from_millis(18_100));
+        let gone = v.iter().find(|(_, o)| o.ty == ACTOR_DESTROY).expect("destroy");
+        assert_eq!(gone.1.body, wall[40..56].to_vec());
+        assert!(matches!(gone.1.to, To::All));
+        assert!(g.walls.is_empty());
+        // Broken: gone now, not at 18 s.
+        g.wall_placed(them, &wall, t0);
+        let v = g.hit_wall(me, actor, 500.0, t0);
+        assert!(v.iter().any(|o| o.ty == DEAL_DAMAGE && o.body[16..20] == 0f32.to_le_bytes()));
+        assert!(g.walls.is_empty());
+        let v = g.due(t0 + Duration::from_millis(20));
+        assert_eq!(v.iter().filter(|(_, o)| o.ty == ACTOR_DESTROY).count(), 1);
+        assert!(g.due(t0 + Duration::from_secs(19)).iter().all(|(_, o)| o.ty != ACTOR_DESTROY), "no second destroy");
+    }
+
+    /// Fission's climax barriers (1000 health) live in the climax sublevel's
+    /// space: native's DealDamage to pool slot 2 there (t 338.31: 999 left).
+    #[test]
+    fn fission_climax_barriers_are_known_in_their_space() {
+        let (mut g, me, _, t0) = two_in_the_area();
+        g.set_match(super::super::combat::LEVEL_FISSION);
+        let climax = super::super::msg::LEVEL_FISSION_CLIMAX.to_le_bytes();
+        let target = unhex("0200000001000000");
+        let b = g.barrier_in(&climax, arr8(&target, 0)).expect("climax barrier");
+        assert_eq!((b.handle, b.max), (258, 1000.0));
+        assert!(g.barrier(arr8(&target, 0)).is_none(), "not in the level's own space");
+        let mut bc = head_shot_on_slot_1();
+        bc[32..40].copy_from_slice(&target);
+        bc[40..44].copy_from_slice(&climax[..4]);
+        let v = g.on_message(me, BULLET_COLLISION, &bc, t0);
+        let dd = v.iter().find(|o| o.ty == DEAL_DAMAGE).expect("barrier's health");
+        assert_eq!(&dd.body[..16], &[climax.as_slice(), &target].concat()[..]);
+        let left = f32::from_le_bytes(dd.body[16..20].try_into().expect("4"));
+        assert!(left < 1000.0 && left > 900.0, "{left}");
+        assert!(g.barriers_down().is_empty());
+    }
+
     /// A PULSAR head shot (9 x 1.5) from slot 0 on slot 1, as the client sends it
     /// (recording 2026-11-16: target `f334d5099974113f` in space `8ec21d00`).
     fn head_shot_on_slot_1() -> Vec<u8> {
@@ -2058,6 +3430,120 @@ mod tests {
         assert_eq!(&killed.body[16..24], &[1, 0, 0, 0, 0, 0, 0, 0]);
         // A shot naming its own shooter hurts nobody.
         assert!(g.on_message(them, BULLET_COLLISION, &bc, t0).iter().all(|o| o.ty != HEALTH_BROADCAST));
+    }
+
+    /// Replays a decoded recording (`msgs.csv`) through the cheat checks:
+    /// `REPLAY_CSV=<path> REPLAY_LEVEL=dyson|combustion|fission|gauss
+    /// [REPLAY_FROM=s REPLAY_TO=s] cargo test --release replay_checks -- --ignored --nocapture`.
+    /// Server-role recordings give every player's own messages (by peer);
+    /// client-role ones the recorder's own and the others' relayed bodies.
+    #[test]
+    #[ignore]
+    fn replay_checks() {
+        use std::io::BufRead;
+        let path = std::env::var("REPLAY_CSV").expect("REPLAY_CSV");
+        let level = match std::env::var("REPLAY_LEVEL").as_deref() {
+            Ok("combustion") => super::super::combat::LEVEL_COMBUSTION,
+            Ok("fission") => super::super::combat::LEVEL_FISSION,
+            Ok("gauss") => super::super::combat::LEVEL_GAUSS,
+            _ => super::super::combat::LEVEL_DYSON,
+        };
+        let span = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (from_t, to_t) = (span("REPLAY_FROM", 0.0), span("REPLAY_TO", 1e9));
+        let client_role = std::env::var("REPLAY_ROLE").as_deref() == Ok("client");
+        let mut g = Gear::new();
+        g.set_match(level);
+        let t0 = Instant::now();
+        let peer = |n: u32| -> SocketAddr { format!("10.0.0.1:{}", 20000 + n).parse().expect("addr") };
+        let relayed = |slot: u32| -> SocketAddr { format!("10.0.0.2:{}", 30000 + slot).parse().expect("addr") };
+        let (mut hits, mut shots) = (0, 0);
+        let mut offs: Vec<f32> = Vec::new();
+        let mut peers = std::collections::BTreeSet::new();
+        let f = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(&path).expect("csv"));
+        for line in f.lines().skip(1) {
+            let line = line.expect("line");
+            let c: Vec<&str> = line.split(',').collect();
+            if c.len() < 9 {
+                continue;
+            }
+            let t: f64 = c[1].parse().unwrap_or(0.0);
+            if t < from_t || t > to_t {
+                continue;
+            }
+            let name = c[4];
+            let at = t0 + Duration::from_secs_f64(t);
+            let wanted = matches!(name, "SR15NetPhysicsSimStateEvent" | "SR15NetGameFireGun" | "SR15NetDamageableBulletCollision");
+            if !wanted {
+                continue;
+            }
+            let d = unhex(c[7]);
+            let p: u32 = c[8].trim().parse().unwrap_or(0);
+            match (c[0], name) {
+                ("c2s", "SR15NetPhysicsSimStateEvent") => {
+                    peers.insert(p);
+                    g.observe_physics_at(peer(p), &d, at)
+                }
+                ("s2c", "SR15NetPhysicsSimStateEvent") if d.len() == 64 && d[4..8] == BODY_OBJECT => {
+                    let slot = u32::from(u16::from_le_bytes([d[0], d[1]]));
+                    // A client's recording: the others' bodies, relayed.
+                    if client_role {
+                        g.observe_physics_at(relayed(slot), &d, at);
+                    }
+                }
+                ("c2s", "SR15NetGameFireGun") => {
+                    shots += 1;
+                    g.on_message(peer(p), FIRE_GUN, &d, at);
+                }
+                ("c2s", "SR15NetDamageableBulletCollision") if d.len() == 64 => {
+                    if d[40..44] == BODY_OBJECT
+                        && let Some(v) = g.player_by_id(arr8(&d, 32))
+                        && let Some(&(_, head)) = g.bodies.get(&v)
+                    {
+                        hits += 1;
+                        let off = body_dist(f3(&d, 20), head);
+                        offs.push(off);
+                        let before = g.checks.count(peer(p), super::super::checks::Flag::FarFromVictim) + g.checks.count(peer(p), super::super::checks::Flag::ThroughWall);
+                        g.on_message(peer(p), BULLET_COLLISION, &d, at);
+                        let flagged = g.checks.count(peer(p), super::super::checks::Flag::FarFromVictim) + g.checks.count(peer(p), super::super::checks::Flag::ThroughWall) > before;
+                        if flagged {
+                            let eye = g.bodies.get(&peer(p)).map(|b| b.1);
+                            println!("REPLAY case t {t:.2} peer {p} victim {v} off {off:.2} hit {:?} victim head {head:?} shooter {eye:?} gun {} dmg {}", f3(&d, 20), hex8(arr8(&d, 0)), f32_at(&d, 44));
+                        }
+                    }
+                    else {
+                        g.on_message(peer(p), BULLET_COLLISION, &d, at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        offs.sort_by(f32::total_cmp);
+        let pct = |q: f32| offs.get(((offs.len() as f32 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+        println!("REPLAY shots {shots} player hits {hits}: hit to body p50 {:.2} p95 {:.2} p99 {:.2} max {:.2}", pct(0.5), pct(0.95), pct(0.99), pct(1.0));
+        let all: Vec<SocketAddr> = g.bodies.keys().copied().collect();
+        for a in all {
+            let n: Vec<String> = super::super::checks::Flag::ALL_FOR_TESTS.iter().map(|f| format!("{f:?} {}", g.checks.count(a, *f))).collect();
+            println!("REPLAY {a}: {}", n.join(", "));
+        }
+    }
+
+    /// A player who rejoined (generation 1) is hit by shots naming them with
+    /// the generation in the id (dyson, 2026-11-20: they took no damage), and
+    /// their health and kill carry the full handle.
+    #[test]
+    fn a_rejoined_player_takes_shots() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.gens.insert(them, 1);
+        let mut bc = head_shot_on_slot_1();
+        bc[32..40].copy_from_slice(&player_id(1, 1));
+        assert_eq!(player_id(5, 1), [0xf7, 0x34, 0xd5, 0x09, 0x98, 0x74, 0x11, 0x3f]);
+        let v = g.on_message(me, BULLET_COLLISION, &bc, t0);
+        let hb = v.iter().find(|o| o.ty == HEALTH_BROADCAST).expect("rejoined victim's health");
+        assert_eq!(&hb.body[8..12], &0x1_0001u32.to_le_bytes());
+        // The old id (generation 0) still finds the slot's only player.
+        bc[32..40].copy_from_slice(&player_id(1, 0));
+        assert!(g.on_message(me, BULLET_COLLISION, &bc, t0).iter().any(|o| o.ty == HEALTH_BROADCAST));
+        assert_eq!(id_handle(DAMAGEABLE), None);
     }
 
     /// The recording's barrier hits (area handle 8, body part 6): native's
@@ -2134,11 +3620,455 @@ mod tests {
         assert_eq!(gauss.len(), 9);
         assert!(gauss.iter().any(|b| b.pool == 0x71 && b.handle == 0x16c && b.max == 230.0 && b.respawn == 30.0));
         assert_eq!(barriers_of(AREA).len(), 11);
-        assert!(barriers_of(super::super::combat::LEVEL_FISSION.to_le_bytes()).is_empty());
+        // Fission's are its climax sublevel's, in that space.
+        let fission = barriers_of(super::super::combat::LEVEL_FISSION.to_le_bytes());
+        assert_eq!(fission.len(), 8);
+        assert!(fission.iter().all(|b| b.max == 1000.0 && b.space == super::super::msg::LEVEL_FISSION_CLIMAX.to_le_bytes()));
+    }
+
+    /// REPAIR MATRIX: its user's teammates nearby get 114 / 12 s = 9.5 a
+    /// second back, credited to the user, up to full health and for 12 s.
+    #[test]
+    fn repair_matrix_heals_teammates_and_credits_the_user() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(112.0 - 13.5));
+        g.credits.clear();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 0);
+        g.on_message(me, HEAL_BUBBLE_ACTIVATE, &unhex("8ec21d00d315993fd1eb3d3fa8a2fdb10000000000000000"), t0);
+        let v = g.due(t0 + Duration::from_secs(1));
+        assert!(v.iter().any(|(a, o)| *a == them && o.ty == HEALTH_BROADCAST));
+        let health = g.lives.get(&them).map_or(0.0, |l| l.health);
+        assert!((health - (112.0 - 13.5 + 9.5)).abs() < 0.01, "{health}");
+        let healed = |g: &Gear| g.credits.iter().map(|c| if let Credit::Heal { by, amount } = c { assert_eq!(*by, me); *amount } else { 0.0 }).sum::<f32>();
+        assert!((healed(&g) - 9.5).abs() < 0.01);
+        // Never past full; done after 12 s.
+        g.due(t0 + Duration::from_secs(3));
+        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(112.0));
+        assert!((healed(&g) - 13.5).abs() < 0.01);
+        g.due(t0 + Duration::from_secs(13));
+        assert!(g.matrices.is_empty());
+    }
+
+    /// INSTANT REPAIR: when its thrower's client says it popped, 50 back at
+    /// once to teammates within 3.5 m, credited to the thrower.
+    #[test]
+    fn instant_repair_heals_teammates_at_once() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        for _ in 0..3 {
+            g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        }
+        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(112.0 - 4.0 * 13.5));
+        g.credits.clear();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 0);
+        let mag = "84fec19782c6fd39";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f234d5099974113f010000009d24204220836f3f5f49bfc1e9ed9ca8b1d0e8c8{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("193a620c7adae243{mag}6388fd280387e323")), t0);
+        let v = g.on_message(me, MAGAZINE_STATE, &unhex(&format!("193a620c7adae243{mag}6281fb261b84f533")), t0);
+        assert!(v.iter().any(|o| o.ty == HEALTH_BROADCAST));
+        assert!(v.iter().any(|o| o.ty == COOLDOWN_ACTIVE));
+        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(112.0 - 4.0 * 13.5 + 50.0));
+        assert_eq!(g.credits, vec![Credit::Heal { by: me, amount: 50.0 }]);
+    }
+
+    /// PHASE SHIFT: while it is on (its user's AbilityActivate on, with the
+    /// `wraith` tac mod equipped), shots and blasts do nothing; off ends it.
+    #[test]
+    fn phase_shift_makes_its_user_immune() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        let mut equip = unhex("ffffffff000000009e5b615f8c9cd62f16132a1b2fd0d241fee794a8b1d0e8c80100000000000000ffffffffffffffffffffffffffff0000");
+        g.set_equipment(them, &equip);
+        g.on_message(them, ABILITY_ACTIVATE, &unhex("0100000001000000"), t0);
+        assert!(g.immune(&them, "dmg_imm") && g.immune(&them, "exp_imm") && g.immune(&them, "stun_imm"));
+        let v = g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        assert!(v.iter().all(|o| o.ty != HEALTH_BROADCAST && o.ty != TRACKED_DAMAGE));
+        assert!(g.victims([43.8 + 0.3, 1.87, -25.3], 3.0, Some(me)).iter().all(|h| h.3 != Some(them)));
+        // Off: hurt again.
+        g.on_message(them, ABILITY_ACTIVATE, &unhex("0100000000000000"), t0);
+        let v = g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        assert!(v.iter().any(|o| o.ty == HEALTH_BROADCAST));
+        // Another tac mod's activation is not a phase.
+        equip[16..24].copy_from_slice(&unhex("bc1f7632483ec3c8"));
+        g.set_equipment(them, &equip);
+        g.on_message(them, ABILITY_ACTIVATE, &unhex("0100000001000000"), t0);
+        assert!(!g.immune(&them, "dmg_imm"));
+    }
+
+    #[test]
+    fn phase_shift_symbol_is_wraith() {
+        assert_eq!(crate::sns::symbol("wraith"), TAC_WRAITH);
+    }
+
+    /// ARC MINE: armed 3.5 s after it is let go of, an enemy within 3.5 m sets
+    /// it off, 1 s later it stuns them (credited to the thrower) and is used up.
+    #[test]
+    fn arc_mine_arms_detects_and_stuns() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        g.credits.clear();
+        let mag = "658d84f5712baa05";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f134d5099974113f01000000211e8241da8ec03faea66dc1e9f091a8b1d0e8c8{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}1b0b211b29d4d241")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}6388fd280387e323")), t0);
+        // It stuck a metre from slot 1.
+        g.thrown_at.insert(me, [45.1, 1.0, -25.3]);
+        let stuns = |v: &[(SocketAddr, Out)]| v.iter().filter(|(_, o)| o.ty == STUN_MSG).count();
+        assert_eq!(stuns(&g.due(t0 + Duration::from_secs(1))), 0, "not armed yet");
+        assert_eq!(stuns(&g.due(t0 + Duration::from_millis(3600))), 0, "set off: goes off 1 s later");
+        let v = g.due(t0 + Duration::from_millis(4700));
+        assert_eq!(stuns(&v), 1);
+        assert!(v.iter().any(|(_, o)| o.ty == MAGAZINE_STATE && o.body[16..] == MAG_USED));
+        assert!(v.iter().any(|(_, o)| o.ty == COOLDOWN_ACTIVE));
+        assert_eq!(g.credits, vec![Credit::Stun { by: me }]);
+        assert!(g.mines.is_empty());
+    }
+
+    /// Shooting an ARC MINE: health down from 9999 to everyone (native), and
+    /// it is gone, without stunning: when its owner says it is used, or by the
+    /// server shortly after if that never comes. A teammate's shot does nothing.
+    #[test]
+    fn arc_mines_can_be_shot_down() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        let mag = "658d84f5712baa05";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f134d5099974113f01000000211e8241da8ec03faea66dc1e9f091a8b1d0e8c8{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}6388fd280387e323")), t0);
+        g.thrown_at.insert(me, [45.1, 1.0, -25.3]);
+        // A PULSAR shot on the mine (target = the mine, in the area's space).
+        let mut bc = head_shot_on_slot_1();
+        bc[32..40].copy_from_slice(&unhex(mag));
+        bc[40..44].copy_from_slice(&AREA[..4]);
+        bc[48] = 0;
+        let mut own_team = bc.clone();
+        own_team[56] = 0xf2;
+        g.teams.insert(them, 0);
+        assert!(g.on_message(them, BULLET_COLLISION, &own_team, t0).is_empty(), "a teammate's shot");
+        g.teams.insert(them, 1);
+        let v = g.on_message(them, BULLET_COLLISION, &bc, t0);
+        assert!(v.iter().any(|o| o.ty == DEAL_DAMAGE), "{v:?}");
+        // Its owner never says so: the server takes it down, with no stun.
+        let v = g.due(t0 + Duration::from_secs(5));
+        assert!(v.iter().all(|(_, o)| o.ty != STUN_MSG));
+        assert!(v.iter().any(|(_, o)| o.ty == MAGAZINE_STATE && o.body[16..] == MAG_USED));
+        assert!(g.mines.is_empty());
+    }
+
+    /// A Detonator going off by an enemy ARC MINE takes it down (no stun);
+    /// one far away leaves it be.
+    #[test]
+    fn blasts_take_arc_mines_down() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        let mag = "658d84f5712baa05";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f134d5099974113f01000000211e8241da8ec03faea66dc1e9f091a8b1d0e8c8{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}6388fd280387e323")), t0);
+        g.thrown_at.insert(me, [50.0, 1.0, -25.3]);
+        g.due(t0);
+        let none = |_: f32| 10.0;
+        assert!(g.blast_mines(them, [60.0, 1.0, -25.3], 2.5, &none, t0).is_empty(), "too far");
+        assert!(g.blast_mines(me, [50.5, 1.0, -25.3], 2.5, &none, t0).iter().any(|o| o.ty == DEAL_DAMAGE), "its own thrower's blast");
+        let v = g.blast_mines(them, [50.5, 1.0, -25.3], 2.5, &none, t0);
+        assert!(v.iter().any(|o| o.ty == DEAL_DAMAGE));
+        let v = g.due(t0 + Duration::from_secs(1));
+        assert!(v.iter().all(|(_, o)| o.ty != STUN_MSG));
+        assert!(g.mines.is_empty());
+    }
+
+    /// A DRONE starts at 70 health: an enemy's shots take it to 0 (native),
+    /// a teammate's do nothing, and a blast near it hurts it too.
+    #[test]
+    fn drones_can_be_shot_down() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        let mag = "84b30407aabbccdd";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f234d5099974113f01000000211e8241da8ec03faea66dc1b54a80cbdec72de3{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}a9509fd4dfc72de3")), t0);
+        g.thrown_at.insert(me, [50.0, 3.0, -25.3]);
+        let mut bc = head_shot_on_slot_1();
+        bc[32..40].copy_from_slice(&unhex(mag));
+        bc[40..44].copy_from_slice(&AREA[..4]);
+        bc[48] = 0;
+        let left = |v: &[Out]| v.iter().find(|o| o.ty == DEAL_DAMAGE).map(|o| f32::from_le_bytes(o.body[16..20].try_into().expect("4")));
+        let v = g.on_message(them, BULLET_COLLISION, &bc, t0);
+        let first = left(&v).expect("dealt");
+        assert!(first > 50.0 && first < 70.0, "from 70: {first}");
+        g.teams.insert(them, 0);
+        assert!(g.on_message(them, BULLET_COLLISION, &bc, t0).is_empty(), "a teammate's shot");
+        g.teams.insert(them, 1);
+        let v = g.blast_mines(them, [50.5, 3.0, -25.3], 1.75, &|_| 40.0, t0);
+        assert_eq!(left(&v), Some(first - 40.0));
+        for _ in 0..4 {
+            g.on_message(them, BULLET_COLLISION, &bc, t0);
+        }
+        assert_eq!(g.area_health.get(&arr8(&unhex(mag), 0)), Some(&0.0));
+        assert!(g.blast_mines(them, [50.5, 3.0, -25.3], 1.75, &|_| 40.0, t0).is_empty(), "down: no more");
+    }
+
+    /// A shot whose line passes through an enemy's DRONE hits it, whether or
+    /// not the shooter's client reports the hit; the client's own report of
+    /// that hit then counts nothing more, and at 0 the drone is ended now.
+    #[test]
+    fn shots_through_a_drone_take_it_down() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        let mag = "84b30407aabbccdd";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f234d5099974113f01000000211e8241da8ec03faea66dc1b54a80cbdec72de3{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}a9509fd4dfc72de3")), t0);
+        g.thrown_at.insert(me, [50.0, 3.0, -25.3]);
+        // From 6 m off along z, aimed 0.3 m wide of its centre.
+        let mut shot = vec![0u8; 64];
+        for (k, x) in [50.3f32, 3.0, -19.3].iter().enumerate() {
+            shot[20 + 4 * k..24 + 4 * k].copy_from_slice(&x.to_le_bytes());
+        }
+        for (k, x) in [0.0f32, 0.0, -80.0].iter().enumerate() {
+            shot[36 + 4 * k..40 + 4 * k].copy_from_slice(&x.to_le_bytes());
+        }
+        shot[48..52].copy_from_slice(&20f32.to_le_bytes());
+        let left = |v: &[Out]| v.iter().find(|o| o.ty == DEAL_DAMAGE).map(|o| f32::from_le_bytes(o.body[16..20].try_into().expect("4")));
+        assert_eq!(left(&g.on_message(them, FIRE_GUN, &shot, t0)), Some(50.0));
+        // Its client's own hit report on it: already counted.
+        let mut bc = head_shot_on_slot_1();
+        bc[32..40].copy_from_slice(&unhex(mag));
+        bc[40..44].copy_from_slice(&AREA[..4]);
+        assert!(g.on_message(them, BULLET_COLLISION, &bc, t0).is_empty());
+        // A teammate's shot through it does nothing; a wide one misses.
+        g.teams.insert(them, 0);
+        assert_eq!(left(&g.on_message(them, FIRE_GUN, &shot, t0)), None);
+        g.teams.insert(them, 1);
+        let mut wide = shot.clone();
+        wide[20..24].copy_from_slice(&51.0f32.to_le_bytes());
+        assert_eq!(left(&g.on_message(them, FIRE_GUN, &wide, t0)), None);
+        // Down: its used state now, the destroy just after.
+        g.on_message(them, FIRE_GUN, &shot, t0);
+        let v = g.on_message(them, FIRE_GUN, &shot, t0);
+        assert_eq!(left(&v), Some(10.0));
+        let v = g.on_message(them, FIRE_GUN, &shot, t0);
+        assert_eq!(left(&v), Some(0.0));
+        assert!(v.iter().any(|o| o.ty == MAGAZINE_STATE && o.body[16..24] == MAG_USED));
+        let later = g.due(t0 + Duration::from_millis(300));
+        assert!(later.iter().any(|(_, o)| o.ty == DESTROY_MAGAZINE && o.body == unhex(mag)));
+        assert!(!g.mags.contains_key(&arr8(&unhex(mag), 0)));
+    }
+
+    /// NEUTRON: a wall from a player with `point` equipped stuns the enemy
+    /// within 2.5 m 1.25 s later, credited to its owner; another tac mod's
+    /// wall (an ENERGY BARRIER) does nothing.
+    #[test]
+    fn neutron_stuns_enemies_after_its_charge() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        g.credits.clear();
+        let mut equip = unhex("ffffffff000000009e5b615f8c9cd62fa44a86d6cac72de3fee794a8b1d0e8c80100000000000000ffffffffffffffffffffffffffff0000");
+        g.set_equipment(me, &equip);
+        // The recording's wall, moved a metre from slot 1.
+        let mut wall = unhex("6c602cbed96a183fcf2a563ec5db413f99a981c1bac2344089c5ecc00000803f262929d5a48c8b3d193a620c7adae243b6bd71bb33b275acf434d5099874113f8652624a9681de2f6b59d5be124a87bed1a2b3bd740000000100000000000000");
+        for (k, x) in [45.1f32, 1.0, -25.3].iter().enumerate() {
+            wall[16 + 4 * k..20 + 4 * k].copy_from_slice(&x.to_le_bytes());
+        }
+        g.wall_placed(me, &wall, t0);
+        let stuns = |v: &[(SocketAddr, Out)]| v.iter().filter(|(_, o)| o.ty == STUN_MSG).count();
+        assert_eq!(stuns(&g.due(t0 + Duration::from_secs(1))), 0, "still charging");
+        let v = g.due(t0 + Duration::from_millis(1300));
+        assert_eq!(stuns(&v), 1);
+        assert!(v.iter().any(|(_, o)| o.ty == EXPLOSION_PLAYER_DAMAGE && o.body[8..16] == EX_STUN));
+        assert_eq!(g.credits, vec![Credit::Stun { by: me }]);
+        assert!(g.neutrons.is_empty());
+        // It goes off around its user, wherever the wall is: 2 m from them,
+        // with the wall 20 m away, they are stunned; 3 m off they are not.
+        let far = |x: f32| {
+            let mut w = wall.clone();
+            w[16..20].copy_from_slice(&x.to_le_bytes());
+            w
+        };
+        g.observe_physics(them, &body(1, [43_800, 1_870, -23_300]));
+        g.wall_placed(me, &far(65.0), t0);
+        assert_eq!(stuns(&g.due(t0 + Duration::from_millis(1300))), 1, "2 m from its user");
+        g.observe_physics(them, &body(1, [43_800, 1_870, -22_300]));
+        g.wall_placed(me, &far(65.0), t0);
+        assert_eq!(stuns(&g.due(t0 + Duration::from_millis(1300))), 0, "3 m: out of range");
+        // Not through a wall: an ENERGY BARRIER between them shields.
+        g.observe_physics(them, &body(1, [43_800, 1_870, -23_300]));
+        let mut shield = wall.clone();
+        shield[0..16].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x3f]);
+        for (k, x) in [43.8f32, 1.6, -24.3].iter().enumerate() {
+            shield[16 + 4 * k..20 + 4 * k].copy_from_slice(&x.to_le_bytes());
+        }
+        shield[48] ^= 0x55;
+        let mut barrier_kit = equip.clone();
+        barrier_kit[16..24].copy_from_slice(&unhex("1a0b261335d4d241"));
+        g.set_equipment(them, &barrier_kit);
+        g.wall_placed(them, &shield, t0);
+        g.wall_placed(me, &far(65.0), t0);
+        assert_eq!(stuns(&g.due(t0 + Duration::from_millis(1300))), 0, "behind a wall");
+        g.walls.clear();
+        g.credits.clear();
+        // ENERGY BARRIER (`shield`): a wall, no blast.
+        equip[16..24].copy_from_slice(&unhex("1a0b261335d4d241"));
+        g.set_equipment(me, &equip);
+        g.wall_placed(me, &wall, t0);
+        assert!(g.neutrons.is_empty());
+        // ...unless EchoCombat's `P` token says it was a NEUTRON, before or after.
+        g.point_token(me, t0 + Duration::from_millis(200));
+        assert_eq!(g.neutrons.len(), 1, "token after the wall");
+        g.neutrons.clear();
+        g.point_token(me, t0);
+        g.wall_placed(me, &wall, t0 + Duration::from_millis(100));
+        assert_eq!(g.neutrons.len(), 1, "token before the wall");
+        g.neutrons.clear();
+        g.wall_placed(me, &wall, t0 + Duration::from_secs(5));
+        g.point_token(me, t0 + Duration::from_secs(9));
+        assert!(g.neutrons.is_empty(), "too far apart");
+    }
+
+    /// STUN FIELD: 1 m when it goes off, 4 m from 0.5 s on (the settings).
+    #[test]
+    fn stun_field_grows_to_its_settings_size() {
+        assert!((stun_reach(Duration::ZERO) - 1.0).abs() < 0.01);
+        let mid = stun_reach(Duration::from_millis(250));
+        assert!(mid > 2.5 && mid < 4.0, "{mid}");
+        assert!((stun_reach(Duration::from_secs(1)) - 4.0).abs() < 0.01);
+        assert!((stun_reach(Duration::MAX) - 4.0).abs() < 0.01);
+    }
+
+    /// Cheat death follows the settings: EchoCombat's 5 s by default.
+    #[test]
+    fn cheat_death_is_the_settings_seconds() {
+        assert_eq!(cheat_death(), Duration::from_secs(5));
+    }
+
+    /// A DETONATOR stuck to a wall (it flew in, then stopped) hurts the side
+    /// it came from, not a player behind the wall; one in the open, or a
+    /// player right on it, is hit.
+    #[test]
+    fn detonator_stuck_to_a_wall_does_not_hit_through_it() {
+        let head = |x: f32| [x, 1.7, 0.0];
+        // Flew along +x into a wall at x = 0.
+        let (at, from) = ([0.0, 1.0, 0.0], [-0.3, 1.05, 0.0]);
+        assert!(behind_surface(at, from, head(1.0)), "the far side");
+        assert!(!behind_surface(at, from, head(-1.0)), "the near side");
+        assert!(!behind_surface(at, from, head(0.3)), "right on it");
+        // Thrown onto the floor: players around and above it are hit.
+        assert!(!behind_surface([0.0, 0.0, 0.0], [0.0, 0.3, 0.2], head(1.2)));
+    }
+
+    /// The shield (native Fission, 2026-11-16): a full-charge COMET head hit
+    /// (60 x 2) on a full shield leaves 0 shield and 7 health, alive; the next
+    /// hit kills. A hit of twice the shield or more reaches the health at once.
+    #[test]
+    fn a_full_shield_survives_any_single_hit() {
+        assert_eq!(split_hit(112.0, 7.0, 120.0), (112.0, 0.0));
+        assert_eq!(split_hit(112.0, 7.0, 223.0), (112.0, 0.0));
+        assert_eq!(split_hit(20.89, 7.0, 84.0), (20.89, 7.0), "native Dyson 113.69: shield 20.89, head hit");
+        assert_eq!(split_hit(0.0, 7.0, 4.0), (0.0, 4.0));
+        let (mut g, me, them, _) = two_in_the_area();
+        let v = g.hurt(them, 120.0, PART_HEAD, [0.0; 3], [1; 8], Some(me));
+        assert!(v.iter().all(|o| o.ty != PLAYER_KILLED), "a charged COMET head hit does not kill");
+        let hb = v.iter().find(|o| o.ty == HEALTH_BROADCAST).expect("hurt");
+        assert_eq!(&hb.body[12..20], [0f32.to_le_bytes(), 7f32.to_le_bytes()].concat().as_slice());
+        let v = g.hurt(them, 30.0, PART_HEAD, [0.0; 3], [1; 8], Some(me));
+        assert!(v.iter().any(|o| o.ty == PLAYER_KILLED), "the next one does");
+    }
+
+    /// A DETONATOR's line of sight: a wall of the map between it and a player
+    /// blocks it, as does a standing barrier's box; open air does not.
+    #[test]
+    fn walls_and_barriers_block_the_line() {
+        let mut g = Gear::default();
+        g.set_match(super::super::combat::LEVEL_COMBUSTION);
+        let w = super::super::walls::of(super::super::combat::LEVEL_COMBUSTION).expect("walls");
+        let (c, n) = w.face(1000);
+        let (a, b) = ([c[0] - n[0], c[1] - n[1], c[2] - n[2]], [c[0] + n[0], c[1] + n[1], c[2] + n[2]]);
+        assert!(g.line_blocked(a, b, BLAST_SKIP), "through a wall");
+        assert!(!g.line_blocked(b, [b[0] + n[0] * 0.3, b[1] + n[1] * 0.3, b[2] + n[2] * 0.3], BLAST_SKIP), "away from it");
+        let bar = Barrier { space: [0; 8], pool: 1, handle: 1, max: 100.0, respawn: 0.0, pos: [0.0; 3], rot: [0.0, 0.0, 0.0, 1.0], half: [1.0, 1.0, 0.1], off_z: 0.0 };
+        assert!(bar.crosses([0.0, 0.0, -2.0], [0.0, 0.0, 2.0], 0.15));
+        assert!(!bar.crosses([3.0, 0.0, -2.0], [3.0, 0.0, 2.0], 0.15));
+    }
+
+    #[test]
+    fn neutron_symbol_is_point() {
+        assert_eq!(crate::sns::symbol("point"), TAC_POINT);
+    }
+
+    /// A teammate walking by does not set it off; picking it back up removes it.
+    #[test]
+    fn arc_mine_ignores_teammates_and_can_be_picked_up() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 0);
+        let mag = "658d84f5712baa05";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f134d5099974113f01000000211e8241da8ec03faea66dc1e9f091a8b1d0e8c8{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}6388fd280387e323")), t0);
+        g.thrown_at.insert(me, [45.1, 1.0, -25.3]);
+        g.due(t0 + Duration::from_secs(4));
+        let v = g.due(t0 + Duration::from_secs(6));
+        assert!(v.iter().all(|(_, o)| o.ty != STUN_MSG));
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("3c7045ed2b0f6742{mag}1b0b211b29d4d241")), t0);
+        assert!(g.mines.is_empty());
+    }
+
+    /// An opponent in range is not healed.
+    #[test]
+    fn repair_matrix_skips_the_other_team() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        g.credits.clear();
+        g.on_message(me, HEAL_BUBBLE_ACTIVATE, &unhex("8ec21d00d315993fd1eb3d3fa8a2fdb10000000000000000"), t0);
+        g.due(t0 + Duration::from_secs(2));
+        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(112.0 - 13.5));
+        assert!(g.credits.is_empty());
+    }
+
+    /// OVERCHARGE's heal: 3 health over 10 s for a linked teammate, no more
+    /// than 3, credited to the user; the user is not healed.
+    #[test]
+    fn overcharge_heals_its_user_and_linked_teammates_a_little() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 0);
+        // Both hurt (no teams yet for the shots), then on one team.
+        g.teams.clear();
+        g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        let mut back = head_shot_on_slot_1();
+        back[32] = 0xf2;
+        back[56] = 0xf3;
+        g.on_message(them, BULLET_COLLISION, &back, t0);
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 0);
+        let before = |g: &Gear, a: SocketAddr| g.lives.get(&a).map_or(0.0, |l| l.health);
+        let (me0, them0) = (before(&g, me), before(&g, them));
+        g.on_message(me, HEAL_BUBBLE_ACTIVATE, &unhex("f234d5099974113f41e35b49673283b9f234d5099974113f"), t0);
+        // The user's client links slot 1.
+        let mut link = unhex("8ec21d00d315993ff334d5099974113f0000000000000000000000000000000000");
+        link.truncate(32);
+        link[16..20].copy_from_slice(&(-4_090_010f32).to_le_bytes());
+        g.on_message(me, DAMAGE_DEALT, &link, t0);
+        g.credits.clear();
+        g.due(t0 + Duration::from_secs(5));
+        let healed = |g: &Gear| g.credits.iter().map(|c| if let Credit::Heal { by, amount } = c { assert_eq!(*by, me); *amount } else { 0.0 }).sum::<f32>();
+        assert!((before(&g, them) - them0 - 1.5).abs() < 0.05, "half of 3 in 5 s: {}", before(&g, them) - them0);
+        assert!(before(&g, me) <= me0, "the user is not healed");
+        // Past its 10 s: 3 each at most, then nothing more.
+        g.due(t0 + Duration::from_secs(10));
+        g.due(t0 + Duration::from_secs(12));
+        assert!((before(&g, them) - them0 - 3.0).abs() < 0.05);
+        assert!((healed(&g) - 3.0).abs() < 0.05);
+        assert!(g.oc_heals.is_empty());
     }
 
     /// OVERCHARGE: the user's hits deal +1 (+2 on the head) and they take 25%
-    /// less; a linked teammate takes 25% less and cannot die for 8 s.
+    /// less; a linked teammate takes 25% less and cannot die for 5 s (`cheat_death_seconds`).
     #[test]
     fn overcharge_boosts_cuts_and_saves() {
         let (mut g, me, them, t0) = two_in_the_area();
@@ -2164,7 +4094,18 @@ mod tests {
             let v = g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
             assert!(v.iter().all(|o| o.ty != PLAYER_KILLED), "cheat death");
         }
-        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(1.0));
+        assert_eq!(g.lives.get(&them).map(|l| (l.health, l.core)), Some((0.0, 1.0)), "no shield, 1 health");
+        // The same use linking them again and again: one cheat death only.
+        let five = t0 + Duration::from_secs(5);
+        assert!(g.cheats_death(them, t0 + Duration::from_secs(4)));
+        for k in 5..10 {
+            g.on_message(me, DAMAGE_DEALT, &link, t0 + Duration::from_secs(k));
+        }
+        assert!(!g.cheats_death(them, five + Duration::from_millis(100)), "not renewed by later links");
+        // A new use later: a new cheat death.
+        let next = t0 + Duration::from_secs(20);
+        g.on_message(me, DAMAGE_DEALT, &link, next);
+        assert!(g.cheats_death(them, next + Duration::from_secs(1)));
         // The link breaks: the next lethal hit kills.
         link[16..20].copy_from_slice(&(-6_090_010f32).to_le_bytes());
         g.on_message(me, DAMAGE_DEALT, &link, t0);

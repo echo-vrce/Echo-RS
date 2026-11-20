@@ -34,8 +34,8 @@
   radius; box: centre, rotation quaternion, half extents), in world space.
 
 Writes src/engine/data/combat_<map>_{ids,balance}.hex (the vars are gen_combat_vars.py's),
-combat_<map>_track.txt, combat_<map>_capture.txt, combat_<map>_barriers.txt and
-lobby_combat_barriers.txt.
+combat_<map>_track.txt, combat_<map>_capture.txt, combat_<map>_barriers.txt,
+combat_fission_climax_barriers.txt and lobby_combat_barriers.txt.
 """
 import math
 import json
@@ -271,6 +271,9 @@ def main() -> None:
             (DATA / f"combat_{name}_capture.txt").write_text(capture(m, name))
         (DATA / f"combat_{name}_barriers.txt").write_text(barriers(m, level, unhex(DATA / f"combat_{name}_ids.hex")))
         print(level, hex(echopkg.sym(level)), "components", (len(ids_response(m, level)) - 8) // 10)
+    # Fission's climax sublevel has its own damageables (1000 health), in its own space.
+    climax = "mpl_combat_fission_climax"
+    (DATA / "combat_fission_climax_barriers.txt").write_text(barriers(m, climax, unhex(DATA / "combat_fission_climax_ids.hex")))
     lobby = barriers(m, "mpl_lobby_b_combat", unhex(DATA / "ids_response_2645.hex"))
     (DATA / "lobby_combat_barriers.txt").write_text(lobby)
 

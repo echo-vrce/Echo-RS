@@ -88,6 +88,7 @@ impl Pool {
         self.instances.lock().retain(|idx, i| {
             if i.inst.task.is_finished() {
                 warn!(instance = idx, port = i.inst.port, "game server instance exited");
+                crate::upnp::close(crate::upnp::Proto::Udp, i.inst.port);
                 false
             } else {
                 true
@@ -172,6 +173,7 @@ impl Pool {
             };
             let inst = engine::start(idx, socket, fleet_url, self.cfg.engine)?;
             info!(instance = idx, port, total = self.count() + 1, "game server instance started");
+            crate::upnp::open(crate::upnp::Proto::Udp, port);
             self.instances.lock().insert(idx, Slot { inst, started: Instant::now() });
             return Ok(());
         }
@@ -188,6 +190,7 @@ impl Pool {
         }
         let Some(inst) = self.instances.lock().remove(&idx) else { return };
         info!(instance = idx, port, "retiring idle game server instance");
+        crate::upnp::close(crate::upnp::Proto::Udp, port);
         inst.inst.stop().await;
     }
 

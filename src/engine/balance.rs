@@ -31,11 +31,28 @@ static SERVER_ARENA: OnceLock<Map<String, Value>> = OnceLock::new();
 
 /// `mp_arena_rules` values only this server has (the launcher's Settings page
 /// shows them with the game's): kept out of what clients get.
-pub const SERVER_ARENA_KEYS: [&str; 2] = ["goalie_ping_advantage_public", "goalie_ping_advantage_private"];
+pub const SERVER_ARENA_KEYS: [&str; 10] = [
+    "goalie_ping_advantage_public",
+    "goalie_ping_advantage_private",
+    "team_only_voice_public",
+    "team_only_voice_private",
+    // RULES screen rows the game has no private setting for.
+    "overtime_private",
+    "goal_stops_time_private",
+    "carry_points_over_private",
+    "standard_chassis_private",
+    "disc_curve_private",
+    "disc_spawn_private",
+];
 
 /// One of `SERVER_ARENA_KEYS` as the host set it.
 pub fn server_arena_flag(key: &str) -> Option<bool> {
     SERVER_ARENA.get()?.get(key)?.as_bool()
+}
+
+/// Every one of `SERVER_ARENA_KEYS` the host set, as one object.
+pub fn server_arena() -> Value {
+    Value::Object(SERVER_ARENA.get().cloned().unwrap_or_default())
 }
 
 pub(crate) const ECHOCOMBAT_WEAPONS: &str = include_str!("data/mp_weapon_settings_echocombat.json");
@@ -246,11 +263,14 @@ pub struct ArenaPublic {
     pub goalie_advantage: bool,
     /// Its window (`goalie_ping_window`, 150 ms), for public and private matches.
     pub goalie_window_ms: f32,
+    /// Team-only voice in public matches (`team_only_voice_public`, off
+    /// unless the host turns it on).
+    pub team_voice: bool,
 }
 
 impl Default for ArenaPublic {
     fn default() -> Self {
-        Self { round_secs: 300.0, pre_match_secs: 45.0, launch_secs: 15.0, mercy_margin: 12, self_goals: false, sudden_death: true, sd_round_secs: 120.0, sd_regulation_over_secs: 0.0, sd_round_over_secs: 5.0, goalie_advantage: false, goalie_window_ms: 150.0 }
+        Self { round_secs: 300.0, pre_match_secs: 45.0, launch_secs: 15.0, mercy_margin: 12, self_goals: false, sudden_death: true, sd_round_secs: 120.0, sd_regulation_over_secs: 0.0, sd_round_over_secs: 5.0, goalie_advantage: false, goalie_window_ms: 150.0, team_voice: false }
     }
 }
 
@@ -271,6 +291,7 @@ impl ArenaPublic {
             sd_round_over_secs: f(&rr, "sudden_death_round_over_time", d.sd_round_over_secs, 0.0),
             goalie_advantage: server_arena_flag("goalie_ping_advantage_public").unwrap_or(d.goalie_advantage),
             goalie_window_ms: f(r, "goalie_ping_window", d.goalie_window_ms, 0.0),
+            team_voice: server_arena_flag("team_only_voice_public").unwrap_or(d.team_voice),
         }
     }
 }
@@ -358,7 +379,7 @@ mod tests {
         let ask_medigun: Map<String, Value> = serde_json::from_str(r#"{"mp_weapon_settings": {"medigun": {"enabled": true}}}"#).expect("json");
         let ec = build(&body, Base { echocombat: true, medigun: false }, &ask_medigun).expect("build");
         let w = document(&ec, "mp_weapon_settings").expect("weapons");
-        assert_eq!(w.pointer("/grenade_properties/dot/radius"), Some(&Value::from(2.25)));
+        assert_eq!(w.pointer("/grenade_properties/dot/radius"), Some(&Value::from(2.5)));
         assert_eq!(w.pointer("/medigun/enabled"), Some(&Value::Bool(false)));
         let gear = document(&ec, "mp_equipment").expect("equipment").to_string();
         assert!(gear.contains("PROTOSTAR") && gear.contains("OVERCHARGE"), "EchoCombat gear list");
