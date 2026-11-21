@@ -47,6 +47,10 @@ const NAKAMA_SAVE_LOADOUT: u64 = 0x7777_7777_7777_0B00;
 const NAKAMA_MUTE_ENTRANTS: u64 = 0x7777_7777_7777_0C00;
 /// `SNSUserServerProfileUpdateRequest`, sent to EchoRelay's login service.
 const PROFILE_UPDATE_REQUEST: u64 = 0xd298_6849_b36b_9c72;
+/// `SNSRemoteLogSetv3`: a game's JSON logs to the backend. Native's game
+/// server sends one with a `GOAL` log at each arena goal, and Atlas adds those
+/// up into the match's score (its sessions list and the website show it).
+const REMOTE_LOG_SET: u64 = 0x244b_4768_5187_eae1;
 
 /// Players' platform ids by entrant session, noted by the game servers in
 /// this process (the backend messages carry only the session).
@@ -251,6 +255,10 @@ async fn bridge_nakama(up: &Upstreams, idx: u32, local: WebSocket, url: &str) ->
                             info!(instance = idx, player = ?m.user_id.as_ref().map(|u| &u.id), "sending match stats to nakama");
                             rtx.send(TMsg::Binary(frame.into())).await?;
                         }
+                        continue;
+                    }
+                    if let Some(Em::RemoteLogSetV3(m)) = &env.message {
+                        rtx.send(TMsg::Binary(remote_log_frame(m).into())).await?;
                         continue;
                     }
                     if let Some(Em::GameServerRegistration(reg)) = &mut env.message {
@@ -466,6 +474,13 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                 let Some(Ok(m)) = m else { break };
                 let AxMsg::Binary(data) = m else { if matches!(m, AxMsg::Close(_)) { break } continue };
                 let Ok(env) = pb::Envelope::decode(data.as_slice()) else { continue };
+                if let Some(Em::RemoteLogSetV3(m)) = &env.message {
+                    // Atlas reads them on this socket; EchoRelay has no use for them.
+                    if nakama {
+                        rtx.send(TMsg::Binary(remote_log_frame(m).into())).await?;
+                    }
+                    continue;
+                }
                 if let Some(Em::UserServerProfileUpdateRequest(m)) = &env.message {
                     // A combat match's stats and XP for a player: native's
                     // SNSUserServerProfileUpdateRequest. nakama takes it on this
@@ -859,6 +874,25 @@ fn profile_update_frame(m: &pb::SnsUserServerProfileUpdateRequestMessage) -> Opt
     Some(er_message(PROFILE_UPDATE_REQUEST, w))
 }
 
+/// `SNSRemoteLogSetv3`: `[platform u64][account u64][4 x u64 0][level u64]`,
+/// then a string table: `[count u64]`, each later string's offset (`u32`,
+/// from the first), and the NUL-terminated strings.
+fn remote_log_frame(m: &pb::SnsRemoteLogSetV3Message) -> Vec<u8> {
+    let x = m.user_id.as_ref().and_then(|u| sns::XpId::parse(&u.id));
+    let mut w = Writer::new();
+    w.u64(x.map_or(0, |x| x.platform)).u64(x.map_or(0, |x| x.account));
+    w.u64(0).u64(0).u64(0).u64(0).u64(m.log_level).u64(m.logs.len() as u64);
+    let mut at = 0u32;
+    for l in m.logs.iter().take(m.logs.len().saturating_sub(1)) {
+        at += l.len() as u32 + 1;
+        w.bytes(&at.to_le_bytes());
+    }
+    for l in &m.logs {
+        w.json_nt(l.as_bytes());
+    }
+    er_message(REMOTE_LOG_SET, w)
+}
+
 async fn echorelay_profile_update(login: &str, frame: Vec<u8>) {
     let r = async {
         let (mut ws, _) = tokio_tungstenite::connect_async(login).await.context("connecting to the login service")?;
@@ -945,6 +979,20 @@ mod tests {
         sns::frame(&mut frame, NAKAMA_MUTE_ENTRANTS, &payload);
         sns::frame(&mut frame, NAKAMA_SAVE_LOADOUT, b"{} ");
         assert_eq!(mute_texts(&frame).len(), 1);
+    }
+
+    #[test]
+    fn remote_log_set_has_natives_layout() {
+        let m = pb::SnsRemoteLogSetV3Message { user_id: None, log_level: 2, logs: vec!["{\"a\":1}".into(), "{}".into()] };
+        let f = remote_log_frame(&m);
+        let msgs = sns::split(&f).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let (sym, p) = &msgs[0];
+        assert_eq!(*sym, REMOTE_LOG_SET);
+        assert_eq!(&p[48..56], &2u64.to_le_bytes());
+        assert_eq!(&p[56..64], &2u64.to_le_bytes());
+        assert_eq!(&p[64..68], &8u32.to_le_bytes());
+        assert_eq!(&p[68..], b"{\"a\":1} {} ");
     }
 
     #[test]

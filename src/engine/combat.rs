@@ -243,6 +243,43 @@ fn game_state_handle(level: u64) -> Option<u16> {
 
 /// The module of the capture volume's and the barriers' events.
 const OBJECT_MODULE: u64 = 0x6aea_99ee_b2ba_b6c4;
+/// Native Fission (2026-11-21): the level's script events on the payload's
+/// first reach of a trackpoint. Without them the lift under the payload at
+/// checkpoint 1 stayed up (the payload sank through it), the checkpoint's
+/// celebration waited for the next grab, and the doors to the next section
+/// stayed shut (unloaded map past them).
+/// - The payload's own checkpoint event (its handle, filter 5): checkpoint 1
+///   (trackpoint 58), checkpoint 2 (64), the end (95).
+/// - The level's toggle (`FISSION_TOGGLE`, filter 13) on its doors and
+///   lights: 58 0xf1; 61 0xef, 0xf0; 64 0xf4..0xf6; 74 to 93 0xf2, 0xf3.
+/// - An all-ones symbol on handle 0xeb (58) and 0xec (64), filter 5.
+const FISSION_PAYLOAD_EVENTS: [(u16, u64); 3] = [(58, 0x08c9_92f5_e37f_6056), (64, 0x7522_f800_0ac7_d5e8), (95, 0x4ea8_7836_8609_da77)];
+const FISSION_TOGGLE: u64 = 0x8099_0d12_aec2_bcda;
+
+/// `FISSION_PAYLOAD_EVENTS` and the rest for trackpoints `from` (exclusive)
+/// to `to`, in native's order.
+fn fission_track_events(from: u16, to: u16, payload: u16) -> Vec<Out> {
+    let mut v = Vec::new();
+    for tp in from.saturating_add(1)..=to {
+        if let Some(&(_, sym)) = FISSION_PAYLOAD_EVENTS.iter().find(|(t, _)| *t == tp) {
+            v.push(Out::Event(sym, OBJECT_MODULE, payload, FILTER_ALL));
+        }
+        let toggles: &[u16] = match tp {
+            58 => &[0xf1],
+            61 => &[0xf0, 0xef],
+            64 => &[0xf6, 0xf4, 0xf5],
+            74..=93 => &[0xf2, 0xf3],
+            _ => &[],
+        };
+        v.extend(toggles.iter().map(|&h| Out::Event(FISSION_TOGGLE, OBJECT_MODULE, h, FILTER_ALL_ALT)));
+        match tp {
+            58 => v.push(Out::Event(u64::MAX, OBJECT_MODULE, 0xeb, FILTER_ALL)),
+            64 => v.push(Out::Event(u64::MAX, OBJECT_MODULE, 0xec, FILTER_ALL)),
+            _ => {}
+        }
+    }
+    v
+}
 /// Rounds a team must win on a capture map. Native Dyson played two rounds,
 /// orange won both and the match ended (`round_count` 1 notwithstanding):
 /// first to two is the guess that fits.
@@ -552,6 +589,31 @@ impl Track {
 
     fn end(&self) -> f32 {
         self.checkpoints.last().copied().unwrap_or(0.0)
+    }
+
+    /// Which way the payload faces at `dist`: along the track. Where the
+    /// track drops (Fission's lift after checkpoint 1: 2.79 m straight
+    /// down), native's payload stays level and faces the way it came, then
+    /// sinks; facing along the drop pointed ours nose-down.
+    fn facing(&self, dist: f32) -> [f32; 3] {
+        let dir = |d: f32| {
+            let (a, b) = (self.pos((d - 0.5).max(0.0)), self.pos(d + 0.5));
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+        };
+        let steep = |f: [f32; 3]| f[0] * f[0] + f[2] * f[2] < f[1] * f[1];
+        let f = dir(dist);
+        if !steep(f) {
+            return f;
+        }
+        let mut back = dist;
+        while back > 0.0 {
+            back -= 0.5;
+            let g = dir(back.max(0.0));
+            if !steep(g) {
+                return [g[0], 0.0, g[2]];
+            }
+        }
+        [0.0, 0.0, 1.0]
     }
 
     fn pos(&self, d: f32) -> [f32; 3] {
@@ -1887,6 +1949,11 @@ impl Combat {
         }
         if let Some((from, to)) = first_reach {
             self.reach_track_vars(from, to);
+            if self.level == LEVEL_FISSION
+                && let Some(p) = self.payload.as_ref()
+            {
+                out.extend(fission_track_events(from, to, p.handle));
+            }
         }
         if let Some(i) = reached {
             out.extend(self.announce(MOD_GAME_STATE, &GS_CHECKPOINT[i.min(1)..=i.min(1)]));
@@ -2156,8 +2223,7 @@ impl Combat {
         let mut d: Vec<u8> = (0..template.len() / 2).map(|i| u8::from_str_radix(&template[2 * i..2 * i + 2], 16).unwrap_or(0)).collect();
         d[8..16].copy_from_slice(&(now_us & 0xffff_ffff).to_le_bytes());
         let at = p.track.pos(p.dist);
-        let (a, b) = (p.track.pos((p.dist - 0.5).max(0.0)), p.track.pos(p.dist + 0.5));
-        let f = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let f = p.track.facing(p.dist);
         let r = PHYS_HEAD_BITS + index * PHYS_RECORD_BITS;
         let pos = [at[0], at[1] + PAYLOAD_RIDE, at[2]];
         for (k, x) in pos.iter().enumerate() {
@@ -2332,6 +2398,29 @@ mod tests {
         assert!((c.payload_dist().expect("d") - 59.305).abs() < 0.01);
         run(&mut c, 1.0, &nobody);
         assert!(c.clock < clock - 0.5, "the clock runs again");
+    }
+
+    /// Native Fission's checkpoint 1: the payload's checkpoint event, the
+    /// door toggle and the 0xeb event, once; and on the lift the payload
+    /// stays level (no nose-down).
+    #[test]
+    fn fission_checkpoint_one_opens_the_way_and_the_payload_stays_level() {
+        let mut c = playing(fission());
+        c.payload.as_mut().expect("p").dist = 56.4;
+        let mut v = Vec::new();
+        for _ in 0..20 {
+            let me = on_payload(&mut c, 1);
+            v.extend(c.step(0.1, &[me]));
+        }
+        let cp = Out::Event(0x08c9_92f5_e37f_6056, OBJECT_MODULE, 0x60, FILTER_ALL);
+        assert_eq!(v.iter().filter(|o| **o == cp).count(), 1, "{v:?}");
+        assert!(v.contains(&Out::Event(FISSION_TOGGLE, OBJECT_MODULE, 0xf1, FILTER_ALL_ALT)));
+        assert!(v.contains(&Out::Event(u64::MAX, OBJECT_MODULE, 0xeb, FILTER_ALL)));
+        let p = c.payload.as_ref().expect("p");
+        let f = p.track.facing(57.9);
+        assert!(f[1].abs() < 1e-6 && (f[0] * f[0] + f[2] * f[2]) > 0.01, "level: {f:?}");
+        let g = p.track.facing(20.0);
+        assert!((f[0] * g[0] + f[2] * g[2]) != 0.0);
     }
 
     /// Native Gauss: the clock hits 0 with attackers on it: overtime events

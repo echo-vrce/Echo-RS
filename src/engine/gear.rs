@@ -445,7 +445,9 @@ struct Life {
     health: f32,
     /// The health under it (see `FULL_CORE`).
     core: f32,
-    hurt: Option<(u32, [f32; 3], [u8; 8])>,
+    /// The last hit: kind, place, cause, and the shot's direction (native:
+    /// the bullet's direction from its `BulletCollision`; 0 for blasts).
+    hurt: Option<(u32, [f32; 3], [u8; 8], [f32; 3])>,
     dead: bool,
     died_at: Option<Instant>,
     /// When health last went down, and when regeneration last sent.
@@ -484,14 +486,13 @@ fn health_body(owner: [u8; 8], slot: u32, life: &Life, entry: bool) -> Vec<u8> {
     // The health under the shield: 7.0 at full, 0 once dead (native's
     // broadcast at a kill).
     b.extend_from_slice(&(if life.dead { 0f32 } else { life.core }).to_le_bytes());
-    let (kind, pos, cause) = life.hurt.unwrap_or((0, [0.0; 3], if entry { [0xff; 8] } else { [0; 8] }));
+    let (kind, pos, cause, dir) = life.hurt.unwrap_or((0, [0.0; 3], if entry { [0xff; 8] } else { [0; 8] }, [0.0; 3]));
     b.extend_from_slice(&kind.to_le_bytes());
     b.extend_from_slice(&[0; 4]);
     b.extend_from_slice(if life.hurt.is_some() { &[0; 4] } else { &[0xff; 4] });
-    for x in pos {
+    for x in pos.into_iter().chain(dir) {
         b.extend_from_slice(&x.to_le_bytes());
     }
-    b.extend_from_slice(&[0; 12]);
     b.extend_from_slice(&cause);
     b
 }
@@ -500,7 +501,7 @@ fn health_body(owner: [u8; 8], slot: u32, life: &Life, entry: bool) -> Vec<u8> {
 /// regen sends it: the regen kind until full, and ffffffff at 28 (no hit).
 fn regen_body(owner: [u8; 8], slot: u32, life: &Life) -> Vec<u8> {
     let mut shown = *life;
-    shown.hurt = if life.full() { None } else { Some((HURT_REGEN, [0.0; 3], [0; 8])) };
+    shown.hurt = if life.full() { None } else { Some((HURT_REGEN, [0.0; 3], [0; 8], [0.0; 3])) };
     let mut b = health_body(owner, slot, &shown, false);
     b[28..32].copy_from_slice(&[0xff; 4]);
     b
@@ -726,6 +727,8 @@ pub struct Gear {
     /// Heal bubble parameters by bubble, and each player's bubble owner id.
     bubbles: Vec<([u8; 8], Vec<u8>)>,
     bubble_owner: HashMap<SocketAddr, [u8; 8]>,
+    /// The bullet direction for the next `hurt` (a shot's).
+    shot_dir: Option<[f32; 3]>,
     /// Each player's health as the server last broadcast it.
     lives: HashMap<SocketAddr, Life>,
     /// Shots by explosion id: (weapon byte, projectile damage), from `GameFireGun`.
@@ -831,6 +834,7 @@ impl Gear {
             fields: Vec::new(),
             bubbles: Vec::new(),
             bubble_owner: HashMap::new(),
+            shot_dir: None,
             lives: HashMap::new(),
             shots: HashMap::new(),
             drone_rays: HashMap::new(),
@@ -1591,6 +1595,7 @@ impl Gear {
     }
 
     fn hurt(&mut self, who: SocketAddr, amount: f32, kind: u32, pos: [f32; 3], cause: [u8; 8], by: Option<SocketAddr>) -> Vec<Out> {
+        let dir = self.shot_dir.take().unwrap_or([0.0; 3]);
         // The id is the same for every player; a client's own messages only confirm it.
         let owner = self.bubble_owner.get(&who).copied().unwrap_or(DAMAGEABLE);
         let slot = self.slot_of(&who);
@@ -1616,7 +1621,7 @@ impl Gear {
         life.health = (life.health - off_shield).max(0.0);
         life.core = (life.core - off_core).max(0.0);
         let landed = off_shield + off_core;
-        life.hurt = Some((kind, pos, cause));
+        life.hurt = Some((kind, pos, cause, dir));
         life.lost_at = Some(now);
         life.regen_at = None;
         let mut v = Vec::new();
@@ -1624,7 +1629,7 @@ impl Gear {
             life.health = 0.0;
             life.dead = true;
             life.died_at = Some(Instant::now());
-            info!(%who, cause = %hex8(cause), "player killed");
+            info!(victim = %who, victim_slot = format_args!("{slot:#x}"), killer = ?by, killer_slot = format_args!("{killer:#x}"), cause = %hex8(cause), "player killed");
             // Shots pass their body part as the kind (explosions 4, ordnance 2).
             self.credits.push(Credit::Kill { by: by.filter(|a| *a != who), victim: who, head: kind == PART_HEAD && by.is_some() });
             // `[id][cause][victim slot][killer slot]` (Gauss match).
@@ -1908,6 +1913,7 @@ impl Gear {
                     match shot {
                         Some(victim) => {
                             info!(%from, %victim, amount, part, "shot hit a player");
+                            self.shot_dir = Some(f3(d, 8));
                             v.extend(self.hurt(victim, amount, part as u32, at, arr8(d, 0), Some(from)));
                         }
                         None => debug!(%from, target = %hex8(target), "shot hit a player not in the area"),
@@ -2157,7 +2163,9 @@ impl Gear {
                 v.push(o);
             }
         }
-        info!(%thrower, healed = v.len() / 2, "INSTANT REPAIR");
+        let own = self.bodies.get(&thrower).map(|(_, p)| (body_dist(at, *p), self.reaches(at, *p)));
+        let life = self.lives.get(&thrower).map(|l| (l.health, l.core, l.dead));
+        info!(%thrower, healed = v.len() / 2, ?at, own_distance_and_clear = ?own, own_life = ?life, "INSTANT REPAIR");
         v
     }
 
@@ -2492,6 +2500,10 @@ impl Gear {
     /// within `heal_radius` of them get `heal_amt / heal_duration` a second
     /// (the user times `self_heal_mult`), one matrix per player at a time
     /// (`unique_healing_only`). It stops early when its user dies or leaves.
+    /// Native (Surge, 2026-11-21) measured the 8 m from its user's body as
+    /// they moved (a teammate's healing stopped at 8.02 m and came back at
+    /// 7.94) and nothing in its settings asks for occlusion (INSTANT
+    /// REPAIR's do): no line of sight needed, which ours wrongly asked.
     fn repair(&mut self, now: Instant, ready: &mut Vec<(SocketAddr, Out)>) {
         if self.matrices.is_empty() {
             return;
@@ -2520,7 +2532,7 @@ impl Gear {
             let near: Vec<SocketAddr> = self
                 .bodies
                 .iter()
-                .filter(|(a, (_, p))| (**a == m.who || (team.is_some() && self.teams.get(*a).copied() == team)) && self.in_combat(a) && dist(at, *p) <= radius && (**a == m.who || self.reaches(at, *p)))
+                .filter(|(a, (_, p))| (**a == m.who || (team.is_some() && self.teams.get(*a).copied() == team)) && self.in_combat(a) && dist(at, *p) <= radius)
                 .map(|(a, _)| *a)
                 .collect();
             for a in near {

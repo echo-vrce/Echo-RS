@@ -1816,10 +1816,23 @@ impl Session {
             ENTRANT_DATA => self.on_entrant_data(from, d),
             LOADOUT_REQUEST if d.len() == 4 => {
                 let want = usize::from(u16_at(d, 0));
-                let body = self.slot_addr.get(want).copied().flatten().and_then(|a| self.peers.get(&a)).and_then(|p| p.loadout.clone());
+                let owner = self.slot_addr.get(want).copied().flatten();
+                let body = owner.and_then(|a| self.peers.get(&a)).and_then(|p| p.loadout.clone());
                 match body {
                     Some(b) => self.reliable_to(from, LOADOUT_RESPONSE, &b),
-                    None => self.parked_loadouts.push((from, want)),
+                    None => {
+                        // Not known yet: ask its owner, as native does (it
+                        // passed the request on and the owner's answer went
+                        // to the asker). Only parked, a player whose loadout
+                        // never came (a rejoin) went without a gun for good
+                        // in everyone's game.
+                        let asked = self.parked_loadouts.iter().any(|(_, s)| *s == want);
+                        self.parked_loadouts.push((from, want));
+                        if let Some(o) = owner.filter(|o| *o != from && !asked) {
+                            info!(asker = %from, owner = %o, slot = want, "loadout not known: asking its owner");
+                            self.reliable_to(o, LOADOUT_REQUEST, d);
+                        }
+                    }
                 }
             }
             LOADOUT_RESPONSE if d.len() == 452 => {
@@ -2109,6 +2122,18 @@ impl Session {
             rej[16] = 2;
             self.reliable_to(from, JOIN_REJECTED, &rej);
             self.reliable_to(from, DISCONNECT, &[]);
+            return;
+        }
+        // The match is over and the session about to end: a player let in
+        // now loads into a match that closes on them a moment later, and
+        // their game was left at "matchmaker unavailable". Refused as a full
+        // lobby is, their game asks the matchmaker for another.
+        if self.close_at.is_some() {
+            let mut rej = [0u8; 20];
+            rej[16] = 4;
+            self.reliable_to(from, JOIN_REJECTED, &rej);
+            self.reliable_to(from, DISCONNECT, &[]);
+            warn!(%from, "match over: join refused");
             return;
         }
         let Some(slot) = (0..MAX_SLOTS).find(|s| self.slot_addr[*s].is_none()) else {
@@ -2788,6 +2813,8 @@ impl Session {
         for a in self.joined() {
             self.reliable_to(a, POST_SCORE, &rec);
         }
+        let log = self.goal_log(&g, blue_scored, (self.arena.disc_owner & 0xffff) as u16);
+        self.fleet_out.push(log);
         // Native: the server takes the disc and pins it where it entered the
         // goal box, bumping the reset count so clients snap to it.
         self.arena.frozen = Some((hit[0], hit[1], hit[2]));
@@ -4346,6 +4373,61 @@ impl Session {
         }
     }
 
+    /// Native's game server sends the backend a `GOAL` remote log at each
+    /// arena goal. Atlas adds them up into the match's score, which its
+    /// sessions list and the website show; without them every match read
+    /// 0 - 0. Atlas counts a goal for team 0 (blue) or 1 by its type's points.
+    fn goal_log(&self, g: &super::stats::GoalInfo, blue_scored: bool, owner: u16) -> pb::Envelope {
+        use super::stats::*;
+        let goal_type = match g.goal_type {
+            GOAL_SLAM_DUNK => "SLAM DUNK",
+            GOAL_INSIDE_SHOT => "INSIDE SHOT",
+            GOAL_LONG_SHOT => "LONG SHOT",
+            GOAL_BOUNCE_SHOT => "BOUNCE SHOT",
+            GOAL_LONG_BOUNCE_SHOT => "LONG BOUNCE SHOT",
+            GOAL_HEADBUTT => "HEADBUTT",
+            GOAL_LONG_HEADBUTT => "LONG HEADBUTT",
+            GOAL_BUMPER_SHOT => "BUMPER SHOT",
+            GOAL_LONG_BUMPER_SHOT => "LONG BUMPER SHOT",
+            GOAL_SELF => "SELF GOAL",
+            _ => if g.points >= 3 { "LONG SHOT" } else { "INSIDE SHOT" },
+        };
+        let player = |slot: Option<u16>| {
+            slot.and_then(|s| self.slot_addr.get(usize::from(s)).copied().flatten()).and_then(|a| self.peers.get(&a)).map(|p| {
+                let id = p.xpid.map(|[platform, account]| crate::sns::XpId { platform, account }.token()).unwrap_or_default();
+                let name = p.entrant_header.as_deref().and_then(|h| h.get(60..96)).map(|n| n.split(|&b| b == 0).next().unwrap_or(&[])).unwrap_or(&[]);
+                (String::from_utf8_lossy(name).into_owned(), id, i64::from(p.team == TEAM_ORANGE))
+            })
+        };
+        let team = i64::from(!blue_scored);
+        let (name, id, _) = player(g.scorer.or(Some(owner))).unwrap_or_default();
+        let (prev_name, prev_id, prev_team) = player(g.assister).unwrap_or_default();
+        let log = serde_json::json!({
+            "message": "Goal",
+            "message_type": "GOAL",
+            "[session][uuid]": format!("{{{}}}", self.info.lobby.to_string().to_uppercase()),
+            "[game_info][game_time]": f64::from(self.arena.round_clock - self.arena.clock),
+            "[game_info][is_arena]": true,
+            "[game_info][is_capture_point]": false,
+            "[game_info][is_combat]": false,
+            "[game_info][is_payload]": false,
+            "[game_info][is_private]": self.arena.private,
+            "[game_info][is_social]": false,
+            "[game_info][level]": "mpl_arena_a",
+            "[game_info][match_type]": if self.arena.private { "Echo_Arena_Private" } else { "Echo_Arena" },
+            "[goal_type]": goal_type,
+            "[player_info][displayname]": name,
+            "[player_info][teamid]": team,
+            "[player_info][userid]": id,
+            "[prev_player][displayname]": prev_name,
+            "[prev_player][teamid]": if g.assister.is_some() { prev_team } else { -1 },
+            "[prev_player][userid]": prev_id,
+            "[was_headbutt]": matches!(g.goal_type, GOAL_HEADBUTT | GOAL_LONG_HEADBUTT),
+        });
+        info!(goal_type, team, "goal log to the backend");
+        env(Em::RemoteLogSetV3(pb::SnsRemoteLogSetV3Message { user_id: None, log_level: 2, logs: vec![log.to_string()] }))
+    }
+
     /// An arena match is over: each player's totals, win or loss, to the
     /// backend as an `SNSUserServerProfileUpdateRequest` (nakama adds them to
     /// its statistics boards, as it does a combat match's). Native's game
@@ -4617,7 +4699,7 @@ impl Session {
             self.peers
                 .iter()
                 .filter(|(_, p)| p.stage == Stage::Joined)
-                .filter_map(|(addr, p)| Some((msg::entrant_hold_var(p.genidx, p.slot?)?, u64::from(!self.gear.alive(*addr)))))
+                .filter_map(|(addr, p)| Some((msg::entrant_hold_var(p.generation.unwrap_or(p.genidx), p.slot?)?, u64::from(!self.gear.alive(*addr)))))
                 .collect()
         } else {
             Vec::new()

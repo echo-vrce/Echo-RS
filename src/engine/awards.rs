@@ -94,13 +94,17 @@ pub fn choose(defs: &[AwardDef], stats: &[Vec<f32>]) -> Vec<(usize, Option<usize
     }
     out.push((mvp, None, score(mvp).max(0) as u64));
     let mut taken = vec![mvp];
+    // Each award goes out once: two players both shown QUICK REFLEXES was a
+    // bug report. A player whose best one is gone gets their next best.
+    let mut given: Vec<usize> = Vec::new();
     for _ in 0..MAX_AWARDS {
-        let best = (0..stats.len()).filter(|i| !taken.contains(i)).filter_map(|i| cands[i].first().map(|&(k, s)| (i, k, s))).fold(None, |b: Option<(usize, usize, i64)>, c| match b {
+        let best = (0..stats.len()).filter(|i| !taken.contains(i)).filter_map(|i| cands[i].iter().find(|(k, _)| !given.contains(k)).map(|&(k, s)| (i, k, s))).fold(None, |b: Option<(usize, usize, i64)>, c| match b {
             Some(b) if b.2 >= c.2 => Some(b),
             _ => Some(c),
         });
         let Some((i, k, _)) = best else { break };
         taken.push(i);
+        given.push(k);
         out.push((i, Some(k), round(stats[i][k]).max(0) as u64));
     }
     out
@@ -109,6 +113,26 @@ pub fn choose(defs: &[AwardDef], stats: &[Vec<f32>]) -> Vec<(usize, Option<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_award_goes_to_two_players() {
+        let defs = ARENA;
+        let n = defs.len();
+        let mut players = vec![vec![0.0; n]; 4];
+        players[0] = vec![50.0; n];
+        players[1][0] = 9.0;
+        players[2][0] = 8.0;
+        players[2][1] = 0.5;
+        players[3][0] = 7.0;
+        players[3][2] = 0.5;
+        let out = choose(&defs, &players);
+        let kinds: Vec<usize> = out.iter().filter_map(|o| o.1).collect();
+        assert_eq!(kinds.len(), 3);
+        let mut d = kinds.clone();
+        d.sort();
+        d.dedup();
+        assert_eq!(d.len(), kinds.len(), "{kinds:?}");
+    }
 
     /// Native combat (client-combat-20261116-b): MVP, then guard 162,
     /// defender 10, cannoneer 2021: each the best award of the next player.
