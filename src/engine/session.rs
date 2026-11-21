@@ -328,6 +328,10 @@ const EV_SD_CALLED: u64 = 0x0ae9_dc18_2d5a_c591;
 const SD_NEW_ROUND_SECS: f32 = 5.0;
 /// From a public match's return to lobby to the session's end.
 const PUBLIC_END_GRACE: Duration = Duration::from_secs(5);
+/// A match with only spectators in it, before any player has joined a team,
+/// ends after this long (the host, 2026-11-20). Once players have been in it,
+/// it ends as soon as only spectators are left.
+const SPECTATORS_ONLY_GRACE: Duration = Duration::from_secs(30);
 
 /// How far the server's disc timestamp runs ahead of session time (the
 /// clients' clocks start within a few seconds of it).
@@ -1254,6 +1258,11 @@ pub struct Session {
     combat_at: Option<Instant>,
     /// The combat vars last sent (only changes go out, plus all twice a second).
     combat_sent: HashMap<u64, u64>,
+    /// Games VeilNet showed have EchoCombat.
+    ec_clients: HashSet<SocketAddr>,
+    /// Games given the stock gear tables (no EchoCombat seen yet): they get
+    /// EchoCombat's if it shows up later.
+    stock_balance: HashSet<SocketAddr>,
     /// Seconds since the last combat stat update.
     combat_stat_clock: f32,
     /// The capture point's holder last tick (for capture credits).
@@ -1305,12 +1314,29 @@ pub struct Session {
     /// ends at this time whoever is still here, so the server goes idle and
     /// nobody (a `-lobbyid` join, the matchmaker) lands in the finished game.
     close_at: Option<Instant>,
+    /// A player has been on a team in this match (not just spectators).
+    had_players: bool,
+    /// Since when only spectators have been in a match nobody has played yet.
+    spectators_since: Option<Instant>,
     /// Entrants the backend server-muted (atlas's /mute-player): their voice
     /// is not relayed to anyone. Kept by entrant, so a mute can arrive before
     /// the player's connection does; a rejoin gets a new entrant id, and the
     /// backend mutes that one again.
     muted: HashSet<Uuid>,
+    /// EchoCombat's map switch under way: the new level, and when the
+    /// server reloads on it (the lobby says "not in game" until then).
+    map_switch: Option<(u64, Instant)>,
+    /// When the server last reloaded on a new map (the replication wait).
+    reloaded_at: Option<Instant>,
 }
+
+/// A map switch: the clients leave the game this long before the server
+/// reloads (EchoCombat's `MAP_LEAVE_MS`: the client's VeilNet unloads its
+/// map 1 s into it, while the lobby still says the server is not in game).
+const MAP_LEAVE: Duration = Duration::from_secs(3);
+/// After a map switch, a client that has not said it is ready for the
+/// replicated vars by now gets them anyway.
+const RELOAD_REPLICATION_WAIT: Duration = Duration::from_secs(30);
 
 fn env(m: Em) -> pb::Envelope {
     pb::Envelope { cid: Uuid::new_v4().to_string(), message: Some(m) }
@@ -1543,6 +1569,8 @@ impl Session {
             combat,
             combat_at: None,
             combat_sent: HashMap::new(),
+            ec_clients: HashSet::new(),
+            stock_balance: HashSet::new(),
             combat_stat_clock: 0.0,
             cap_owner: None,
             recent_hits: HashMap::new(),
@@ -1572,7 +1600,11 @@ impl Session {
             last_activity: Instant::now(),
             ever_joined: false,
             close_at: None,
+            had_players: false,
+            spectators_since: None,
             muted: HashSet::new(),
+            map_switch: None,
+            reloaded_at: None,
         }
     }
 
@@ -1656,6 +1688,27 @@ impl Session {
         }
     }
 
+    /// Everyone in the match (players and spectators).
+    pub fn peer_addrs(&self) -> Vec<SocketAddr> {
+        self.peers.keys().copied().collect()
+    }
+
+    /// VeilNet showed this game has EchoCombat. Given the stock tables
+    /// before that: EchoCombat's now.
+    pub fn mark_echocombat(&mut self, addr: SocketAddr) {
+        if !self.ec_clients.insert(addr) || !self.stock_balance.remove(&addr) {
+            return;
+        }
+        if let Some((_, body)) = captured().balance.iter().find(|(l, _)| *l == self.info.level) {
+            info!(%addr, "EchoCombat seen: its gear tables");
+            self.reliable_to(addr, BALANCE_UPDATE, body);
+        }
+    }
+
+    pub fn joined_addrs(&self) -> Vec<SocketAddr> {
+        self.joined()
+    }
+
     fn joined(&self) -> Vec<SocketAddr> {
         self.peers.iter().filter(|(_, p)| p.stage == Stage::Joined).map(|(a, _)| *a).collect()
     }
@@ -1737,10 +1790,21 @@ impl Session {
                     None => debug!(%from, level = format_args!("{level:#018x}"), "no ids response for level"),
                 }
             }
-            BALANCE_READY => match captured().balance.iter().find(|(l, _)| *l == self.info.level) {
-                Some((_, body)) => self.reliable_to(from, BALANCE_UPDATE, body),
-                None => warn!(level = format_args!("{:#018x}", self.info.level), "no balance settings for this level; client will wait"),
-            },
+            BALANCE_READY => {
+                // Each game gets the gear tables it has the scripts for.
+                let stock = super::balance::echocombat_base() && !self.ec_clients.contains(&from);
+                let blocks = if stock { &captured().balance_stock } else { &captured().balance };
+                match blocks.iter().find(|(l, _)| *l == self.info.level) {
+                    Some((_, body)) => {
+                        self.reliable_to(from, BALANCE_UPDATE, body);
+                        if stock {
+                            info!(%from, "no EchoCombat seen: stock gear tables");
+                            self.stock_balance.insert(from);
+                        }
+                    }
+                    None => warn!(level = format_args!("{:#018x}", self.info.level), "no balance settings for this level; client will wait"),
+                }
+            }
             REPLICATED_READY => {
                 if baseline(self.info.level, self.info.mode).is_none() {
                     warn!(level = format_args!("{:#018x}", self.info.level), "no replicated baseline for this level; client will wait");
@@ -2080,12 +2144,23 @@ impl Session {
     }
 
     /// The backend's verdict on entrants this server reported.
+    /// The backend's answer for entrants. A rejection of a player already past
+    /// the accept (in the match) is a kick: nakama's (and Atlas's) kick is a
+    /// "players rejected" with the reason "kicked from server". It used to be
+    /// ignored, and the player stayed until their game timed out (~30 s).
     pub fn on_accept(&mut self, ids: &[String], accepted: bool) {
         for id in ids {
             let Ok(eid) = id.parse::<Uuid>() else { continue };
-            let Some(addr) = self.peers.iter().find(|(_, p)| p.entrant_id == eid && p.stage == Stage::AwaitingAccept).map(|(a, _)| *a) else {
+            let Some((addr, stage)) = self.peers.iter().find(|(_, p)| p.entrant_id == eid).map(|(a, p)| (*a, p.stage)) else {
                 continue;
             };
+            if stage != Stage::AwaitingAccept {
+                if !accepted && stage != Stage::Handshake {
+                    info!(%addr, entrant = %eid, "backend removed the player (kick)");
+                    self.kick(id);
+                }
+                continue;
+            }
             if accepted {
                 self.assign_team(addr);
                 self.send_join_sequence(addr);
@@ -2151,12 +2226,14 @@ impl Session {
         }
         let start = self.started.elapsed().as_secs();
         let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) - start;
+        // A map switch: the new level at once, "not in game" until the reload.
+        let (level, ingame) = self.map_switch.map_or((self.info.level, true), |(l, _)| (l, false));
         let json = serde_json::json!({
             "battlepassstatgroup": "",
             // Signed like native's own JSON: echo_arena's hash is above i64::MAX.
             "gametype": self.info.mode as i64,
-            "ingame": true,
-            "level": self.info.level as i64,
+            "ingame": ingame,
+            "level": level as i64,
             "starttime": start_time,
             "team": [{"alignment": 0}, {"alignment": 1}],
             "user": by_slot,
@@ -2810,11 +2887,14 @@ impl Session {
         self.peers.values().any(|p| p.slot == Some(slot) && matches!(p.team, TEAM_SPECTATOR | TEAM_MODERATOR))
     }
 
-    /// `SR15NetPlayerEquipmentUpdate`: relayed to the others, as native. A
-    /// newcomer's first one also gets everyone else's latest: native (all four
-    /// combat server recordings, 2026-11-16) answers it within 0.1-0.3 s with
-    /// each other player's update, so players who joined later saw no guns,
-    /// tac mods or weapon arm (hand swap) until the owner changed something.
+    /// `SR15NetPlayerEquipmentUpdate`: relayed to the others, as native. Each
+    /// one also gets the sender everyone else's latest: native (all four
+    /// combat client recordings, 2026-11-16) answers every update, not just a
+    /// newcomer's first, within 0.1-0.3 s with each other player's. A client
+    /// sends one at each spawn and round start and forgets the others' gear
+    /// then; answered only the first time, nobody saw anyone else's guns,
+    /// tac mods or weapon arm (hand swap) after that (2026-11-20 recording),
+    /// only their shots.
     fn on_equipment(&mut self, from: SocketAddr, d: &[u8]) {
         for (a, p) in self.peers.iter_mut() {
             if *a != from && p.stage == Stage::Joined && p.spawned() {
@@ -2824,11 +2904,8 @@ impl Session {
         self.gear.set_equipment(from, d);
         let Some(p) = self.peers.get_mut(&from) else { return };
         let first = p.equipment.replace(d.to_vec()).is_none();
-        if !first {
-            return;
-        }
         // Native's server marks the player spawned (entrant data, to everyone).
-        if let Some(slot) = p.slot {
+        if first && let Some(slot) = p.slot {
             let mut spawned = (slot as u64).to_le_bytes().to_vec();
             spawned.extend_from_slice(&ENTRANT_KEY_SPAWNED.to_le_bytes());
             let mut status = (slot as u64).to_le_bytes().to_vec();
@@ -2837,14 +2914,16 @@ impl Session {
             self.relay_reliable(from, ENTRANT_DATA, &spawned, true);
             self.relay_reliable(from, ENTRANT_DATA, &status, true);
         }
-        info!(%from, "spawned: other players' bodies now sent to it");
+        if first {
+            info!(%from, "spawned: other players' bodies now sent to it");
+        }
         let others: Vec<Vec<u8>> = self
             .peers
             .iter()
             .filter(|(a, p)| **a != from && p.stage == Stage::Joined)
             .filter_map(|(_, p)| p.equipment.clone())
             .collect();
-        debug!(%from, players = others.len(), "equipment of the others sent to a newcomer");
+        debug!(%from, players = others.len(), "equipment of the others sent back");
         for e in others {
             self.reliable_to(from, EQUIPMENT, &e);
         }
@@ -2926,6 +3005,41 @@ impl Session {
         }
     }
 
+    /// A match (not the social lobby) with only spectators left ends: at
+    /// once if players had been on a team (they all left), or after
+    /// `SPECTATORS_ONLY_GRACE` if spectators came first and no player
+    /// joined a team. Someone still connecting holds the instant end.
+    fn watch_spectators(&mut self, now: Instant) {
+        if self.social || self.close_at.is_some() {
+            return;
+        }
+        let joined = || self.peers.values().filter(|p| p.stage == Stage::Joined);
+        let players = joined().filter(|p| matches!(p.team, TEAM_BLUE | TEAM_ORANGE)).count();
+        let watchers = joined().filter(|p| p.team == TEAM_SPECTATOR).count();
+        let connecting = self.peers.values().any(|p| p.stage != Stage::Joined);
+        if players > 0 {
+            self.had_players = true;
+            self.spectators_since = None;
+            return;
+        }
+        if watchers == 0 {
+            self.spectators_since = None;
+            return;
+        }
+        if self.had_players {
+            if !connecting {
+                info!(spectators = watchers, "every player left, only spectators remain: the session ends");
+                self.close_at = Some(now);
+            }
+            return;
+        }
+        let since = *self.spectators_since.get_or_insert(now);
+        if now.duration_since(since) >= SPECTATORS_ONLY_GRACE {
+            info!(spectators = watchers, grace = ?SPECTATORS_ONLY_GRACE, "no player joined a team, only spectators: the session ends");
+            self.close_at = Some(now);
+        }
+    }
+
     /// Whether a finished public match's session is due to end (see `close_at`).
     pub fn finished(&self) -> bool {
         self.close_at.is_some_and(|t| Instant::now() >= t)
@@ -2982,11 +3096,104 @@ impl Session {
 
     /// Resend timers only (cheap; runs between frames).
     pub fn service(&mut self) {
+        self.drain_lock(super::draining());
+        self.watch_spectators(Instant::now());
+        self.watch_map_switch(Instant::now());
         self.save_loadouts();
         for (from, o) in self.gear.due(Instant::now()) {
             self.send_gear(from, o);
         }
         self.flush_reliable();
+    }
+
+    /// EchoCombat's post-match map buttons (VeilNet `C` WANT_MAP | `k`, map
+    /// `k` of `combat::LEVELS`): in a private combat match, the lobby's level
+    /// becomes the new map and the server says it is not in game; true if the
+    /// switch begins (then VeilNet tells the clients, `L`).
+    ///
+    /// Native EchoCombat's way (`plugin/veilnet.cpp`, `ApplyMapSwitch`): the
+    /// owner JSON's `level`, and `ingame` false; every EchoCombat client, once
+    /// its lobby shows the new level, goes to "server loading" (the loading
+    /// screen) and unloads its map; `MAP_LEAVE` later the server reloads on
+    /// the new map and says it is in game again, and the clients load the
+    /// lobby's level as they do on a join. The session, its players and
+    /// their connections stay; the match starts over on the new map. A
+    /// player without EchoCombat is not moved by its game. A late joiner
+    /// loads the new map: the level comes from this owner state, whatever
+    /// the backend.
+    pub fn request_map(&mut self, k: u8) -> bool {
+        let Some(&level) = super::combat::LEVELS.get(usize::from(k)) else { return false };
+        if self.info.mode != MODE_COMBAT_PRIVATE || self.combat.is_none() || self.map_switch.is_some() {
+            info!(map = k, "map switch refused: not a private combat match, or a switch is under way");
+            return false;
+        }
+        if !super::filter::allows(self.info.mode, level) {
+            info!(level = %super::filter::level_name(level), "map switch refused: this server does not host that map");
+            return false;
+        }
+        info!(from = %super::filter::level_name(self.info.level), to = %super::filter::level_name(level), "map switch: the lobby's level changes; reloading shortly");
+        self.map_switch = Some((level, Instant::now() + MAP_LEAVE));
+        self.publish_owner_state();
+        true
+    }
+
+    /// A map switch's reload when it is due; the replication wait after it.
+    fn watch_map_switch(&mut self, now: Instant) {
+        if let Some((level, at)) = self.map_switch
+            && now >= at
+        {
+            self.reload_on(level);
+            self.map_switch = None;
+            self.reloaded_at = Some(now);
+            self.publish_owner_state();
+        }
+        if self.reloaded_at.is_some_and(|t| now.duration_since(t) > RELOAD_REPLICATION_WAIT) {
+            self.reloaded_at = None;
+            for p in self.peers.values_mut().filter(|p| p.stage == Stage::Joined && !p.rep_ready) {
+                p.rep_ready = true;
+            }
+        }
+    }
+
+    /// The match starts over on `level` with the same players: what the old
+    /// map's match kept goes; the players' connections, teams, loadouts and
+    /// EchoCombat rules stay. Each client asks for the new map's ids,
+    /// balance settings and replicated vars as it loads it; the others'
+    /// bodies wait for its spawn on the new map.
+    fn reload_on(&mut self, level: u64) {
+        info!(level = %super::filter::level_name(level), "map switch: session restarting on the new map");
+        self.info.level = level;
+        self.handles = ids_response(level, level, self.info.mode).and_then(Handles::from_ids).unwrap_or(Handles::PUBLIC_ARENA);
+        // EchoCombat's rules come back from VeilNet on the next tick.
+        self.combat = combat_for(level);
+        if let Some(c) = self.combat.as_mut() {
+            c.set_private();
+        }
+        self.combat_at = None;
+        self.combat_sent.clear();
+        self.combat_stat_clock = 0.0;
+        self.cap_owner = None;
+        self.recent_hits.clear();
+        self.gear = super::gear::Gear::new();
+        self.gear.set_match(level);
+        self.touch.clear();
+        self.touch_seq.clear();
+        let now = Instant::now();
+        for p in self.peers.values_mut() {
+            p.equipment = None;
+            p.joined_at = Some(now);
+            p.rep_ready = false;
+            p.rep_sent = false;
+            p.rep_acked = false;
+            p.fight_sent = None;
+            p.holds_sent = None;
+            p.on_payload = false;
+            p.last_stun = None;
+            p.stats = Stats::default();
+            p.extra = super::stats::ArenaExtra::default();
+            p.cstats = CombatStats::default();
+        }
+        self.roster_dirty = true;
     }
 
     /// Report loadouts players changed to the backend, which keeps them in
@@ -3245,6 +3452,19 @@ impl Session {
         self.combat_outs(outs);
     }
 
+    /// For EchoCombat's VeilNet: whether a PAUSE may begin now, and the RULES
+    /// page 1 total (`R`).
+    pub fn echocombat_state(&self) -> (bool, u32) {
+        self.combat.as_ref().map_or((true, 0), |c| (c.pause_ok(), c.rules_total()))
+    }
+
+    /// EchoCombat's rules (from VeilNet) to the combat match.
+    pub fn set_echocombat(&mut self, ec: super::combat::EchoRules) {
+        let Some(c) = self.combat.as_mut() else { return };
+        let outs = c.set_echocombat(ec);
+        self.combat_outs(outs);
+    }
+
     /// Carry out what the combat mode asked for.
     fn combat_outs(&mut self, outs: Vec<super::combat::Out>) {
         for o in outs {
@@ -3281,7 +3501,7 @@ impl Session {
                     self.send_combat_stats();
                 }
                 super::combat::Out::Unlock => {
-                    if self.join_locked {
+                    if self.join_locked && !super::draining() {
                         self.join_locked = false;
                         info!("join unlock (next combat round)");
                         self.fleet_out.push(env(Em::LobbySessionEvent(pb::LobbySessionEventMessage {
@@ -3363,11 +3583,24 @@ impl Session {
         self.update_join_lock();
     }
 
+    /// Draining for an update: the session takes nobody new (any mode, social
+    /// lobby included), and those in it play on until they leave.
+    fn drain_lock(&mut self, draining: bool) {
+        if draining && !self.join_locked {
+            self.join_locked = true;
+            info!(lobby = %self.info.lobby, players = self.peer_count(), "join lock (draining for an update)");
+            self.fleet_out.push(env(Em::LobbySessionEvent(pb::LobbySessionEventMessage {
+                lobby_session_id: self.info.lobby.to_string(),
+                code: pb::lobby_session_event_message::Code::Locked as i32,
+            })));
+        }
+    }
+
     /// A public match stops taking players (no backfill) with a minute left
     /// and once it is over: the server tells the matchmaker with a lobby
     /// session event, Locked, and Unlocked if a new match starts after all.
     fn update_join_lock(&mut self) {
-        if self.arena.private {
+        if self.arena.private || super::draining() {
             return;
         }
         let a = &self.arena;
@@ -4373,6 +4606,23 @@ impl Session {
                 }
             }
         };
+        // A combat match: every entrant's own cease fire, as native sends it
+        // (all four maps' recordings): 0 while alive, 1 while dead and
+        // waiting to respawn. A client obeys only its own entrant's. Ours sent
+        // none, so a client kept whatever it had (the lobby's, or its
+        // default): guns folded away, ordnance gone at once, no stuns and tac
+        // mods that never came back, for the whole match. Native's high bytes
+        // differ per match (one had them all 0); the game reads the flag.
+        let mut combat_holds: Vec<(u64, u64)> = if self.combat.is_some() {
+            self.peers
+                .iter()
+                .filter(|(_, p)| p.stage == Stage::Joined)
+                .filter_map(|(addr, p)| Some((msg::entrant_hold_var(p.genidx, p.slot?)?, u64::from(!self.gear.alive(*addr)))))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        combat_holds.sort_unstable();
         let mut fulls: Vec<Vec<u8>> = base.iter().enumerate().map(|(i, b)| fresh(b, i)).collect();
         // The lobby's cease fire (`VAR_HOLD`), per player: lifted (0) only in
         // the brawler room, where the client then lets them stun and block.
@@ -4394,6 +4644,10 @@ impl Session {
                     if let Some(&(_, v)) = tracked.iter().find(|(h, _)| *h == var) {
                         *f = msg::with_var_added(f, var, v);
                     }
+                }
+            } else {
+                for &(var, v) in &combat_holds {
+                    *f = msg::with_var_added(f, var, v);
                 }
             }
         }
@@ -4439,7 +4693,12 @@ impl Session {
                 }
                 p.rep_seq += 1;
             } else if let Some((_, vars)) = combat_vars.as_ref() {
-                let mut body = delta(&base[0], vars);
+                let mut vars = vars.clone();
+                if second || p.holds_sent.as_ref() != Some(&combat_holds) {
+                    vars.extend_from_slice(&combat_holds);
+                    p.holds_sent = Some(combat_holds.clone());
+                }
+                let mut body = delta(&base[0], &vars);
                 stamp(&mut body, server_frame);
                 p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);
                 p.rep_seq += 1;
@@ -4609,6 +4868,15 @@ impl Session {
             if counted {
                 self.relay_reliable(from, COMPONENT_EVENT, d, false);
             }
+            return;
+        }
+        if let Some(c) = self.combat.as_mut()
+            && c.is_private()
+            && let Some(outs) = c.rules_press(sym)
+        {
+            // The RULES page (EchoCombat opens it in Combat): native's
+            // game-mode script takes the presses on the server.
+            self.combat_outs(outs);
             return;
         }
         if let Some(c) = self.combat.as_mut()
@@ -4922,6 +5190,56 @@ mod server_mute_tests {
         assert!(s.finished());
     }
 
+    /// Only spectators in a match: it ends 30 s on when nobody has played
+    /// yet (unless a player joins a team in time), at once when every player
+    /// has left. The social lobby never ends this way.
+    #[test]
+    fn spectator_only_matches_end() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let spectator = |n: u128| {
+            let mut p = joined_peer(Uuid::from_u128(n));
+            p.team = TEAM_SPECTATOR;
+            p
+        };
+        let player = |n: u128| {
+            let mut p = joined_peer(Uuid::from_u128(n));
+            p.team = TEAM_BLUE;
+            p
+        };
+        let (a, b): (SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap());
+        let arena = || Session::new(SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_ARENA }, 1);
+
+        // Spectators first, nobody plays: ends after 30 s.
+        let mut s = arena();
+        s.peers.insert(a, spectator(1));
+        s.watch_spectators(at(0));
+        s.watch_spectators(at(29));
+        assert!(s.close_at.is_none());
+        s.watch_spectators(at(30));
+        assert!(s.close_at.is_some());
+
+        // A player joins a team in time: it goes on.
+        let mut s = arena();
+        s.peers.insert(a, spectator(1));
+        s.watch_spectators(at(0));
+        s.peers.insert(b, player(2));
+        s.watch_spectators(at(20));
+        s.watch_spectators(at(60));
+        assert!(s.close_at.is_none());
+        // ... then every player leaves: it ends at once.
+        s.peers.remove(&b);
+        s.watch_spectators(at(61));
+        assert_eq!(s.close_at, Some(at(61)));
+
+        // The social lobby is never closed for it.
+        let mut s = Session::new(SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL }, 1);
+        s.peers.insert(a, spectator(1));
+        s.watch_spectators(at(0));
+        s.watch_spectators(at(100));
+        assert!(s.close_at.is_none());
+    }
+
     /// A server-muted peer's voice reaches nobody; others still hear each
     /// other, and lifting the mute lets it through again.
     #[test]
@@ -5069,6 +5387,110 @@ mod server_mute_tests {
         assert!(rel.iter().any(|m| m.0 == ENTRANT_DATA && m.1 == hex_bytes("01000000000000007d061f480cf31c19c4bedaed35d9f32d")));
         s.relay_mailbox(a, PLAYER_STATE, 5, &[0; 64]);
         assert_eq!(s.peers[&b].t.queued_mailbox.len(), 1);
+        // Every later update (each spawn, each round) gets the others' gear
+        // again, as native; `spawned` only the first time.
+        s.peers.get_mut(&b).unwrap().t.queued_reliable.clear();
+        s.on_equipment(b, &[4; 56]);
+        let rel = &s.peers[&b].t.queued_reliable;
+        assert!(rel.iter().any(|m| m.0 == EQUIPMENT && m.1 == vec![2; 56]), "the others' gear again");
+        assert!(!rel.iter().any(|m| m.0 == ENTRANT_DATA));
+    }
+
+    /// EchoCombat's map buttons: the lobby shows the new level and "not in
+    /// game" at once, the server reloads on it `MAP_LEAVE` later and is in
+    /// game again; the players stay, their spawn and replication start over.
+    #[test]
+    fn a_rejection_of_a_joined_player_kicks_them() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: MODE_COMBAT_PRIVATE, level: super::super::combat::LEVEL_DYSON };
+        let mut s = Session::new(info, 1);
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let eid = Uuid::from_u128(7);
+        s.peers.insert(a, joined_peer(eid));
+        s.on_accept(&[eid.to_string()], true);
+        assert!(s.peers.contains_key(&a), "an accept changes nothing");
+        s.on_accept(&[eid.to_string()], false);
+        assert!(!s.peers.contains_key(&a), "kicked");
+        let kicked = s.fleet_out.iter().any(|e| {
+            matches!(&e.message, Some(Em::LobbyEntrantRemoved(r)) if r.code == pb::lobby_entrant_removed_message::Code::Kicked as i32)
+        });
+        assert!(kicked, "the backend is told");
+    }
+
+    #[test]
+    fn a_combat_match_sends_each_entrants_cease_fire() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: MODE_COMBAT_PRIVATE, level: super::super::combat::LEVEL_DYSON };
+        let mut s = Session::new(info, 1);
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let mut p = joined_peer(Uuid::from_u128(1));
+        p.slot = Some(3);
+        p.rep_ready = true;
+        s.peers.insert(a, p);
+        let var = msg::entrant_hold_var(0, 3).expect("var");
+        let holds = |s: &Session| -> Vec<Option<u64>> {
+            s.peers[&a].t.queued_mailbox.iter().filter(|m| m.0 == REPLICATED_VARS).map(|m| var_raw(&m.2, var)).collect()
+        };
+        s.replicate();
+        assert!(holds(&s).contains(&Some(0)), "in the baseline: may fight");
+        s.peers.get_mut(&a).unwrap().t.queued_mailbox.clear();
+        s.replicate();
+        assert!(holds(&s).contains(&Some(0)), "and in the next delta");
+    }
+
+    #[test]
+    fn draining_locks_the_session_once() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: MODE_COMBAT_PRIVATE, level: super::super::combat::LEVEL_DYSON };
+        let mut s = Session::new(info, 1);
+        let locks = |s: &Session| {
+            s.fleet_out
+                .iter()
+                .filter(|e| matches!(&e.message, Some(Em::LobbySessionEvent(ev)) if ev.code == pb::lobby_session_event_message::Code::Locked as i32))
+                .count()
+        };
+        s.drain_lock(false);
+        assert_eq!(locks(&s), 0);
+        s.drain_lock(true);
+        s.drain_lock(true);
+        assert_eq!(locks(&s), 1, "locked once");
+        assert!(s.join_locked);
+    }
+
+    #[test]
+    fn a_private_combat_match_switches_maps() {
+        use super::super::combat::{LEVEL_DYSON, LEVEL_GAUSS};
+        let owner = |s: &Session, a: SocketAddr| -> Option<String> {
+            let q = &s.peers[&a].t.queued_reliable;
+            q.iter().rev().find(|m| m.0 == OWNER_STATE).map(|m| String::from_utf8_lossy(&m.1).into_owned())
+        };
+        let info = SessionInfo { lobby: Uuid::nil(), mode: crate::sns::symbol("echo_combat"), level: LEVEL_DYSON };
+        let mut s = Session::new(info, 1);
+        assert!(!s.request_map(3), "public: no");
+        let info = SessionInfo { lobby: Uuid::nil(), mode: MODE_COMBAT_PRIVATE, level: LEVEL_DYSON };
+        let mut s = Session::new(info, 1);
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let mut p = joined_peer(Uuid::from_u128(1));
+        p.slot = Some(0);
+        p.equipment = Some(vec![1; 56]);
+        p.rep_ready = true;
+        p.rep_sent = true;
+        s.peers.insert(a, p);
+        assert!(!s.request_map(4), "no such map");
+        assert!(s.request_map(3));
+        let o = owner(&s, a).expect("owner state");
+        assert!(o.contains(&format!("\"level\":{}", LEVEL_GAUSS as i64)), "{o}");
+        assert!(o.contains("\"ingame\":false"), "{o}");
+        assert!(!s.request_map(1), "one at a time");
+        assert_eq!(s.info.level, LEVEL_DYSON, "not yet");
+        let t = Instant::now();
+        s.watch_map_switch(t + MAP_LEAVE + Duration::from_millis(10));
+        assert_eq!(s.info.level, LEVEL_GAUSS);
+        assert!(s.combat.as_ref().is_some_and(|c| c.is_private()));
+        let o = owner(&s, a).expect("owner state");
+        assert!(o.contains("\"ingame\":true") && o.contains(&format!("\"level\":{}", LEVEL_GAUSS as i64)), "{o}");
+        let p = &s.peers[&a];
+        assert!(p.equipment.is_none() && !p.rep_ready && !p.rep_sent, "spawn and replication start over");
+        assert_eq!(p.slot, Some(0), "the player stays");
+        s.watch_map_switch(t + MAP_LEAVE + RELOAD_REPLICATION_WAIT + Duration::from_secs(1));
+        assert!(s.peers[&a].rep_ready, "replication anyway");
     }
 
     fn hex_bytes(h: &str) -> Vec<u8> {

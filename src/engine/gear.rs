@@ -67,6 +67,11 @@ pub const ACTIVATE_EXPLOSION: u64 = h("SR15NetActivateExplosion");
 pub const EXPLOSION_NOTHING_HIT: u64 = h("SR15NetExplosionNothingHit");
 pub const EXPLOSION_PLAYER_DAMAGE: u64 = 0xc9bf_5b1d_bb88_8def;
 pub const STUN_MSG: u64 = 0x1feb_4959_6855_9bc3;
+/// A match's stun (native Fission with EchoCombat, 2026-11-21): `[victim
+/// slot u32][1 u32][seconds f32][0 u32]`, to everyone, with the explosion.
+/// `SR15StunMsg` (`STUN_MSG`) is the social lobby's: in a match the games
+/// ignored it, and STUN FIELD, ARC MINE and NEUTRON stunned nobody.
+pub const STUN_PLAYER_MSG: u64 = 0xccd9_ed2d_3125_ff67;
 pub const HEALTH_BROADCAST: u64 = 0x97bb_bd24_5d46_7354;
 /// `[damageable 8][slot u32][0 u32]`: native sends it with each INSTANT REPAIR
 /// that gives a player's shield back.
@@ -102,12 +107,24 @@ const BREAK_EVENT_AFTER: Duration = Duration::from_millis(10);
 const BREAK_ECHO_AFTER: Duration = Duration::from_millis(17);
 /// A respawn: the event and full health, then the script's event a frame later.
 const RESPAWN_ECHO_AFTER: Duration = Duration::from_millis(7);
+/// Fission's end-game pillars (the climax sublevel's damageables, 1000
+/// health): no break. Native (2026-11-21) raised one once it had taken 50
+/// (health at or under 950): the pillar's own `ComponentEvent`, twice in the
+/// frame. 25.03 s later the same event lowered it, and a frame after that
+/// (34 ms) `DealDamage` put it back at full. Hits while it is up still count
+/// down; health does not come back on its own while it is down.
+const PILLAR_EVENT: u64 = 0x8099_0d12_aec2_bcda;
+const PILLAR_RAISE_DAMAGE: f32 = 50.0;
+const PILLAR_UP: Duration = Duration::from_millis(25_030);
+const PILLAR_RESET_AFTER: Duration = Duration::from_millis(34);
 #[cfg(test)]
 const AREA_OBJECT: [u8; 4] = [0x26, 0x45, 0x2b, 0xfc];
 /// Explosion kinds (bytes 8..16 of the explosion messages).
 const EX_ROCKET: [u8; 8] = [0xdc, 0x35, 0x4e, 0x7e, 0x5c, 0x3d, 0x0a, 0xb3];
 const EX_DET: [u8; 8] = [0x6c, 0x8a, 0xc2, 0x55, 0xa1, 0x24, 0x51, 0x20];
 const EX_STUN: [u8; 8] = [0x10, 0x3f, 0x1d, 0xe6, 0x54, 0x5b, 0x90, 0x25];
+/// ARC MINE's own blast (native Fission, 2026-11-21; ours used the STUN FIELD's).
+const EX_ARC: [u8; 8] = [0xae, 0xda, 0x1e, 0xfa, 0xef, 0x03, 0xeb, 0x17];
 const EX_DOT: [u8; 8] = [0x06, 0x2a, 0xbc, 0x9b, 0x8f, 0xed, 0x2c, 0xea];
 /// What a shooter's hit marker names (`LocallyTrackedDamage` bytes 8..16).
 const MARK_ROCKET: [u8; 8] = [0x8d, 0xa7, 0xeb, 0x67, 0xbd, 0x59, 0x0f, 0x11];
@@ -123,8 +140,10 @@ const HURT_ORDNANCE: u32 = 2;
 const DET_DAMAGE: f32 = 65.0;
 const DET_RADIUS: f64 = 1.5;
 /// How far a det reaches barriers, and its damage to one at a distance:
-/// full to 1 m, then down to 40% at the edge.
-const DET_BARRIER_REACH: f32 = 2.5;
+/// full to 1 m, then down to 40% at the edge. Native's hits fit a 3 m edge:
+/// Surge (2026-11-21) took 101.79 off a barrier 1.93 m from the blast, Dyson
+/// 97 at about 2 m (our 2.5 m edge gave 88 and 84).
+const DET_BARRIER_REACH: f32 = 3.0;
 fn det_barrier_falloff(d: f32) -> f32 {
     let f = if d <= 1.0 { 1.0 } else { 1.0 - 0.6 * ((d - 1.0) / (DET_BARRIER_REACH - 1.0)).clamp(0.0, 1.0) };
     DET_DAMAGE * f
@@ -302,6 +321,10 @@ fn parse_barriers(space: [u8; 8], text: &str) -> Vec<Barrier> {
         .collect()
 }
 
+fn pillar_event(handle: u16) -> [u8; 24] {
+    super::msg::component_event(PILLAR_EVENT, BARRIER_MODULE, handle, super::msg::FILTER_ALL_ALT)
+}
+
 fn barrier_event(handle: u16) -> [u8; 24] {
     super::msg::component_event(BARRIER_EVENT, BARRIER_MODULE, handle, super::msg::FILTER_ALL_ALT)
 }
@@ -446,6 +469,14 @@ impl Default for Life {
 /// Bytes 8..12 are the player's slot (the 8-byte id before it is the same
 /// for every player: a Gauss match's broadcasts carry one 56-byte record per
 /// slot after it).
+/// A player's handle as health broadcasts and kills carry it: their slot
+/// (from their body physics, else the session's) with their generation
+/// above it (`gen << 16 | slot`; a player who rejoined is generation 1).
+fn player_handle(bodies: &HashMap<SocketAddr, (u16, [f32; 3])>, slots: &HashMap<SocketAddr, u32>, gens: &HashMap<SocketAddr, u16>, who: &SocketAddr) -> u32 {
+    let slot = bodies.get(who).map(|b| u32::from(b.0)).or_else(|| slots.get(who).copied()).unwrap_or(0);
+    (u32::from(gens.get(who).copied().unwrap_or(0)) << 16) | (slot & 0xffff)
+}
+
 fn health_body(owner: [u8; 8], slot: u32, life: &Life, entry: bool) -> Vec<u8> {
     let mut b = owner.to_vec();
     b.extend_from_slice(&slot.to_le_bytes());
@@ -718,6 +749,8 @@ pub struct Gear {
     /// The space's barriers (level data) and when broken ones come back.
     barriers: Vec<Barrier>,
     respawns: Vec<(Instant, [u8; 8], Barrier)>,
+    /// Fission's raised pillars and when they come down.
+    pillars_up: Vec<(Instant, [u8; 8], Barrier)>,
     /// Standing ENERGY BARRIER walls by actor id: their box (pool and handle
     /// unused) and placer.
     walls: HashMap<[u8; 8], (Barrier, SocketAddr)>,
@@ -819,6 +852,7 @@ impl Gear {
             barriers: barriers_of(AREA),
             walls: HashMap::new(),
             respawns: Vec::new(),
+            pillars_up: Vec::new(),
             boosted: HashMap::new(),
             links: HashMap::new(),
             oc_use: HashMap::new(),
@@ -954,6 +988,30 @@ impl Gear {
     /// `disable_objectives` keeps its user off the objective.
     pub fn immune(&self, who: &SocketAddr, what: &str) -> bool {
         self.phased(who) && weapons().pointer(&format!("/ability_properties/wraith/{what}")).and_then(Value::as_bool).unwrap_or(true)
+    }
+
+    /// The gear tables in use: a match's (EchoCombat's) or the lobby's.
+    fn weapons_table(&self) -> &'static Value {
+        if self.in_match { combat_weapons() } else { weapons() }
+    }
+
+    /// A stun for `victim` (a player id, else the lobby's training dummy).
+    /// A match: native's `SR15StunPlayerMsg` with the gear's stun length.
+    /// The lobby: `SR15StunMsg` (`[space][slot | generation << 16]`, the
+    /// dummy 0x0c), as native's lobby sent it.
+    fn stun_out(&self, space: &[u8; 8], victim: [u8; 8], player: bool, secs: f32) -> Out {
+        if self.in_match
+            && player
+            && let Some((slot, _)) = id_handle(victim)
+        {
+            let mut b = u32::from(slot).to_le_bytes().to_vec();
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&secs.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            return out(To::All, STUN_PLAYER_MSG, &b);
+        }
+        let target: u64 = if player { u64::from(id_handle(victim).map_or(0, |(s, g)| (u32::from(g) << 16) | u32::from(s))) } else { 0x0c };
+        out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())
     }
 
     /// Whether a player is alive (not dead and waiting to respawn).
@@ -1132,8 +1190,7 @@ impl Gear {
     /// With their generation above it (`gen << 16 | slot`, the player handle
     /// health broadcasts and kills carry: a player who rejoined is generation 1).
     pub fn slot_of(&self, who: &SocketAddr) -> u32 {
-        let slot = self.bodies.get(who).map(|b| u32::from(b.0)).or_else(|| self.slots.get(who).copied()).unwrap_or(0);
-        (u32::from(self.gens.get(who).copied().unwrap_or(0)) << 16) | (slot & 0xffff)
+        player_handle(&self.bodies, &self.slots, &self.gens, who)
     }
 
     /// The slot whose gear stations are a player's: the session's, else their
@@ -1314,18 +1371,25 @@ impl Gear {
     pub fn restore_barriers(&mut self) -> Vec<(SocketAddr, Out)> {
         self.respawns.clear();
         let anyone = SocketAddr::from(([0, 0, 0, 0], 0));
-        let all = self.barriers.clone();
+        let mut v = Vec::new();
+        // Raised pillars come down (they have no break event of their own).
+        for (_, _, b) in std::mem::take(&mut self.pillars_up) {
+            let ev = pillar_event(b.handle);
+            v.push((anyone, out(To::All, COMPONENT_EVENT, &ev)));
+            v.push((anyone, out(To::All, COMPONENT_EVENT, &ev)));
+        }
+        let pillar = |b: &Barrier| u64::from_le_bytes(b.space) == super::msg::LEVEL_FISSION_CLIMAX;
+        let (pillars, all): (Vec<Barrier>, Vec<Barrier>) = self.barriers.iter().partition(|b| pillar(b));
         let target = |b: &Barrier| {
             let mut t = [0u8; 8];
             t[..2].copy_from_slice(&b.pool.to_le_bytes());
             t[4] = 1;
             t
         };
-        let mut v = Vec::new();
         for b in &all {
             v.push((anyone, out(To::All, COMPONENT_EVENT, &barrier_event(b.handle))));
         }
-        for b in &all {
+        for b in all.iter().chain(&pillars) {
             self.area_health.insert(target(b), b.max);
             v.push((anyone, self.deal_in(b.space, target(b), b.max)));
         }
@@ -1380,6 +1444,9 @@ impl Gear {
     /// (exactly 30 s in the Gauss and Dyson recordings). A broken one takes no
     /// more.
     fn hit_barrier(&mut self, from: SocketAddr, known: Option<Barrier>, target: [u8; 8], amount: f32, now: Instant) -> Vec<Out> {
+        if let Some(b) = known.filter(|b| u64::from_le_bytes(b.space) == super::msg::LEVEL_FISSION_CLIMAX) {
+            return self.hit_pillar(from, b, target, amount, now);
+        }
         let space = known.map_or(self.space, |b| b.space);
         let max = known.map_or(BARRIER_HEALTH, |b| b.max);
         let health = self.area_health.entry(target).or_insert(max);
@@ -1403,6 +1470,25 @@ impl Gear {
             if b.respawn > 0.0 {
                 self.respawns.push((now + Duration::from_secs_f32(b.respawn), target, b));
             }
+        }
+        v
+    }
+
+    /// A hit on one of Fission's end-game pillars (`PILLAR_EVENT`).
+    fn hit_pillar(&mut self, from: SocketAddr, b: Barrier, target: [u8; 8], amount: f32, now: Instant) -> Vec<Out> {
+        if amount <= 0.0 {
+            return Vec::new();
+        }
+        let health = self.area_health.entry(target).or_insert(b.max);
+        *health = (*health - amount).max(0.0);
+        let left = *health;
+        let mut v = vec![self.deal_in(b.space, target, left)];
+        if left <= b.max - PILLAR_RAISE_DAMAGE && !self.pillars_up.iter().any(|(_, t, _)| *t == target) {
+            info!(%from, pillar = b.handle, left, "pillar raised");
+            let ev = pillar_event(b.handle);
+            v.push(out(To::All, COMPONENT_EVENT, &ev));
+            v.push(out(To::All, COMPONENT_EVENT, &ev));
+            self.pillars_up.push((now + PILLAR_UP, target, b));
         }
         v
     }
@@ -1432,7 +1518,10 @@ impl Gear {
             if self.area_health.get(&target).is_some_and(|h| *h <= 0.0) {
                 continue;
             }
-            let amount = damage(d) * scale;
+            // Fission's climax barriers (their own space) take a blast as
+            // anything else does: native, a METEOR's blast took 40 off one,
+            // not the barrier multiplier's 80.
+            let amount = damage(d) * if b.space == self.space { scale } else { 1.0 };
             if amount <= 0.0 {
                 continue;
             }
@@ -1733,6 +1822,14 @@ impl Gear {
                 vec![out(To::Others, ty, d)]
             }
             HEAL_BUBBLE_ACTIVATE => vec![out(To::Others, ty, d)],
+            PLAYER_RESPAWN if d.len() >= 8 && self.in_match && !self.lives.get(&from).is_some_and(|l| l.dead) => {
+                // In a match the server respawns everyone (`MATCH_RESPAWN`
+                // after the kill). A lagging client's own ask came in after
+                // that and went out as a second respawn: the others' games
+                // then left its body where it respawned while it played on.
+                info!(%from, "respawn ask from a player who is not dead: dropped (the server respawned them)");
+                Vec::new()
+            }
             PLAYER_RESPAWN if d.len() >= 8 => {
                 self.bubble_owner.insert(from, arr8(d, 0));
                 let life = self.lives.entry(from).or_default();
@@ -2175,8 +2272,7 @@ impl Gear {
             for (victim, pos, _, _, _) in hits {
                 self.credits.push(Credit::Stun { by: n.thrower });
                 ready.push((n.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, EX_STUN, pos, victim, n.actor))));
-                let target = u64::from(id_handle(victim).map_or(0, |(s, g)| (u32::from(g) << 16) | u32::from(s)));
-                ready.push((n.thrower, out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())));
+                ready.push((n.thrower, self.stun_out(&space, victim, true, point_setting("stun_duration", 1.25))));
             }
         }
     }
@@ -2231,13 +2327,12 @@ impl Gear {
             let (mag, owner, head, thrower, at) = (m.mag, m.owner, m.head, m.thrower, m.at);
             info!(mag = %hex8(mag), stunned = hits.len(), "ARC MINE went off");
             if hits.is_empty() {
-                ready.push((thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &EX_STUN, &mag].concat())));
+                ready.push((thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &EX_ARC, &mag].concat())));
             }
             for (victim, pos, _, _, _) in hits {
                 self.credits.push(Credit::Stun { by: thrower });
-                ready.push((thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, EX_STUN, pos, victim, mag))));
-                let target = u64::from(id_handle(victim).map_or(0, |(s, g)| (u32::from(g) << 16) | u32::from(s)));
-                ready.push((thrower, out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())));
+                ready.push((thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, EX_ARC, pos, victim, mag))));
+                ready.push((thrower, self.stun_out(&space, victim, true, arc_setting("stun_length", 2.0))));
             }
             // The chain: the same team's armed mines nearby.
             let team = self.teams.get(&thrower).copied().filter(|t| *t < 2);
@@ -2460,7 +2555,7 @@ impl Gear {
                 while dr.left > 0 && dr.next <= now {
                     dr.left -= 1;
                     dr.next += Duration::from_secs_f64(every);
-                    let slot = self.bodies.get(&dr.who).map_or(0, |b| u32::from(b.0));
+                    let slot = player_handle(&self.bodies, &self.slots, &self.gens, &dr.who);
                     let life = self.lives.entry(dr.who).or_default();
                     if life.dead {
                         continue;
@@ -2500,7 +2595,10 @@ impl Gear {
         let draining: Vec<SocketAddr> = self.drains.iter().map(|d| d.who).collect();
         for (who, life) in &mut self.lives {
             let Some(lost) = life.lost_at else { continue };
-            let slot = self.bodies.get(who).map_or(0, |b| u32::from(b.0));
+            // With the generation: a rejoined player's game (generation 1)
+            // took no regen broadcast for generation 0, so its health never
+            // came back on screen until the next hit's broadcast showed it.
+            let slot = player_handle(&self.bodies, &self.slots, &self.gens, who);
             if life.dead || life.full() || draining.contains(who) || now < lost + REGEN_DELAY {
                 continue;
             }
@@ -2565,8 +2663,8 @@ impl Gear {
                         self.credits.push(Credit::Stun { by: f.thrower });
                     }
                     ready.push((f.thrower, out(To::All, EXPLOSION_PLAYER_DAMAGE, &player_damage(&space, f.kind, pos, victim, f.mag))));
-                    let target: u64 = if who.is_some() { u64::from(id_handle(victim).map_or(0, |(s, g)| (u32::from(g) << 16) | u32::from(s))) } else { 0x0c };
-                    ready.push((f.thrower, out(To::All, STUN_MSG, &[space.as_slice(), &target.to_le_bytes()].concat())));
+                    let secs = self.weapons_table().pointer("/grenade_properties/stun/stun_length").and_then(Value::as_f64).unwrap_or(1.75) as f32;
+                    ready.push((f.thrower, self.stun_out(&space, victim, who.is_some(), secs)));
                 }
             }
         }
@@ -2584,6 +2682,17 @@ impl Gear {
             ready.push((anyone, out(To::All, COMPONENT_EVENT, &ev)));
             ready.push((anyone, self.deal_in(b.space, target, b.max)));
             self.later.push((now + RESPAWN_ECHO_AFTER, anyone, out(To::All, COMPONENT_EVENT, &ev)));
+        }
+        // Raised pillars whose time is up: down, then full health.
+        let down: Vec<([u8; 8], Barrier)> = self.pillars_up.iter().filter(|(t, _, _)| *t <= now).map(|(_, t, b)| (*t, *b)).collect();
+        self.pillars_up.retain(|(t, _, _)| *t > now);
+        for (target, b) in down {
+            info!(pillar = b.handle, "pillar lowered");
+            self.area_health.insert(target, b.max);
+            let ev = pillar_event(b.handle);
+            ready.push((anyone, out(To::All, COMPONENT_EVENT, &ev)));
+            ready.push((anyone, out(To::All, COMPONENT_EVENT, &ev)));
+            self.later.push((now + PILLAR_RESET_AFTER, anyone, self.deal_in(b.space, target, b.max)));
         }
         self.later.retain(|(at, from, o)| {
             if *at <= now {
@@ -3143,6 +3252,20 @@ mod tests {
     /// shows (Dyson/Gauss server recordings): PULSAR 9 -> 4.5, STARBURST
     /// 11 -> 5.5, PROTOSTAR 45 -> 78.75, drone shots (`blaster`) 2 -> 1; an
     /// uncharged COMET (30, same as METEOR's damage) x0.5, not METEOR's x2.
+    /// Native Surge (Gauss), 2026-11-21, server recording: every gun's hit
+    /// on a barrier (230) or wall (415) took half its damage: drone shots 2
+    /// -> 1, 6 -> 3, STARBURST 11 -> 5.5, in EchoCombat's tables and stock's.
+    #[test]
+    fn surge_barrier_hits_take_natives_damage() {
+        let stock: Value = serde_json::from_str(include_str!("data/mp_weapon_settings_stock.json")).expect("stock json");
+        for w in [combat_weapons(), &stock] {
+            for (sym, base, want) in [("9852604d9e83d52f", 2.0, 1.0), ("b54889d0c8c72de3", 11.0, 5.5), ("edef83a8b1d0e8c8", 6.0, 3.0)] {
+                let gun: [u8; 8] = unhex(sym).try_into().expect("8");
+                assert_eq!(base * multiplier(w, gun, base, PART_BARRIER), want, "{sym}");
+            }
+        }
+    }
+
     #[test]
     fn barrier_damage_follows_the_gun() {
         let w = combat_weapons();
@@ -3402,6 +3525,36 @@ mod tests {
         let left = f32::from_le_bytes(dd.body[16..20].try_into().expect("4"));
         assert!(left < 1000.0 && left > 900.0, "{left}");
         assert!(g.barriers_down().is_empty());
+    }
+
+    /// Fission's end-game pillars as native's (2026-11-21): up once 50 is
+    /// taken, the event twice; down 25.03 s later, the same event twice and
+    /// full health a frame after; never broken.
+    #[test]
+    fn fission_pillars_go_up_when_shot_and_come_down() {
+        let (mut g, me, _, t0) = two_in_the_area();
+        g.set_match(super::super::combat::LEVEL_FISSION);
+        let climax = super::super::msg::LEVEL_FISSION_CLIMAX.to_le_bytes();
+        let target = arr8(&unhex("0500000001000000"), 0);
+        let b = g.barrier_in(&climax, target).expect("pillar 5");
+        let events = |v: &[Out]| v.iter().filter(|o| o.ty == COMPONENT_EVENT && o.body == pillar_event(261)).count();
+        assert_eq!(events(&g.hit_barrier(me, Some(b), target, 30.0, t0)), 0, "970: still down");
+        let v = g.hit_barrier(me, Some(b), target, 30.0, t0);
+        assert_eq!(events(&v), 2, "940: up");
+        assert_eq!(&pillar_event(261)[..], &unhex("dabcc2ae120d9980c4b6bab2ee99ea6a05010d00ffffffff")[..]);
+        assert_eq!(events(&g.hit_barrier(me, Some(b), target, 30.0, t0)), 0, "already up");
+        // Even all its health gone: no break.
+        let v = g.hit_barrier(me, Some(b), target, 5000.0, t0);
+        assert!(v.iter().all(|o| o.ty != COMPONENT_EVENT));
+        assert!(g.later.is_empty() && g.respawns.is_empty());
+        let early: Vec<Out> = g.due(t0 + Duration::from_secs(25)).into_iter().map(|(_, o)| o).collect();
+        assert_eq!(events(&early), 0);
+        let down: Vec<Out> = g.due(t0 + PILLAR_UP).into_iter().map(|(_, o)| o).collect();
+        assert_eq!(events(&down), 2, "down");
+        let full: Vec<Out> = g.due(t0 + PILLAR_UP + PILLAR_RESET_AFTER).into_iter().map(|(_, o)| o).collect();
+        let dd = full.iter().find(|o| o.ty == DEAL_DAMAGE).expect("full health");
+        assert_eq!(&dd.body[16..20], &1000f32.to_le_bytes());
+        assert_eq!(events(&g.hit_barrier(me, Some(b), target, 30.0, t0 + PILLAR_UP)), 0, "a fresh 1000");
     }
 
     /// A PULSAR head shot (9 x 1.5) from slot 0 on slot 1, as the client sends it
@@ -4146,6 +4299,34 @@ mod tests {
         let hb = &last.iter().find(|(_, o)| o.ty == HEALTH_BROADCAST).expect("full").1;
         assert_eq!(&hb.body[12..16], &112f32.to_le_bytes());
         assert!(g.due(t + Duration::from_secs(30)).iter().all(|(_, o)| o.ty != HEALTH_BROADCAST), "stops at full");
+    }
+
+    /// A rejoined player (generation 1): the regen broadcasts carry the
+    /// generation, or the game takes none of them (2026-11-20: health stuck
+    /// low until the next hit's broadcast showed it nearly full).
+    #[test]
+    fn regen_names_a_rejoined_player_with_the_generation() {
+        let (mut g, _, them, _) = two_in_the_area();
+        g.gens.insert(them, 1);
+        g.hurt(them, 50.0, HURT_EXPLOSION, [0.0; 3], MARK_ROCKET, None);
+        let t = Instant::now();
+        let v = g.due(t + Duration::from_millis(12_500));
+        let hb = &v.iter().find(|(w, o)| *w == them && o.ty == HEALTH_BROADCAST).expect("regen").1;
+        assert_eq!(&hb.body[8..12], &0x1_0001u32.to_le_bytes());
+    }
+
+    /// In a match the server respawns the dead; a lagging client's own late
+    /// ask, once it is alive again, is not sent out as a second respawn.
+    #[test]
+    fn a_late_respawn_ask_from_a_live_player_is_dropped() {
+        let (mut g, _, them, t0) = two_in_the_area();
+        g.set_match(super::super::combat::LEVEL_GAUSS);
+        let ask = unhex("8ec21d00d315993f0100000000000000");
+        assert!(g.on_message(them, PLAYER_RESPAWN, &ask, t0).is_empty());
+        g.lives.entry(them).or_default().dead = true;
+        let v = g.on_message(them, PLAYER_RESPAWN, &ask, t0);
+        assert_eq!(v[0].ty, PLAYER_RESPAWN, "dead: taken");
+        assert!(g.on_message(them, PLAYER_RESPAWN, &ask, t0).is_empty(), "then a repeat is not");
     }
 
     #[test]

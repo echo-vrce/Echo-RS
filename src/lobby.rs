@@ -164,6 +164,8 @@ struct Lobby {
     players: HashMap<XpId, Player>,
     empty_since: Option<Instant>,
     created: Instant,
+    /// The game server said Locked: matchmaking puts nobody new in it.
+    locked: bool,
 }
 
 impl Lobby {
@@ -349,6 +351,14 @@ impl Hub {
         match env.message {
             Some(Em::LobbySessionEvent(ev)) => {
                 let Ok(lid) = ev.lobby_session_id.parse::<Uuid>() else { return };
+                let locked = ev.code == pb::lobby_session_event_message::Code::Locked as i32;
+                if locked || ev.code == pb::lobby_session_event_message::Code::Unlocked as i32 {
+                    if let Some(l) = self.state.lock().lobbies.get_mut(&lid) {
+                        l.locked = locked;
+                    }
+                    debug!(server, lobby = %lid, locked, "lobby join lock");
+                    return;
+                }
                 if ev.code == pb::lobby_session_event_message::Code::Ended as i32 {
                     let mut s = self.state.lock();
                     close_lobby(&mut s, lid);
@@ -566,8 +576,12 @@ impl Hub {
                     },
                     None => *lobby_id,
                 };
-                if !s.lobbies.contains_key(&id) {
+                let Some(l) = s.lobbies.get(&id) else {
                     return Placement::Fail(fail::SERVER_DOES_NOT_EXIST, "Lobby does not exist");
+                };
+                // A locked lobby takes back its own players and moderators only.
+                if l.locked && moderate.is_none() && !l.players.contains_key(&xpid) {
+                    return Placement::Fail(fail::SERVER_IS_LOCKED, "Lobby is locked");
                 }
                 Some(id)
             }
@@ -578,7 +592,7 @@ impl Hub {
                     // Fill the fullest public lobby of this mode that has a seat.
                     s.lobbies
                         .values()
-                        .filter(|l| l.mode == mode && !l.private && l.id != *current_lobby && l.pick_team(wanted).is_some())
+                        .filter(|l| l.mode == mode && !l.private && !l.locked && l.id != *current_lobby && l.pick_team(wanted).is_some())
                         .filter(|l| req.group_id.is_nil() || l.group_id.is_nil() || l.group_id == req.group_id)
                         .max_by_key(|l| l.players.len())
                         .map(|l| l.id)
@@ -596,6 +610,9 @@ impl Hub {
                 };
                 if !crate::engine::filter::allows(mode, level_wanted) {
                     return Placement::Fail(fail::SERVER_FIND_FAILED, "This server does not host that mode or map");
+                }
+                if crate::engine::draining() {
+                    return Placement::Fail(fail::SERVER_FIND_FAILED, "This server is updating; try again in a minute");
                 }
                 // Allocate a free server (embedded instances first: lowest latency).
                 let Some(server_id) = s.servers.values().filter(|g| g.lobby.is_none()).max_by_key(|g| g.embedded).map(|g| g.id) else {
@@ -637,6 +654,7 @@ impl Hub {
                         players: HashMap::new(),
                         empty_since: Some(Instant::now()),
                         created: Instant::now(),
+                        locked: false,
                     },
                 );
                 info!(lobby = %id, server = server_id, mode = self.modes.name(mode), private, "lobby created");

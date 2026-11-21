@@ -10,9 +10,15 @@
 //! Every packet is 16 bytes: `"ECVL"`, a type byte, 3 pad bytes, a u32 id and
 //! `"VEIL"` (little-endian). Ported from EchoCombat's `plugin/veilnet.cpp`.
 //!
-//! Not here yet (they need the map's scripts, which this server does not run):
-//! the RULES page-1 times (`R`: point unlock / capture time), the map switch
-//! buttons, and pausing a payload only at a checkpoint.
+//! The match itself (`combat.rs`) applies what the rules mean: the RULES page
+//! 1 values (sent to the clients here as `R`), POINT RATE, PAYLOAD SPEED and
+//! PAUSE; on a payload map a PAUSE waits for the payload to be held.
+//!
+//! The post-match map buttons (`C` 2000000xh | map, private matches): the
+//! ask is handed to the session (`take_map_ask`), which changes the lobby's
+//! level and reloads; `announce_map` then tells every client (`L` map), and
+//! their VeilNet takes them to the loading screen (see `session.rs`,
+//! `request_map`).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -39,6 +45,8 @@ const WANT_RATE: u32 = 0x40;
 const WANT_PAUSE: u32 = 0x20;
 const WANT_MAP: u32 = 0x2000_0000;
 const LOADOUT_NEW: u32 = 2;
+/// The map buttons: Dyson, Combustion, Fission, Gauss (`combat::LEVELS`).
+const MAPS: u8 = 4;
 /// POINT RATE / PAYLOAD SPEED steps, in quarters (0.25x .. 2.5x).
 const RATE_STEPS: std::ops::RangeInclusive<u8> = 1..=10;
 
@@ -130,6 +138,18 @@ pub struct VeilNet {
     resume_at: Option<Instant>,
     rate: u8,
     payload_speed: u8,
+    /// PAUSE asked for on a payload map while the payload moves: it begins at
+    /// the next checkpoint ('G' bit 7, the podium's QUEUED).
+    pause_queued: bool,
+    /// The match says a PAUSE may begin now.
+    pause_ok: bool,
+    /// RULES page 1 as one float's bits, unlock * 60 + capture (`R`).
+    total: u32,
+    /// The session's level: a map switch keeps the session, not the map.
+    level: u64,
+    /// A map button pressed (map 0..3: Dyson, Combustion, Fission, Gauss),
+    /// for the session to take.
+    map_ask: Option<u8>,
 }
 
 impl VeilNet {
@@ -148,6 +168,11 @@ impl VeilNet {
             resume_at: None,
             rate: 4,
             payload_speed: 4,
+            pause_queued: false,
+            pause_ok: true,
+            total: 0,
+            level: 0,
+            map_ask: None,
         }
     }
 
@@ -155,8 +180,21 @@ impl VeilNet {
     pub fn sync_session(&mut self, session: Option<(Uuid, u64, u64)>) {
         let Some((lobby, mode, level)) = session else { return };
         if self.session == Some(lobby) {
+            if level != self.level {
+                // A map switch: the match rules stay, a pause does not.
+                self.level = level;
+                self.payload_map = level == LEVEL_FISSION || level == LEVEL_GAUSS;
+                self.paused = PAUSE_OFF;
+                self.resume_at = None;
+                self.pause_queued = false;
+                self.pause_ok = true;
+                self.total = 0;
+                debug!(%lobby, payload = self.payload_map, "VeilNet: same session on a new map");
+            }
             return;
         }
+        self.level = level;
+        self.map_ask = None;
         self.session = Some(lobby);
         self.private = mode == MODE_COMBAT_PRIVATE || mode == MODE_ARENA_PRIVATE;
         self.payload_map = level == LEVEL_FISSION || level == LEVEL_GAUSS;
@@ -166,16 +204,20 @@ impl VeilNet {
         self.resume_at = None;
         self.rate = 4;
         self.payload_speed = 4;
+        self.pause_queued = false;
+        self.pause_ok = true;
+        self.total = 0;
         debug!(%lobby, private = self.private, payload = self.payload_map, "VeilNet: new session, rules back to the defaults");
     }
 
     /// LOADOUTS bits 0-1, SERIES-10 ONLY bit 2, PAUSE bits 3-4, payload map
-    /// bit 5, POINT RATE bits 8-15, PAYLOAD SPEED bits 16-23.
+    /// bit 5, PAUSE queued bit 7, POINT RATE bits 8-15, PAYLOAD SPEED bits 16-23.
     fn rules_word(&self) -> u32 {
         self.loadouts
             | u32::from(self.chassis) << 2
             | u32::from(self.paused & 3) << 3
             | u32::from(self.payload_map) << 5
+            | u32::from(self.pause_queued) << 7
             | u32::from(self.rate) << 8
             | u32::from(self.payload_speed) << 16
     }
@@ -233,6 +275,8 @@ impl VeilNet {
         match kind {
             b'H' => {
                 out.push((from, packet(b'A', if self.medigun { ANSWER_MEDIGUN } else { 0 })));
+                // 0 too: a new session's reset must reach the clients.
+                out.push((from, packet(b'R', self.total)));
                 out.push((from, packet(b'G', self.rules_word())));
             }
             b'C' => self.rules_ask(from, id, now, out),
@@ -252,7 +296,13 @@ impl VeilNet {
 
     fn rules_ask(&mut self, from: SocketAddr, id: u32, now: Instant, out: &mut Out) {
         if id & 0xF000_0000 == WANT_MAP {
-            info!(client = %from, map = id & 0xF, "VeilNet: map switch asked; not supported by this server yet");
+            let k = (id & 0xF) as u8;
+            if !self.private || k >= MAPS {
+                debug!(client = %from, map = k, "VeilNet: map switch refused (not a private match)");
+            } else if self.map_ask.is_none() {
+                info!(client = %from, map = k, "VeilNet: map switch asked");
+                self.map_ask = Some(k);
+            }
             return;
         }
         if !self.private {
@@ -267,13 +317,22 @@ impl VeilNet {
             }
         } else if id & (WANT_CHASSIS | WANT_RATE | WANT_PAUSE) == WANT_PAUSE {
             // PAUSE from running or resuming; UNPAUSE from paused starts the countdown.
-            let want = if id & 1 != 0 {
+            let mut want = if id & 1 != 0 {
                 PAUSE_ON
             } else if self.paused == PAUSE_ON {
                 PAUSE_RESUMING
             } else {
                 self.paused
             };
+            // A payload map: only while the payload is held, else at the
+            // next checkpoint.
+            if want == PAUSE_ON && self.paused == PAUSE_OFF && !self.pause_ok {
+                if !self.pause_queued {
+                    self.pause_queued = true;
+                    info!(client = %from, "VeilNet: PAUSE queued until the payload reaches a checkpoint");
+                }
+                want = self.paused;
+            }
             if want != self.paused {
                 self.paused = want;
                 self.resume_at = (want == PAUSE_RESUMING).then(|| now + RESUME);
@@ -286,6 +345,57 @@ impl VeilNet {
         if self.rules_word() != before {
             let n = self.tell_rules(now, out);
             info!(client = %from, rules = format_args!("{:08x}", self.rules_word()), told = n, "VeilNet: RULES changed");
+        }
+    }
+
+    /// Whether `addr` is an EchoCombat client (heard from lately).
+    pub fn is_client(&self, addr: SocketAddr, now: Instant) -> bool {
+        self.clients.iter().any(|&(a, last)| a == addr && now.duration_since(last) < CLIENT_LIFE)
+    }
+
+    /// A map button press, once.
+    pub fn take_map_ask(&mut self) -> Option<u8> {
+        self.map_ask.take()
+    }
+
+    /// Tells every EchoCombat client the server is switching to map `k`
+    /// (`L`): they leave the game once the lobby shows the new level.
+    pub fn announce_map(&self, k: u8, now: Instant, out: &mut Out) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+        let n = self.relay(None, b'L', u32::from(k), now, out);
+        info!(map = k, told = n, "VeilNet: map switch announced");
+        n
+    }
+
+    /// What the match should apply.
+    pub fn rules(&self) -> crate::engine::combat::EchoRules {
+        crate::engine::combat::EchoRules {
+            rate: self.rate,
+            payload_speed: self.payload_speed,
+            paused: self.enabled && self.private && self.paused != PAUSE_OFF,
+        }
+    }
+
+    /// The match's side: whether a PAUSE may begin now, and RULES page 1
+    /// (`R`, told to every client when it changes). A queued PAUSE begins
+    /// once it may.
+    pub fn set_match(&mut self, pause_ok: bool, total: u32, now: Instant, out: &mut Out) {
+        if !self.enabled {
+            return;
+        }
+        self.pause_ok = pause_ok;
+        if total != self.total {
+            self.total = total;
+            let n = self.relay(None, b'R', total, now, out);
+            debug!(total = f32::from_bits(total), told = n, "VeilNet: RULES unlock / capture time");
+        }
+        if self.pause_queued && pause_ok && self.paused == PAUSE_OFF {
+            self.pause_queued = false;
+            self.paused = PAUSE_ON;
+            let n = self.tell_rules(now, out);
+            info!(told = n, "VeilNet: queued PAUSE on (the payload is held)");
         }
     }
 
@@ -362,9 +472,10 @@ medigun=0"));
         let mut v = VeilNet::new(true, true);
         let mut out = Out::new();
         v.handle(a(1), b'H', 0, Instant::now(), &mut out);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 3);
         assert_eq!(parse(&out[0].1), Some((b'A', ANSWER_MEDIGUN)));
-        assert_eq!(parse(&out[1].1), Some((b'G', 4 << 8 | 4 << 16)));
+        assert_eq!(parse(&out[1].1), Some((b'R', 0)));
+        assert_eq!(parse(&out[2].1), Some((b'G', 4 << 8 | 4 << 16)));
         assert!(out.iter().all(|(to, _)| *to == a(1)));
     }
 
@@ -409,6 +520,72 @@ medigun=0"));
         v.handle(a(1), b'C', WANT_RATE | 2 << 8, now, &mut out);
         assert_eq!(v.payload_speed, 2);
         assert_eq!(v.rate, 4);
+    }
+
+    #[test]
+    fn a_payload_pause_waits_for_a_checkpoint() {
+        let mut v = VeilNet::new(true, false);
+        let now = Instant::now();
+        let mut out = Out::new();
+        v.handle(a(2), b'H', 0, now, &mut out);
+        v.sync_session(Some((Uuid::new_v4(), MODE_COMBAT_PRIVATE, LEVEL_GAUSS)));
+        v.set_match(false, 0, now, &mut out);
+        v.handle(a(1), b'C', WANT_PAUSE | 1, now, &mut out);
+        assert_eq!(v.paused, PAUSE_OFF);
+        assert!(v.rules_word() & 1 << 7 != 0, "queued");
+        assert!(!v.rules().paused);
+        out.clear();
+        v.set_match(true, 0, now, &mut out);
+        assert_eq!(v.paused, PAUSE_ON);
+        assert!(v.rules().paused);
+        assert!(v.rules_word() & 1 << 7 == 0);
+        assert!(out.iter().any(|(to, d)| *to == a(2) && parse(d) == Some((b'G', v.rules_word()))));
+    }
+
+    #[test]
+    fn a_map_button_is_handed_to_the_session() {
+        let mut v = VeilNet::new(true, false);
+        let now = Instant::now();
+        let mut out = Out::new();
+        v.handle(a(1), b'H', 0, now, &mut out);
+        v.handle(a(2), b'H', 0, now, &mut out);
+        v.sync_session(Some((Uuid::new_v4(), 0, LEVEL_FISSION)));
+        v.handle(a(1), b'C', WANT_MAP | 3, now, &mut out);
+        assert_eq!(v.take_map_ask(), None, "public: refused");
+        let lobby = Uuid::new_v4();
+        v.sync_session(Some((lobby, MODE_COMBAT_PRIVATE, LEVEL_FISSION)));
+        assert!(v.payload_map);
+        v.handle(a(1), b'C', WANT_MAP | 3, now, &mut out);
+        v.handle(a(1), b'C', WANT_MAP | 3, now, &mut out);
+        v.handle(a(1), b'C', WANT_MAP | 9, now, &mut out);
+        assert_eq!(v.take_map_ask(), Some(3));
+        assert_eq!(v.take_map_ask(), None, "once");
+        assert!(v.is_client(a(2), now) && !v.is_client(a(3), now));
+        out.clear();
+        assert_eq!(v.announce_map(3, now, &mut out), 2);
+        assert_eq!(out.iter().filter(|(_, d)| parse(d) == Some((b'L', 3))).count(), 4, "each twice");
+        // Same session, new map: Dyson has no payload.
+        v.paused = PAUSE_ON;
+        v.sync_session(Some((lobby, MODE_COMBAT_PRIVATE, 0x43e2_da79_1464_2604)));
+        assert!(!v.payload_map);
+        assert_eq!(v.paused, PAUSE_OFF);
+        assert!(v.private);
+    }
+
+    #[test]
+    fn rules_total_goes_out_as_r() {
+        let mut v = VeilNet::new(true, false);
+        let now = Instant::now();
+        let mut out = Out::new();
+        v.handle(a(1), b'H', 0, now, &mut out);
+        assert!(out.iter().any(|(_, d)| parse(d) == Some((b'R', 0))));
+        out.clear();
+        let t = (30.0f32 * 60.0 + 2.0).to_bits();
+        v.set_match(true, t, now, &mut out);
+        assert_eq!(out.iter().filter(|(_, d)| parse(d) == Some((b'R', t))).count(), 2, "twice, against loss");
+        out.clear();
+        v.set_match(true, t, now, &mut out);
+        assert!(out.is_empty(), "only when it changes");
     }
 
     #[test]

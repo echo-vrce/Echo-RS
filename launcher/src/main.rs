@@ -10,8 +10,9 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
@@ -232,6 +233,200 @@ impl Drop for Running {
     }
 }
 
+/// How a Start ran the server, to run it again after an update.
+#[derive(Clone)]
+struct Launch {
+    exe: PathBuf,
+    args: Vec<String>,
+    log_filter: String,
+}
+
+/// What the window and the update steward share. The steward has its own
+/// thread: a window hidden to the tray gets no frames, and that is where a
+/// launcher hosting for days usually is.
+#[derive(Default)]
+struct Shared {
+    running: Mutex<Option<Running>>,
+    launch: Mutex<Option<Launch>>,
+    /// Draining for an update since then: the server takes nobody new and
+    /// exits once its matches are empty; then the update goes in and the
+    /// servers start again.
+    drain: Mutex<Option<Instant>>,
+    auto_update: AtomicBool,
+    hidden: AtomicBool,
+    /// A status line for the window, from the steward.
+    notice: Mutex<Option<String>>,
+}
+
+impl Shared {
+    fn live(&self) -> bool {
+        self.running.lock().expect("running").as_ref().is_some_and(|r| r.exited.is_none())
+    }
+
+    fn draining_since(&self) -> Option<Instant> {
+        *self.drain.lock().expect("drain")
+    }
+
+    fn send_line(&self, line: &str) -> bool {
+        use std::io::Write;
+        let mut running = self.running.lock().expect("running");
+        if let Some(r) = running.as_mut()
+            && r.exited.is_none()
+            && let Some(w) = &mut r.stdin
+        {
+            if writeln!(w, "{line}").and_then(|_| w.flush()).is_ok() {
+                return true;
+            }
+            r.stdin = None;
+        }
+        false
+    }
+
+    fn spawn(&self, l: &Launch, log: &Log, ctx: &egui::Context) -> std::io::Result<()> {
+        let mut cmd = Command::new(&l.exe);
+        cmd.args(&l.args)
+            .current_dir(l.exe.parent().unwrap_or(Path::new(".")))
+            .env("NO_COLOR", "1")
+            .env("ERS_LOG", &l.log_filter)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut child = cmd.spawn()?;
+        if let Some(o) = child.stdout.take() {
+            pump(o, log.clone(), ctx.clone());
+        }
+        if let Some(e) = child.stderr.take() {
+            pump(e, log.clone(), ctx.clone());
+        }
+        let stdin = child.stdin.take();
+        *self.running.lock().expect("running") = Some(Running { child, stdin, exited: None });
+        *self.launch.lock().expect("launch") = Some(l.clone());
+        Ok(())
+    }
+
+    /// Ends the server now. `keep_drain`: for "Update now", the update still
+    /// goes in and the servers start again; a plain Stop cancels that.
+    fn kill(&self, log: &Log, keep_drain: bool) -> bool {
+        if !keep_drain {
+            *self.drain.lock().expect("drain") = None;
+        }
+        let mut running = self.running.lock().expect("running");
+        let Some(r) = running.as_mut().filter(|r| r.exited.is_none()) else { return false };
+        let _ = r.child.kill();
+        let _ = r.child.wait();
+        r.exited = Some("stopped".into());
+        push(log, "— stopped —".into());
+        true
+    }
+
+    /// The server's exit, once: its message.
+    fn reap(&self, log: &Log) -> Option<String> {
+        let mut running = self.running.lock().expect("running");
+        let r = running.as_mut().filter(|r| r.exited.is_none())?;
+        let st = r.child.try_wait().ok()??;
+        let msg = st.code().map_or("ended".into(), |c| format!("exited (code {c})"));
+        push(log, format!("— {msg} —"));
+        r.exited = Some(msg.clone());
+        Some(msg)
+    }
+
+    /// Ask the running server to drain for the update `tag`.
+    fn begin_drain(&self, log: &Log, tag: &str) {
+        if self.draining_since().is_some() || !self.send_line("drain") {
+            return;
+        }
+        *self.drain.lock().expect("drain") = Some(Instant::now());
+        push(log, format!("— {tag} downloaded: running matches take nobody new and finish first; then the update goes in and the servers start again —"));
+    }
+}
+
+/// How often the steward asks GitHub for a new release (the launcher also
+/// asks once as it starts).
+const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// The update steward: checks for releases, drains a running server when one
+/// is downloaded, installs it once the server is gone, and starts the servers
+/// again (or the new launcher, when the launcher itself changed).
+fn steward(shared: Arc<Shared>, updater: update::Updater, log: Log, ctx: egui::Context, bridge: Arc<tray::Bridge>, me: Option<PathBuf>) {
+    use update::Status;
+    let mut next_check = Instant::now() + CHECK_EVERY;
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        if let Some(msg) = shared.reap(&log) {
+            *shared.notice.lock().expect("notice") = Some(format!("Server {msg}."));
+            ctx.request_repaint();
+        }
+        let live = shared.live();
+        let auto = shared.auto_update.load(Ordering::Relaxed);
+        let status = updater.status();
+        if auto && Instant::now() >= next_check {
+            next_check = Instant::now() + CHECK_EVERY;
+            if !updater.busy() && !matches!(status, Status::Ready(_) | Status::Installed { restart: true, .. }) {
+                let c = ctx.clone();
+                updater.check(exe_dir(), false, move || c.request_repaint());
+            }
+        }
+        let Status::Ready(tag) = status else { continue };
+        if live {
+            if auto {
+                shared.begin_drain(&log, &tag);
+                ctx.request_repaint();
+            }
+            continue;
+        }
+        // The server is gone (drained, stopped or never started): in it goes.
+        updater.install_pending(&exe_dir());
+        let resume = shared.drain.lock().expect("drain").take().is_some();
+        let launch = shared.launch.lock().expect("launch").clone();
+        let hidden = shared.hidden.load(Ordering::Relaxed);
+        match updater.status() {
+            Status::Installed { restart: true, .. } => {
+                // The launcher itself changed: start the new one, and close this one.
+                let Some(me) = &me else { continue };
+                let mut cmd = Command::new(me);
+                if resume {
+                    cmd.arg("--start");
+                }
+                if hidden {
+                    cmd.arg("--hidden");
+                }
+                cmd.current_dir(exe_dir());
+                match cmd.spawn() {
+                    Ok(_) => {
+                        push(&log, format!("— updated to {tag}: the new launcher takes over —"));
+                        bridge.request_quit();
+                    }
+                    Err(e) => {
+                        push(&log, format!("— updated to {tag}, but the new launcher did not start ({e}): start it yourself —"));
+                        *shared.notice.lock().expect("notice") = Some(format!("Updated to {tag}: restart the launcher"));
+                    }
+                }
+            }
+            s => {
+                if let Status::Failed(e) = &s {
+                    push(&log, format!("— the update did not go in ({e}) —"));
+                }
+                if resume && let Some(l) = launch {
+                    let what = if matches!(s, Status::Installed { .. }) { format!("updated to {tag}") } else { "still on the old version".to_string() };
+                    match shared.spawn(&l, &log, &ctx) {
+                        Ok(()) => {
+                            push(&log, format!("— {what}: servers started again —"));
+                            *shared.notice.lock().expect("notice") = Some("Running.".into());
+                        }
+                        Err(e) => *shared.notice.lock().expect("notice") = Some(format!("Could not start again after the update: {e}")),
+                    }
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -340,7 +535,11 @@ fn setup_path() -> PathBuf {
 
 struct App {
     setup: Setup,
-    running: Option<Running>,
+    shared: Arc<Shared>,
+    /// From `--start` / `--hidden` (the launcher restarting after an update):
+    /// done on the first frame.
+    autostart: bool,
+    autohide: bool,
     log: Log,
     status: String,
     ctx: egui::Context,
@@ -373,30 +572,61 @@ impl App {
             }
         }
         let setup: Setup = setup;
+        // This executable's path, taken before an update can rename it aside.
+        let me = std::env::current_exe().ok();
         update::clean_old(&exe_dir());
         let updater = update::Updater::default();
         if setup.auto_update {
             let ctx = cc.egui_ctx.clone();
             updater.check(exe_dir(), false, move || ctx.request_repaint());
         }
-        Self { setup, running: None, log: Arc::default(), status: String::new(), ctx: cc.egui_ctx.clone(), bridge, tray: None, hidden: false, page: Page::Server, settings: settings::State::default(), updater }
+        let shared = Arc::new(Shared::default());
+        shared.auto_update.store(setup.auto_update, Ordering::Relaxed);
+        let log: Log = Arc::default();
+        {
+            let (shared, updater, log, ctx, bridge) = (shared.clone(), updater.clone(), log.clone(), cc.egui_ctx.clone(), bridge.clone());
+            std::thread::Builder::new().name("update-steward".into()).spawn(move || steward(shared, updater, log, ctx, bridge, me)).ok();
+        }
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        Self {
+            setup,
+            shared,
+            autostart: args.iter().any(|a| a == "--start"),
+            autohide: args.iter().any(|a| a == "--hidden"),
+            log,
+            status: String::new(),
+            ctx: cc.egui_ctx.clone(),
+            bridge,
+            tray: None,
+            hidden: false,
+            page: Page::Server,
+            settings: settings::State::default(),
+            updater,
+        }
     }
 
     /// The update line under the header: what the updater is doing, and its controls.
     fn update_row(&mut self, ui: &mut egui::Ui, live: bool) {
         use update::Status;
-        // A downloaded release goes in as soon as the server is not running.
-        if !live && matches!(self.updater.status(), Status::Ready(_)) {
-            self.updater.install_pending(&exe_dir());
-        }
+        let draining = self.shared.draining_since();
         // (short text, colour, detail on hover)
         let (text, color, detail) = match self.updater.status() {
+            Status::Ready(t) if live && draining.is_some() => {
+                let mins = draining.map_or(0, |d| d.elapsed().as_secs() / 60);
+                (
+                    format!("Updating to {t}: waiting for the running matches to empty ({mins} min)"),
+                    AMBER,
+                    Some("Running matches take nobody new and play on until their players leave; idle game servers have stopped. Then the update goes in and the servers start again on their own.".to_string()),
+                )
+            }
+            Status::Ready(t) if live && self.setup.auto_update => (format!("{t} ready: updating once the running matches are over"), AMBER, None),
+            Status::Ready(t) if live => (format!("{t} ready"), AMBER, Some("Update when empty: running matches finish first, then the servers restart on the new version.".to_string())),
+            Status::Ready(t) => (format!("Installing {t}…"), AMBER, None),
             Status::Idle => ("Not checked yet".to_string(), MUTED, None),
             Status::Checking => ("Checking for updates…".to_string(), MUTED, None),
             Status::UpToDate(t) => ("Up to date".to_string(), GREEN, Some(format!("Newest release on GitHub: {t}"))),
             Status::Downloading(t) => (format!("Downloading {t}…"), AMBER, None),
-            Status::Ready(t) => (format!("{t} ready: installs when the server stops"), AMBER, None),
-            Status::Installed { tag, restart: true } => (format!("Updated to {tag}: restart the launcher"), GREEN, None),
+            Status::Installed { tag, restart: true } => (format!("Updated to {tag}: restarting the launcher…"), GREEN, None),
             Status::Installed { tag, restart: false } => (format!("Updated to {tag}"), GREEN, None),
             Status::Failed(e) => ("Update check failed".to_string(), RED, Some(e)),
         };
@@ -426,7 +656,23 @@ impl App {
                         l.on_hover_text(d);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let check = egui::Button::new(RichText::new("Check now").size(12.5)).corner_radius(6).min_size(egui::vec2(0.0, 24.0));
+                        let small = |t: &str| egui::Button::new(RichText::new(t).size(12.5)).corner_radius(6).min_size(egui::vec2(0.0, 24.0));
+                        if let Status::Ready(tag) = self.updater.status()
+                            && live
+                        {
+                            if draining.is_some() {
+                                if ui.add(small("Update now")).on_hover_text("Stop the server now, players and all, and update").clicked() {
+                                    self.shared.kill(&self.log, true);
+                                    self.status = "Updating…".into();
+                                }
+                            } else if !self.setup.auto_update
+                                && ui.add(small("Update when empty")).on_hover_text("Running matches take nobody new and finish first; then the update goes in and the servers start again").clicked()
+                            {
+                                self.shared.begin_drain(&self.log, &tag);
+                            }
+                            ui.add_space(6.0);
+                        }
+                        let check = small("Check now");
                         if ui.add_enabled(!busy, check).on_hover_text("Look for a newer release on GitHub now").clicked() {
                             let ctx = self.ctx.clone();
                             self.updater.check(exe_dir(), true, move || ctx.request_repaint());
@@ -434,8 +680,9 @@ impl App {
                         ui.add_space(6.0);
                         let auto = ui
                             .checkbox(&mut self.setup.auto_update, RichText::new("Auto-update").size(12.5).color(MUTED))
-                            .on_hover_text("Check GitHub and update each time the launcher starts");
+                            .on_hover_text("Check GitHub as the launcher starts and every 30 minutes. A new release goes in once the running matches are over: they take nobody new, idle servers stop, and the servers start again on the new version.");
                         if auto.changed() {
+                            self.shared.auto_update.store(self.setup.auto_update, Ordering::Relaxed);
                             self.save();
                         }
                     });
@@ -444,7 +691,7 @@ impl App {
     }
 
     fn live(&self) -> bool {
-        self.running.as_ref().is_some_and(|r| r.exited.is_none())
+        self.shared.live()
     }
 
     fn save(&mut self) {
@@ -478,33 +725,11 @@ impl App {
         }
         let shown: Vec<String> = args.iter().map(|a| redact(a)).collect();
         push(&self.log, format!("> {} {}", exe.display(), shown.join(" ")));
-        let mut cmd = Command::new(&exe);
-        cmd.args(&args)
-            .current_dir(exe.parent().unwrap_or(Path::new(".")))
-            .env("NO_COLOR", "1")
-            // Debug lines (disc and touch decisions, pings, packet summaries)
-            // only when asked for: they cost the server more than anything else.
-            .env("ERS_LOG", std::env::var("ERS_LOG").unwrap_or_else(|_| if self.setup.debug_log { "info,echo_rust_server::engine::session=debug".into() } else { "info".into() }))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Some(o) = child.stdout.take() {
-                    pump(o, self.log.clone(), self.ctx.clone());
-                }
-                if let Some(e) = child.stderr.take() {
-                    pump(e, self.log.clone(), self.ctx.clone());
-                }
-                let stdin = child.stdin.take();
-                self.running = Some(Running { child, stdin, exited: None });
-                self.status = "Running.".into();
-            }
+        // Debug lines (disc and touch decisions, pings, packet summaries)
+        // only when asked for: they cost the server more than anything else.
+        let log_filter = std::env::var("ERS_LOG").unwrap_or_else(|_| if self.setup.debug_log { "info,echo_rust_server::engine::session=debug".into() } else { "info".into() });
+        match self.shared.spawn(&Launch { exe, args, log_filter }, &self.log, &self.ctx) {
+            Ok(()) => self.status = "Running.".into(),
             Err(e) => self.status = format!("Could not start: {e}"),
         }
     }
@@ -516,38 +741,21 @@ impl App {
 
     /// A command line for the running server's stdin.
     fn send_line(&mut self, line: &str) {
-        use std::io::Write;
-        if let Some(r) = &mut self.running
-            && r.exited.is_none()
-            && let Some(w) = &mut r.stdin
-        {
-            if writeln!(w, "{line}").and_then(|_| w.flush()).is_err() {
-                r.stdin = None;
-            }
-        }
+        self.shared.send_line(line);
     }
 
     fn stop(&mut self) {
-        if let Some(r) = &mut self.running
-            && r.exited.is_none()
-        {
-            let _ = r.child.kill();
-            let _ = r.child.wait();
-            r.exited = Some("stopped".into());
-            push(&self.log, "— stopped —".into());
+        if self.shared.kill(&self.log, false) {
             self.status = "Stopped.".into();
         }
     }
 
     fn reap(&mut self) {
-        if let Some(r) = &mut self.running
-            && r.exited.is_none()
-            && let Ok(Some(st)) = r.child.try_wait()
-        {
-            let msg = st.code().map_or("ended".into(), |c| format!("exited (code {c})"));
-            push(&self.log, format!("— {msg} —"));
+        if let Some(msg) = self.shared.reap(&self.log) {
             self.status = format!("Server {msg}.");
-            r.exited = Some(msg);
+        }
+        if let Some(n) = self.shared.notice.lock().expect("notice").take() {
+            self.status = n;
         }
     }
 }
@@ -886,6 +1094,7 @@ impl App {
             }
         }
         self.hidden = true;
+        self.shared.hidden.store(true, Ordering::Relaxed);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         // Where a window can't be hidden (Wayland), at least minimise it.
         #[cfg(target_os = "linux")]
@@ -915,9 +1124,17 @@ impl eframe::App for App {
         }
         if self.bridge.take_show() {
             self.hidden = false;
+            self.shared.hidden.store(false, Ordering::Relaxed);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        // Restarted by an update: start the servers again, back to the tray.
+        if std::mem::take(&mut self.autostart) && self.setup.problems().is_empty() {
+            self.start();
+        }
+        if std::mem::take(&mut self.autohide) {
+            self.hide_to_tray(ctx);
         }
         self.reap();
         let live = self.live();
@@ -927,7 +1144,7 @@ impl eframe::App for App {
             .frame(egui::Frame::default().fill(CARD).inner_margin(egui::Margin::symmetric(24, 16)).stroke(egui::Stroke::new(1.0_f32, BORDER)))
             .show(ctx, |ui| self.header(ui, live, &problems));
 
-        if self.running.is_some() {
+        if self.shared.running.lock().expect("running").is_some() {
             egui::TopBottomPanel::bottom("log")
                 .resizable(true)
                 .default_height(220.0)
@@ -973,6 +1190,14 @@ impl eframe::App for App {
         }
     }
 
+    /// The mouse's raw motion (`MouseMoved`, from anywhere on the desktop
+    /// while the window has focus) is dropped: every one asked for a redraw,
+    /// so moving the mouse on any screen redrew the launcher nonstop (44% CPU
+    /// on the software renderer). Pointer moves over the window still come.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.events.retain(|e| !matches!(e, egui::Event::MouseMoved(_)));
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop();
         self.save();
@@ -980,10 +1205,17 @@ impl eframe::App for App {
 }
 
 fn options() -> eframe::NativeOptions {
-    eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Echo Server Launcher").with_inner_size([1060.0, 780.0]).with_min_inner_size([560.0, 480.0]),
-        ..Default::default()
+    #[allow(unused_mut)]
+    let mut viewport = egui::ViewportBuilder::default().with_title("Echo Server Launcher").with_inner_size([1060.0, 780.0]).with_min_inner_size([560.0, 480.0]);
+    // Debug builds only: where the window opens (`x,y`), for testing.
+    #[cfg(debug_assertions)]
+    if let Some((x, y)) = std::env::var("ERS_LAUNCHER_POS").ok().and_then(|v| {
+        let (x, y) = v.split_once(',')?;
+        Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?))
+    }) {
+        viewport = viewport.with_position([x, y]);
     }
+    eframe::NativeOptions { viewport, ..Default::default() }
 }
 
 fn run(options: eframe::NativeOptions) -> eframe::Result<()> {

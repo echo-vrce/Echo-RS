@@ -59,12 +59,21 @@ pub(crate) const ECHOCOMBAT_WEAPONS: &str = include_str!("data/mp_weapon_setting
 /// The gear list a native H server with EchoCombat sends (its social lobby, 2026-11-16):
 /// the stock gear plus PROTOSTAR, QUARK, BLAZAR, STARBURST, UMBRAL VEIL, OVERCHARGE, ...
 const ECHOCOMBAT_EQUIPMENT: &str = include_str!("data/mp_equipment_echocombat.json");
+/// Today's stock `mp_weapon_settings` (a native server without EchoCombat,
+/// Fission, 2026-11-21), for games without EchoCombat. EchoCombat's changes
+/// UMBRAL VEIL (90 s, 0.85 opacity; stock 240 s, 0), QUARK's limbs and DOT
+/// FIELD (no remote trigger, sticks to walls, 11 s, 2.5 m; stock waits for its
+/// thrower's trigger, 8 s, 3.5 m), which a stock game's scripts don't handle.
+/// The gear list is the same in both (`mp_equipment`).
+const STOCK_WEAPONS: &str = include_str!("data/mp_weapon_settings_stock.json");
 
 /// Which weapon settings the blocks start from.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Base {
     pub echocombat: bool,
     pub medigun: bool,
+    /// Today's stock gear tables (`STOCK_WEAPONS`), when not EchoCombat's.
+    pub stock: bool,
 }
 
 /// Call once at startup, before any session (tests use the stock base).
@@ -174,10 +183,21 @@ pub fn apply_to(body: &[u8], changes: &Map<String, Value>) -> Result<Vec<u8>> {
 /// `body` on `base`, with `changes` merged in; untouched documents keep their bytes.
 pub fn build(body: &[u8], base: Base, changes: &Map<String, Value>) -> Result<Vec<u8>> {
     let mut docs = decode(body)?;
-    let mut changed = false;
+    // Native's blocks list their ids sorted (as signed numbers). Our Dyson,
+    // Combustion and Fission blocks had the map's own document (capture
+    // point and round timers) out of place, where a sorted lookup misses it.
+    let mut changed = !docs.is_sorted_by_key(|(id, _)| *id as i64);
+    docs.sort_by_key(|(id, _)| *id as i64);
     let weapons = doc_id("mp_weapon_settings");
-    if base.echocombat {
-        for (id, doc) in [(weapons, ECHOCOMBAT_WEAPONS), (doc_id("mp_equipment"), ECHOCOMBAT_EQUIPMENT)] {
+    let swap = if base.echocombat {
+        Some(ECHOCOMBAT_WEAPONS)
+    } else if base.stock {
+        Some(STOCK_WEAPONS)
+    } else {
+        None
+    };
+    if let Some(weapons_doc) = swap {
+        for (id, doc) in [(weapons, weapons_doc), (doc_id("mp_equipment"), ECHOCOMBAT_EQUIPMENT)] {
             if let Some((_, bytes)) = docs.iter_mut().find(|(d, _)| *d == id) {
                 *bytes = doc.trim_end().as_bytes().to_vec();
                 changed = true;
@@ -221,7 +241,7 @@ pub fn apply(body: Vec<u8>) -> Vec<u8> {
     let base = BASE.get().copied().unwrap_or_default();
     let empty = Map::new();
     let changes = CHANGES.get().unwrap_or(&empty);
-    if !base.echocombat && changes.is_empty() {
+    if !base.echocombat && !base.stock && changes.is_empty() && decode(&body).is_ok_and(|d| d.is_sorted_by_key(|(id, _)| *id as i64)) {
         return body;
     }
     match build(&body, base, changes) {
@@ -231,6 +251,26 @@ pub fn apply(body: Vec<u8>) -> Vec<u8> {
             body
         }
     }
+}
+
+/// A captured block for a game without EchoCombat: the stock gear tables,
+/// with the host's changes. A stock game given EchoCombat's tables (its own
+/// tac mods retuned, gear it has no scripts for) broke its tac mod for good.
+pub fn apply_stock(body: Vec<u8>) -> Vec<u8> {
+    let empty = Map::new();
+    let changes = CHANGES.get().unwrap_or(&empty);
+    match build(&body, Base { stock: true, ..Base::default() }, changes) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "balance changes not applied; sending the stock settings");
+            body
+        }
+    }
+}
+
+/// Whether the blocks clients get are EchoCombat's (`set_base`).
+pub fn echocombat_base() -> bool {
+    BASE.get().is_some_and(|b| b.echocombat)
 }
 
 /// One JSON document of a block, by file name.
@@ -302,6 +342,29 @@ mod tests {
 
     fn arena_block() -> Vec<u8> {
         crate::engine::msg::captured().balance.iter().find(|(l, _)| *l == crate::engine::msg::LEVEL_ARENA).expect("arena").1.clone()
+    }
+
+    #[test]
+    fn every_block_lists_its_ids_in_order() {
+        let c = super::super::msg::captured();
+        for (level, body) in c.balance.iter().chain(&c.balance_stock) {
+            // `apply` leaves a block alone without a base or changes: build it as sent.
+            let sent = build(body, Base { echocombat: true, medigun: false, stock: false }, &Map::new()).expect("block");
+            let ids: Vec<i64> = decode(&sent).expect("decode").iter().map(|(id, _)| *id as i64).collect();
+            assert!(ids.is_sorted(), "level {level:#x}: {ids:x?}");
+        }
+    }
+
+    #[test]
+    fn games_without_echocombat_get_todays_stock_tables() {
+        let c = super::super::msg::captured();
+        for (level, body) in &c.balance_stock {
+            let Some(w) = document(body, "mp_weapon_settings") else { continue };
+            assert_eq!(w.pointer("/grenade_properties/dot/use_remote_trigger"), Some(&Value::Bool(true)), "level {level:#x}");
+            assert_eq!(w.pointer("/ability_properties/smoke/duration").and_then(Value::as_f64), Some(240.0), "level {level:#x}");
+            let e = document(body, "mp_equipment").expect("gear list");
+            assert!(e.to_string().contains("NEUTRON"), "level {level:#x}: today's gear list");
+        }
     }
 
     #[test]
@@ -377,13 +440,13 @@ mod tests {
     fn echocombat_base_and_medigun_only_from_the_file() {
         let body = social_block();
         let ask_medigun: Map<String, Value> = serde_json::from_str(r#"{"mp_weapon_settings": {"medigun": {"enabled": true}}}"#).expect("json");
-        let ec = build(&body, Base { echocombat: true, medigun: false }, &ask_medigun).expect("build");
+        let ec = build(&body, Base { echocombat: true, medigun: false, stock: false }, &ask_medigun).expect("build");
         let w = document(&ec, "mp_weapon_settings").expect("weapons");
         assert_eq!(w.pointer("/grenade_properties/dot/radius"), Some(&Value::from(2.5)));
         assert_eq!(w.pointer("/medigun/enabled"), Some(&Value::Bool(false)));
         let gear = document(&ec, "mp_equipment").expect("equipment").to_string();
         assert!(gear.contains("PROTOSTAR") && gear.contains("OVERCHARGE"), "EchoCombat gear list");
-        let on = build(&body, Base { echocombat: true, medigun: true }, &Map::new()).expect("build");
+        let on = build(&body, Base { echocombat: true, medigun: true, stock: false }, &Map::new()).expect("build");
         let w = document(&on, "mp_weapon_settings").expect("w");
         assert_eq!(w.pointer("/medigun/enabled"), Some(&Value::Bool(true)));
         assert_eq!(w.pointer("/ability_properties/medigun/enabled"), Some(&Value::Bool(true)));

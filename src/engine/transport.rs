@@ -22,6 +22,9 @@ use rad_protocol::header::{PacketHeader, compute_checksum};
 pub const FRAME_RING: u16 = 1023;
 /// Unacked reliable frames allowed in flight.
 const WINDOW: u16 = 511;
+/// A mailbox frame this little behind the last one taken is a late or
+/// repeated one and is dropped; any other frame is taken, however far ahead.
+const MB_STALE: u16 = 64;
 /// Client receive buffer is 1264 bytes; leave room for MAC(32), seq, padding,
 /// header and the fragment index words.
 pub const MAX_CHUNK: usize = 1264 - 32 - 8 - 16 - 8 - 4;
@@ -293,8 +296,13 @@ impl Transport {
                 }
             } // else: a duplicate of a frame already delivered; the ack covers it
         } else {
-            // Mailbox: latest-wins; never stall on a lost frame.
-            if frame == self.mb_expect || ring_ahead(self.mb_expect, frame) < WINDOW {
+            // Mailbox: latest-wins; never stall on a lost frame. Only a frame
+            // a little behind is old: after a long stall (a lagging player)
+            // the sender's counter can be any distance ahead, and treating
+            // that as old dropped every frame until the ring came round again,
+            // freezing the player's body for everyone.
+            let behind = ring_ahead(frame, self.mb_expect);
+            if behind == 0 || behind > MB_STALE {
                 self.decode_into(false, &body, &mut out.mailbox);
                 self.mb_expect = ring_add(frame, 1);
                 let now = Instant::now();
@@ -644,5 +652,49 @@ fn unpack_batch(data: &[u8], out: &mut Vec<DecodedMessage>) {
         }
         out.push(DecodedMessage { size_bytes: len as u32, type_: ty, mailbox: RELIABLE_DST, data: data[i..i + len].to_vec() });
         i += len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair() -> (Transport, Transport) {
+        let c = SessionCrypto {
+            out_flags: 0,
+            out_aes: [0; 32],
+            out_mac: [0; 32],
+            out_rnd: [0; 32],
+            out_seq: 0,
+            in_flags: 0,
+            in_aes: [0; 32],
+            in_mac: [0; 32],
+            in_rnd: [0; 32],
+            in_seq: 0,
+        };
+        (Transport::new(&c), Transport::new(&c))
+    }
+
+    fn send(tx: &mut Transport, rx: &mut Transport, b: u8) -> usize {
+        let mut out = Vec::new();
+        tx.mailbox_now(0x1234, 7, &[b; 16], &mut out);
+        out.iter().filter_map(|p| rx.receive(p)).map(|r| r.mailbox.len()).sum()
+    }
+
+    /// A lagging player's frame counter far ahead (a long stall): his body
+    /// must still update, not freeze until the ring comes round.
+    #[test]
+    fn mailbox_takes_a_frame_far_ahead() {
+        let (mut tx, mut rx) = pair();
+        assert_eq!(send(&mut tx, &mut rx, 1), 1);
+        tx.mb_next = 700;
+        assert_eq!(send(&mut tx, &mut rx, 2), 1, "after a jump");
+        assert_eq!(send(&mut tx, &mut rx, 3), 1);
+        // A late frame from before is dropped.
+        tx.mb_next = 690;
+        assert_eq!(send(&mut tx, &mut rx, 4), 0, "late");
+        tx.mb_next = 701;
+        assert_eq!(send(&mut tx, &mut rx, 5), 0, "repeated");
+        assert_eq!(send(&mut tx, &mut rx, 6), 1);
     }
 }

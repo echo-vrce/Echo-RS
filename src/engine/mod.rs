@@ -25,7 +25,7 @@ pub mod veilnet;
 pub mod walls;
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -252,7 +252,9 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
             _ = tick.tick(), if session.is_some() => {
                 let s = session.as_mut().expect("guarded");
                 let mut veil_out = veilnet::Out::new();
+                veil.sync_session(Some((s.info.lobby, s.info.mode, s.info.level)));
                 veil.tick(Instant::now(), &mut veil_out);
+                veil_sync(s, &mut veil, &mut veil_out);
                 send_veil(socket, veil_out).await;
                 s.service();
                 send_udp(socket, s).await;
@@ -266,8 +268,9 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
                     session = None;
                 } else if s.finished() {
                     // A public match is over and everyone went back to the
-                    // lobby: idle now, so nobody rejoins the finished game.
-                    info!(instance = idx, lobby = %s.info.lobby, players = s.peer_count(), "public match over; ending the session");
+                    // lobby, or only spectators are left: idle now, so nobody
+                    // rejoins the finished game.
+                    info!(instance = idx, lobby = %s.info.lobby, players = s.peer_count(), "match over; ending the session");
                     s.close();
                     send_udp(socket, s).await;
                     outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
@@ -286,6 +289,18 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
         send_udp(socket, &mut s).await;
     }
     result
+}
+
+/// Draining for an update: every running match stops taking players, no new
+/// session starts, and each game server stops once its session is over.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_draining() {
+    DRAINING.store(true, Ordering::Relaxed);
+}
+
+pub fn draining() -> bool {
+    DRAINING.load(Ordering::Relaxed)
 }
 
 /// This host's public IPv4 (what players are given), for the Ipv6Bridge
@@ -323,6 +338,9 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil
         {
             s.point_token(from);
         }
+        if let Some(s) = session.as_mut() {
+            veil_sync(s, veil, &mut out);
+        }
         send_veil(socket, out).await;
         return;
     }
@@ -347,6 +365,32 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil
     }
     if let Some(s) = session.as_mut() {
         s.on_packet(from, d);
+    }
+}
+
+/// EchoCombat's rules both ways: the match's state to VeilNet (may a PAUSE
+/// begin, RULES page 1), then VeilNet's rules to the match.
+fn veil_sync(s: &mut Session, veil: &mut veilnet::VeilNet, out: &mut veilnet::Out) {
+    let now = Instant::now();
+    for a in s.peer_addrs() {
+        if veil.is_client(a, now) {
+            s.mark_echocombat(a);
+        }
+    }
+    let (pause_ok, total) = s.echocombat_state();
+    veil.set_match(pause_ok, total, Instant::now(), out);
+    s.set_echocombat(veil.rules());
+    // A post-match map button: the session reloads on that map, then the
+    // EchoCombat clients are told to follow. Only if every player in the
+    // match has EchoCombat: anyone else's game would stay on the old map.
+    if let Some(k) = veil.take_map_ask() {
+        let now = Instant::now();
+        let without = s.joined_addrs().into_iter().filter(|a| !veil.is_client(*a, now)).count();
+        if without > 0 {
+            info!(map = k, without, "map switch refused: players without EchoCombat would stay on the old map");
+        } else if s.request_map(k) {
+            veil.announce_map(k, now, out);
+        }
     }
 }
 
@@ -415,6 +459,11 @@ fn on_fleet(
                 old.close();
             }
             let info = session_info(&c);
+            if draining() {
+                info!(instance = idx, port, lobby = %info.lobby, "session refused: draining for an update");
+                out.push(session_event(info.lobby, pb::lobby_session_event_message::Code::Ended));
+                return;
+            }
             if !filter::allows(info.mode, info.level) {
                 warn!(
                     instance = idx, port, lobby = %info.lobby,

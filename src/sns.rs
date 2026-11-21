@@ -641,6 +641,7 @@ pub mod fail {
     pub const SERVER_DOES_NOT_EXIST: u32 = 4;
     pub const SERVER_INCOMPATIBLE: u32 = 5;
     pub const SERVER_FIND_FAILED: u32 = 6;
+    pub const SERVER_IS_LOCKED: u32 = 7;
     pub const SERVER_IS_FULL: u32 = 8;
     pub const INTERNAL_ERROR: u32 = 9;
 }

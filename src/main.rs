@@ -284,7 +284,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     engine::checks::set_mode(args.cheat_checks);
-    engine::balance::set_base(engine::balance::Base { echocombat: !args.no_veilnet, medigun: engine::veilnet::medigun_from_file() });
+    engine::balance::set_base(engine::balance::Base { echocombat: !args.no_veilnet, medigun: engine::veilnet::medigun_from_file(), stock: true });
     if let Some(path) = &args.balance
         && let Err(e) = engine::balance::load(path)
     {
@@ -304,7 +304,9 @@ async fn main() -> Result<()> {
     }
     engine::session::set_frame_hz(args.frame_hz);
     // The launcher changes a running server by writing lines to its stdin:
-    // `frame-hz N`, and `servers MAX KEPT` (most at once, kept running).
+    // `frame-hz N`, `servers MAX KEPT` (most at once, kept running), and
+    // `drain` (for an update: lock running matches, stop the idle servers,
+    // and exit once every one is empty).
     let (limits_tx, mut limits_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
     std::thread::spawn(move || {
         for line in std::io::stdin().lines() {
@@ -317,6 +319,12 @@ async fn main() -> Result<()> {
                 }
                 (Some("servers"), Some(max), Some(kept)) => {
                     let _ = limits_tx.send((max as usize, kept as usize));
+                }
+                (Some("drain"), _, _) => {
+                    if !engine::draining() {
+                        engine::set_draining();
+                        tracing::info!("draining for an update: running matches take nobody new; the server exits once they are empty");
+                    }
                 }
                 _ => {}
             }

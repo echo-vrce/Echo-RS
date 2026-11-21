@@ -362,6 +362,37 @@ const VAR_CAP_SCORING: [u64; 2] = [0x4f8a_a683_cc60_b185, 0xdf54_2064_982b_cdf7]
 /// Seconds left on the point's lock.
 const VAR_CAP_LOCK: u64 = 0xeb40_dd00_966d_72fe;
 
+// Private match RULES, page 1 (EchoCombat opens the podium's RULES page in
+// Combat): the stock game-mode script's own presses and vars. EchoCombat reads
+// the round time rows as POINT UNLOCK (the minutes row, seconds before the
+// capture point unlocks) and CAPTURE TIME (the seconds row, seconds to take
+// it, 0 = at once), and the scores as each team's starting points.
+const VAR_MS_BLUE: u64 = 0x4d41_736c_db39_fe99; // net_match_settings_blue_score
+const VAR_MS_RED: u64 = 0x7a4f_1202_6413_4e4d; // net_match_settings_red_score
+const VAR_MS_TIME: u64 = 0x5b74_8a2b_4792_dd2d; // net_match_settings_round_time_in_seconds
+const PRESS_BLUE: [u64; 2] = [0x3385_8102_e739_ba43, 0x08ff_93fa_3cd5_af29]; // nevt_increment / decrement_initial_blue_score
+const PRESS_RED: [u64; 2] = [0xc332_6362_3163_27ef, 0xc222_4056_9ae0_5c69]; // ... _red_score
+const PRESS_MINUTES: [u64; 2] = [0x5835_46d4_f9cf_1835, 0x634f_542c_2223_0d5f]; // nevt_increment / decrement_round_time_minutes
+const PRESS_SECONDS: [u64; 2] = [0x582b_4ad9_e3d5_1935, 0x6351_5821_3839_0c5f]; // ... _seconds
+/// `nevt_sfx_prv_match_settings_change`: native sends it on every press.
+const EV_SETTING_SOUND: u64 = 0x565a_200a_f9a1_1f49;
+const MAX_UNLOCK: u32 = 99;
+const MAX_CAPTURE: u32 = 59;
+/// 75 points win: a team can start one short of it.
+const MAX_START_SCORE: u32 = 74;
+/// The combat announcer's own lines (`mp_combat_voice_announcer` listens for
+/// them; no stock script raises them): "Round one" .. "Round six", "Match
+/// started".
+const VO_ROUND: [u64; 6] = [
+    0x6035_f8e1_7937_6a77,
+    0x6035_f8e1_7937_6a74,
+    0x6035_f8e1_7937_6a75,
+    0x6035_f8e1_7937_6a72,
+    0x6035_f8e1_7937_6a73,
+    0x6035_f8e1_7937_6a70,
+];
+const VO_MATCH_STARTED: u64 = 0x3e59_d6d5_915a_0546;
+
 /// Players needed before the pre-match count starts (public: one is enough to
 /// test; native waits for its matchmaker's teams).
 const PRE_MATCH_PLAYERS: usize = 1;
@@ -702,6 +733,9 @@ struct Payload {
     claimed_once: bool,
     /// Gauss's door count, from its first checkpoint.
     door: Option<f32>,
+    /// Moved forward since the round began or the last checkpoint (an
+    /// EchoCombat PAUSE waits for the next checkpoint then).
+    moved: bool,
 }
 
 impl Payload {
@@ -727,6 +761,7 @@ impl Payload {
             hud: (0, 0, 0),
             claimed_once: false,
             door: None,
+            moved: false,
         }
     }
 }
@@ -816,6 +851,28 @@ pub struct Combat {
     track_vars: Vec<(u16, u64, u64, u64)>,
     /// Level vars from `track_vars` set so far.
     track_set: Vec<(u64, Val)>,
+    /// EchoCombat's private match rules (VeilNet keeps them; see `set_echocombat`).
+    ec: EchoRules,
+    /// RULES page 1 (private capture maps): POINT UNLOCK, CAPTURE TIME,
+    /// starting points.
+    unlock: u32,
+    capture_secs: u32,
+    start_score: [u32; 2],
+}
+
+/// EchoCombat's private match rules as VeilNet has them: POINT RATE and
+/// PAYLOAD SPEED in quarters (4 = x1), and PAUSE (on, or counting back in).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EchoRules {
+    pub rate: u8,
+    pub payload_speed: u8,
+    pub paused: bool,
+}
+
+impl Default for EchoRules {
+    fn default() -> Self {
+        Self { rate: 4, payload_speed: 4, paused: false }
+    }
 }
 
 fn f(v: &Value, path: &str, def: f32) -> f32 {
@@ -874,7 +931,13 @@ impl Combat {
             to_beat: None,
             track_vars: track_vars(level),
             track_set: Vec::new(),
+            ec: EchoRules::default(),
+            unlock: 0,
+            capture_secs: 0,
+            start_score: [0; 2],
         };
+        c.unlock = f(&c.settings, "/capture_point/capture_point_lock_time", 45.0).round().clamp(0.0, MAX_UNLOCK as f32) as u32;
+        c.capture_secs = f(&c.settings, "/capture_point/time_to_capture", 4.0).round().clamp(0.0, MAX_CAPTURE as f32) as u32;
         c.clock = c.round_secs();
         c.countdown = f(&c.rules, "/round_rules/pre_match_wait_time", 30.0);
         Some(c)
@@ -905,7 +968,9 @@ impl Combat {
         }
         v.extend([
             (VAR_TEAM_ROOM, Val::Lo8(u8::from(self.team_room))),
-            (VAR_ROUND_OVER, Val::Lo32(u32::from(self.round_over))),
+            // (`combat_cease_fire`: every gear script reads it; EchoCombat's
+            // PAUSE holds it too.)
+            (VAR_ROUND_OVER, Val::Lo32(u32::from(self.round_over || self.paused()))),
             (VAR_POST_MATCH, Val::Lo32(u32::from(self.post_match))),
             (VAR_CELEBRATION, Val::Lo8(u8::from(self.celebrating))),
             (VAR_ROUND_COUNTER, Val::Lo32(u32::from(self.round))),
@@ -929,6 +994,11 @@ impl Combat {
             v.push((VAR_ORANGE_READY, Val::Lo8(u8::from(self.ready[1]))));
             v.push((VAR_RESTART_REQUEST[0], Val::Lo8(u8::from(self.restart_req[0]))));
             v.push((VAR_RESTART_REQUEST[1], Val::Lo8(u8::from(self.restart_req[1]))));
+            if self.capture.is_some() {
+                v.push((VAR_MS_BLUE, Val::Lo32(self.start_score[0])));
+                v.push((VAR_MS_RED, Val::Lo32(self.start_score[1])));
+                v.push((VAR_MS_TIME, Val::Lo32(self.unlock * 60 + self.capture_secs)));
+            }
         }
         self.script.vars(&mut v);
         v.extend(self.track_set.iter().copied());
@@ -1005,6 +1075,125 @@ impl Combat {
         self.private
     }
 
+    fn paused(&self) -> bool {
+        self.private && self.ec.paused
+    }
+
+    /// The capture point's lock (seconds from the round's begin) and its
+    /// time to capture: a private match's RULES, else the map's.
+    fn lock_time(&self) -> f32 {
+        if self.private { self.unlock as f32 } else { f(&self.settings, "/capture_point/capture_point_lock_time", 45.0) }
+    }
+
+    fn capture_time(&self) -> f32 {
+        if self.private {
+            // CAPTURE TIME 0: taken at once.
+            (self.capture_secs as f32).max(0.001)
+        } else {
+            f(&self.settings, "/capture_point/time_to_capture", 4.0).max(0.1)
+        }
+    }
+
+    /// Each team's points as a round begins (a private match's starting
+    /// points, else none).
+    fn start_points(&self) -> [f32; 2] {
+        if self.private { self.start_score.map(|s| s as f32) } else { [0.0; 2] }
+    }
+
+    /// A RULES page 1 press (`PRESS_*`): the value changes within its bounds
+    /// while a private capture match waits for ready. None: not a press.
+    pub fn rules_press(&mut self, sym: u64) -> Option<Vec<Out>> {
+        let step = |v: &mut u32, presses: [u64; 2], max: u32| {
+            if sym == presses[0] {
+                *v = (*v + 1).min(max);
+                true
+            } else if sym == presses[1] {
+                *v = v.saturating_sub(1);
+                true
+            } else {
+                false
+            }
+        };
+        let mut v = (self.start_score, self.unlock, self.capture_secs);
+        let press = step(&mut v.0[0], PRESS_BLUE, MAX_START_SCORE)
+            || step(&mut v.0[1], PRESS_RED, MAX_START_SCORE)
+            || step(&mut v.1, PRESS_MINUTES, MAX_UNLOCK)
+            || step(&mut v.2, PRESS_SECONDS, MAX_CAPTURE);
+        if !press {
+            return None;
+        }
+        if !self.private || self.capture.is_none() || self.phase != Phase::Waiting || self.starting.is_some() {
+            tracing::info!(sym = format_args!("{sym:#018x}"), "private combat RULES press ignored (not a capture match waiting for ready)");
+            return Some(Vec::new());
+        }
+        (self.start_score, self.unlock, self.capture_secs) = v;
+        if let Some(c) = self.capture.as_mut() {
+            c.points = self.start_score.map(|s| s as f32);
+        }
+        tracing::info!(start = ?self.start_score, unlock = self.unlock, capture = self.capture_secs, "private combat RULES");
+        Some(vec![self.event(EV_SETTING_SOUND)])
+    }
+
+    /// EchoCombat's RULES `T` as its clients take it (VeilNet `R`): the
+    /// unlock and capture time as one float, unlock * 60 + capture, for the
+    /// unlock countdown each client's capture point script says. 0 (unset,
+    /// the map's own) outside private capture matches.
+    pub fn rules_total(&self) -> u32 {
+        if self.private && self.capture.is_some() { ((self.unlock * 60 + self.capture_secs) as f32).to_bits() } else { 0 }
+    }
+
+    /// Whether an EchoCombat PAUSE may begin now: on a payload map only
+    /// while the payload is held (before it first moves, at a checkpoint, or
+    /// driving itself); otherwise it waits for the next checkpoint.
+    pub fn pause_ok(&self) -> bool {
+        match &self.payload {
+            Some(p) if self.phase == Phase::Playing => !p.moved || p.hold > 0.0 || p.autodrive_to.is_some(),
+            _ => true,
+        }
+    }
+
+    /// EchoCombat's rules (from VeilNet). A PAUSE puts the cease fire on, the
+    /// capture point back to neutral (its points kept) and stops every clock,
+    /// the payload and the points until the unpause countdown is over; then
+    /// the announcer says the match has started again.
+    pub fn set_echocombat(&mut self, ec: EchoRules) -> Vec<Out> {
+        let was = self.paused();
+        self.ec = ec;
+        let now = self.paused();
+        let mut out = Vec::new();
+        if now && !was {
+            tracing::info!(phase = ?self.phase, "EchoCombat PAUSE: cease fire, clocks stopped");
+            if let Some(c) = self.capture.as_mut()
+                && self.phase == Phase::Playing
+                && !c.locked
+            {
+                c.possession = NEUTRAL;
+                c.converting = NOBODY;
+                c.progress = [0.0; 2];
+                c.sent = None;
+                out.push(Out::Reliable(CAPTURE_RESET, Capture::id(self.level)));
+            }
+        } else if was && !now {
+            tracing::info!(phase = ?self.phase, "EchoCombat PAUSE over: the match goes on");
+            if matches!(self.phase, Phase::TeamRoom | Phase::RoundStart | Phase::Playing) {
+                out.push(Self::announcer(VO_MATCH_STARTED));
+            }
+        }
+        out
+    }
+
+    /// A combat announcer line, as a global event (the way native's own
+    /// team room cue goes out).
+    fn announcer(sym: u64) -> Out {
+        Out::Event(sym, u64::MAX, 0x0fff, FILTER_ALL)
+    }
+
+    /// A private match: "Round N" as its team room opens (the payload's
+    /// second half is round 2, after the teams swap).
+    fn announce_round(&self) -> Option<Out> {
+        (self.private && (1..=VO_ROUND.len() as u8).contains(&self.round)).then(|| Self::announcer(VO_ROUND[usize::from(self.round - 1)]))
+    }
+
     /// A private match's team (0 blue, 1 orange) pressed ready: native flips
     /// the flag (a second press un-readies). `Some(now ready)` if it counted
     /// (waiting for ready, the start not under way yet).
@@ -1078,8 +1267,10 @@ impl Combat {
         self.capture_reset_sent = false;
         self.early_lock = false;
         self.clock = self.round_secs();
+        let start = self.start_points();
         if let Some(c) = self.capture.as_mut() {
             c.reset();
+            c.points = start;
         }
         self.state = if self.private { ST_WAIT_FOR_READY } else { ST_PRE_MATCH };
         self.countdown = f(&self.rules, "/round_rules/pre_match_wait_time", 30.0);
@@ -1147,7 +1338,7 @@ impl Combat {
     /// The capture point's script vars (native Dyson and Combustion, to the
     /// frame): see the module notes.
     fn capture_vars(&self, c: &Capture) -> Vec<(u64, Val)> {
-        let to_capture = f(&self.settings, "/capture_point/time_to_capture", 4.0).max(0.1);
+        let to_capture = self.capture_time();
         let to_win = f(&self.settings, "/capture_point/points_to_win", 75.0).max(1.0);
         let playing = matches!(self.phase, Phase::Playing);
         let open = playing && !c.locked;
@@ -1280,6 +1471,10 @@ impl Combat {
             out.extend(self.restart());
             return out;
         }
+        if self.paused() && matches!(self.phase, Phase::TeamRoom | Phase::RoundStart | Phase::Playing) {
+            // EchoCombat PAUSE: everything stands still.
+            return out;
+        }
         match self.phase {
             Phase::Waiting if self.private => {
                 if !players.is_empty() && !self.loaded {
@@ -1307,6 +1502,7 @@ impl Combat {
                     self.to_states(&ST_TEAM_ROOM);
                     self.subphase = Some(SUB_TEAM_ROOM);
                     out.push(self.event(EV_TEAM_ROOM));
+                    out.extend(self.announce_round());
                     self.countdown = f(&self.rules, "/round_rules/team_room_wait_time", 15.0);
                 }
             }
@@ -1348,8 +1544,10 @@ impl Combat {
                 }
                 if self.capture.is_some() && self.round > 1 && !self.capture_reset_sent && self.countdown <= CAPTURE_RESET_BEFORE {
                     self.capture_reset_sent = true;
+                    let start = self.start_points();
                     if let Some(c) = self.capture.as_mut() {
                         c.reset();
+                        c.points = start;
                     }
                     out.push(Out::Reliable(CAPTURE_RESET, Capture::id(self.level)));
                 }
@@ -1387,7 +1585,13 @@ impl Combat {
 
     fn begin_round(&mut self) -> Vec<Out> {
         self.phase = Phase::Playing;
-        let lock = f(&self.settings, "/capture_point/capture_point_lock_time", 45.0);
+        let lock = self.lock_time();
+        let start = self.start_points();
+        if start.iter().any(|&s| s > 0.0) && self.capture.is_some() {
+            // Native (EchoCombat's scripts): the score shows the starting
+            // points from the round's begin.
+            self.points_shown = true;
+        }
         if let Some(c) = self.capture.as_mut() {
             // Locked for its time from the round's begin, nothing sent
             // meanwhile (native's first update: 45.0 s after EV_ROUND_BEGIN,
@@ -1473,10 +1677,12 @@ impl Combat {
             self.clock = self.round_secs();
             // Native Dyson: the points go back to 0 in the team room; the
             // volume itself (owner, progress) at its reset, 5 s before the round.
+            let start = self.start_points();
             if let Some(c) = self.capture.as_mut() {
-                c.points = [0.0; 2];
+                c.points = start;
             }
             out.extend([self.event(EV_NEXT_ROUND), Out::Unlock, self.event(EV_TEAM_ROOM), Out::RestoreBarriers]);
+            out.extend(self.announce_round());
             if self.payload.is_some() {
                 // A private payload match's second half: sides swap, the
                 // payload goes back to the start.
@@ -1520,6 +1726,7 @@ impl Combat {
         let mut reached: Option<usize> = None;
         let mut first_reach: Option<(u16, u16)> = None;
         let mut door_open = false;
+        let pspeed = if self.private { self.ec.payload_speed.max(1) } else { 4 };
         if let Some(p) = self.payload.as_mut() {
             let holders = &self.holders;
             let near = |team: u8| players.iter().filter(|(t, alive, _, slot)| *t == team && *alive && holders.contains(slot)).count() as u8;
@@ -1579,6 +1786,12 @@ impl Combat {
                 Some(t) => p.speed = (p.speed + PAYLOAD_ACCEL * dt).min(t),
             }
             let moving = if p.speed < 0.0 { p.speed * SLOW_REVERSE } else { p.speed };
+            // EchoCombat PAYLOAD SPEED (private): what the payload is moved by
+            // (its inner speed, claims and acceleration stay the game's).
+            let moving = moving * f32::from(pspeed) / 4.0;
+            if moving > 0.05 && !auto {
+                p.moved = true;
+            }
             if moving > 0.0 {
                 // (From the floor it is on the checkpoint again at once.)
                 p.dist = (p.dist.max(last_cp) + moving * dt).min(p.track.end());
@@ -1656,6 +1869,7 @@ impl Combat {
                     self.clock = self.clock.max(0.0) + added[p.next.min(1)];
                     self.in_overtime = false;
                     p.hold = celebrate[p.next.min(1)];
+                    p.moved = false;
                     let cp = p.track.checkpoints[p.next];
                     let upto = p.track.checkpoints.get(p.next + 1).copied().unwrap_or(f32::MAX);
                     if let Some(&to) = p.track.autodrive.iter().find(|&&d| d > cp && d < upto) {
@@ -1743,8 +1957,10 @@ impl Combat {
 
     /// The capture point: claims, conversion, points (see the module notes).
     fn run_capture(&mut self, dt: f32, players: &[Player]) -> (Vec<Out>, Option<Winner>) {
-        let to_capture = f(&self.settings, "/capture_point/time_to_capture", 4.0).max(0.1);
+        let to_capture = self.capture_time();
         let to_win = f(&self.settings, "/capture_point/points_to_win", 75.0);
+        // EchoCombat POINT RATE (private): how fast a held point's points rise.
+        let point_rate = if self.private { f32::from(self.ec.rate.max(1)) / 4.0 } else { 1.0 };
         let unclaimed = f(&self.settings, "/capture_point/unclaimed_accrual_multiplier", 0.5);
         let needs_claim = self.settings.pointer("/capture_point/point_accrual_requires_claim").and_then(Value::as_bool).unwrap_or(false);
         let space = self.level;
@@ -1806,7 +2022,7 @@ impl Combat {
                 } else {
                     unclaimed
                 };
-                c.points[t] = (c.points[t] + rate * dt).min(to_win);
+                c.points[t] = (c.points[t] + rate * point_rate * dt).min(to_win);
                 self.points_shown = true;
             }
         }
@@ -2737,6 +2953,139 @@ mod tests {
         assert_eq!(c.team_ready(0), None);
         run(&mut c, 0.2, &orange);
         assert_eq!(c.phase, Phase::PreMatch);
+    }
+
+    #[test]
+    fn rules_symbols_are_the_names() {
+        use crate::sns::symbol;
+        assert_eq!(PRESS_BLUE, [symbol("nevt_increment_initial_blue_score"), symbol("nevt_decrement_initial_blue_score")]);
+        assert_eq!(PRESS_RED, [symbol("nevt_increment_initial_red_score"), symbol("nevt_decrement_initial_red_score")]);
+        assert_eq!(PRESS_MINUTES, [symbol("nevt_increment_round_time_minutes"), symbol("nevt_decrement_round_time_minutes")]);
+        assert_eq!(PRESS_SECONDS, [symbol("nevt_increment_round_time_seconds"), symbol("nevt_decrement_round_time_seconds")]);
+        assert_eq!(EV_SETTING_SOUND, symbol("nevt_sfx_prv_match_settings_change"));
+        assert_eq!(VAR_MS_BLUE, symbol("net_match_settings_blue_score"));
+        assert_eq!(VAR_MS_RED, symbol("net_match_settings_red_score"));
+        assert_eq!(VAR_MS_TIME, symbol("net_match_settings_round_time_in_seconds"));
+        assert_eq!(VAR_ROUND_OVER, symbol("combat_cease_fire"));
+        assert_eq!(VO_MATCH_STARTED, symbol("evt_vo_anc_match_started"));
+        for (k, v) in VO_ROUND.iter().enumerate() {
+            assert_eq!(*v, symbol(&format!("evt_vo_anc_round_{:02}", k + 1)));
+        }
+    }
+
+    /// EchoCombat's RULES page 1 in a private capture match: starting points,
+    /// POINT UNLOCK and CAPTURE TIME (0 = at once), within their bounds and
+    /// only while waiting for ready.
+    #[test]
+    fn private_rules_set_the_capture_point() {
+        let mut c = capture_map(LEVEL_DYSON);
+        assert!(c.rules_press(PRESS_BLUE[0]).is_some_and(|v| v.is_empty()), "public: ignored");
+        assert_eq!(c.start_score, [0, 0]);
+        c.set_private();
+        assert_eq!((c.unlock, c.capture_secs), (45, 4), "the map's own to begin with");
+        assert_eq!(var(&c, VAR_MS_TIME), Some(Val::Lo32(45 * 60 + 4)));
+        assert_eq!(c.rules_total(), (2704.0f32).to_bits());
+        assert!(c.rules_press(0x1234).is_none());
+        for _ in 0..80 {
+            c.rules_press(PRESS_RED[0]);
+        }
+        c.rules_press(PRESS_BLUE[0]);
+        let v = c.rules_press(PRESS_BLUE[0]).expect("a press");
+        assert!(matches!(v[..], [Out::Event(EV_SETTING_SOUND, ..)]));
+        assert_eq!(c.start_score, [2, 74], "75 would win");
+        for _ in 0..50 {
+            c.rules_press(PRESS_MINUTES[1]);
+        }
+        c.rules_press(PRESS_MINUTES[0]);
+        for _ in 0..4 {
+            c.rules_press(PRESS_SECONDS[1]);
+        }
+        assert_eq!((c.unlock, c.capture_secs), (1, 0));
+        assert_eq!(var(&c, VAR_MS_BLUE), Some(Val::Lo32(2)));
+        assert_eq!(c.rules_total(), (60.0f32).to_bits());
+        // Into the round: the starting points, unlocked after 1 s, taken at once.
+        c.team_ready(1);
+        let orange = (1u8, true, Some([0.0, 0.0, 0.0]), 3);
+        run(&mut c, 3.5, &[orange]);
+        assert_eq!(c.phase, Phase::TeamRoom);
+        assert!(c.rules_press(PRESS_BLUE[0]).is_some_and(|v| v.is_empty()), "only before the start");
+        run(&mut c, 15.0, &[orange]);
+        assert_eq!(c.phase, Phase::Playing);
+        assert_eq!(c.capture.as_ref().map(|p| p.points), Some([2.0, 74.0]));
+        run(&mut c, 1.1, &[orange]);
+        run(&mut c, 0.1, &[orange]);
+        assert_eq!(c.capture.as_ref().map(|p| p.possession), Some(1), "taken at once");
+        assert_eq!(var(&c, VAR_CAP_POINTS[1]).is_some(), true, "the score shows");
+        let mut won = false;
+        for _ in 0..30 {
+            won |= run(&mut c, 0.1, &[orange]).iter().any(|o| matches!(o, Out::Event(EV_OVER_C, ..)));
+        }
+        assert!(won, "one point short at the start: the round is soon over");
+    }
+
+    /// EchoCombat PAUSE: the cease fire on, the point neutral (its points
+    /// kept), every clock still; the unpause ends with "match started".
+    /// POINT RATE scales the points.
+    #[test]
+    fn echocombat_pause_and_point_rate() {
+        let mut c = capture_map(LEVEL_DYSON);
+        c.set_private();
+        let orange = (1u8, true, Some([0.0, 0.0, 0.0]), 3);
+        c.team_ready(1);
+        let v = run(&mut c, 3.5, &[orange]);
+        assert!(v.iter().any(|o| *o == Combat::announcer(VO_ROUND[0])), "round one");
+        run(&mut c, 16.0, &[orange]);
+        run(&mut c, 50.0, &[orange]);
+        assert_eq!(c.capture.as_ref().map(|p| p.possession), Some(1));
+        let before = c.capture.as_ref().map(|p| p.points[1]).expect("points");
+        c.set_echocombat(EchoRules { rate: 8, ..EchoRules::default() });
+        run(&mut c, 1.0, &[orange]);
+        let after = c.capture.as_ref().map(|p| p.points[1]).expect("points");
+        assert!((after - before - 2.0).abs() < 0.05, "x2: {before} -> {after}");
+        let clock = c.clock;
+        let v = c.set_echocombat(EchoRules { rate: 8, payload_speed: 4, paused: true });
+        assert!(v.iter().any(|o| matches!(o, Out::Reliable(CAPTURE_RESET, _))));
+        assert_eq!(c.capture.as_ref().map(|p| p.possession), Some(NEUTRAL));
+        assert_eq!(var(&c, VAR_ROUND_OVER), Some(Val::Lo32(1)), "cease fire");
+        run(&mut c, 30.0, &[orange]);
+        assert_eq!(c.clock, clock);
+        assert_eq!(c.capture.as_ref().map(|p| p.points[1]), Some(after));
+        let v = c.set_echocombat(EchoRules { rate: 8, payload_speed: 4, paused: false });
+        assert!(v.contains(&Combat::announcer(VO_MATCH_STARTED)));
+        assert_eq!(var(&c, VAR_ROUND_OVER), Some(Val::Lo32(0)));
+        run(&mut c, 1.0, &[orange]);
+        assert!(c.clock < clock);
+        // A public match takes none of it.
+        let mut c = capture_map(LEVEL_DYSON);
+        c.set_echocombat(EchoRules { rate: 8, payload_speed: 4, paused: true });
+        assert!(!c.paused());
+    }
+
+    /// Payload maps: PAYLOAD SPEED scales how far it moves; a PAUSE may only
+    /// begin while it is held.
+    #[test]
+    fn echocombat_payload_speed_and_pause_only_when_held() {
+        let mut c = playing(fission());
+        c.set_private();
+        c.phase = Phase::Playing;
+        assert!(c.pause_ok(), "not moved yet");
+        let me = on_payload(&mut c, 1);
+        run(&mut c, 1.5, &[me]);
+        let d1 = c.payload_dist().expect("dist");
+        assert!(!c.pause_ok(), "moving");
+        let mut c2 = playing(fission());
+        c2.set_private();
+        c2.phase = Phase::Playing;
+        c2.set_echocombat(EchoRules { rate: 4, payload_speed: 8, paused: false });
+        let me = on_payload(&mut c2, 1);
+        run(&mut c2, 1.5, &[me]);
+        let d2 = c2.payload_dist().expect("dist");
+        assert!((d2 - 2.0 * d1).abs() < 0.05, "x2: {d1} -> {d2}");
+        // Paused: it stands still.
+        c2.set_echocombat(EchoRules { rate: 4, payload_speed: 8, paused: true });
+        let me = on_payload(&mut c2, 1);
+        run(&mut c2, 3.0, &[me]);
+        assert_eq!(c2.payload_dist(), Some(d2));
     }
 
     /// Native: a private match stays on the personal stats; a rematch goes

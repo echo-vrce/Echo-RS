@@ -408,6 +408,8 @@ fn hex(s: &str) -> Vec<u8> {
 pub struct Captured {
     pub ids: Vec<(u64, Vec<u8>)>,
     pub balance: Vec<(u64, Vec<u8>)>,
+    /// The same for games without EchoCombat (stock gear tables).
+    pub balance_stock: Vec<(u64, Vec<u8>)>,
     pub baselines: Vec<(u64, Vec<Vec<u8>>)>,
     pub private_ids: Vec<u8>,
     pub private_baseline: Vec<Vec<u8>>,
@@ -442,6 +444,14 @@ pub fn captured() -> &'static Captured {
             (super::combat::LEVEL_COMBUSTION, super::balance::apply(hex(include_str!("data/combat_combustion_balance.hex")))),
             (super::combat::LEVEL_FISSION, super::balance::apply(hex(include_str!("data/combat_fission_balance.hex")))),
             (super::combat::LEVEL_GAUSS, super::balance::apply(hex(include_str!("data/combat_gauss_balance.hex")))),
+        ],
+        balance_stock: vec![
+            (LEVEL_SOCIAL, super::balance::apply_stock(hex(include_str!("data/balance_settings_mass_update.hex")))),
+            (LEVEL_ARENA, super::balance::apply_stock(hex(include_str!("data/balance_settings_arena_4bbc.hex")))),
+            (super::combat::LEVEL_DYSON, super::balance::apply_stock(hex(include_str!("data/combat_dyson_balance.hex")))),
+            (super::combat::LEVEL_COMBUSTION, super::balance::apply_stock(hex(include_str!("data/combat_combustion_balance.hex")))),
+            (super::combat::LEVEL_FISSION, super::balance::apply_stock(hex(include_str!("data/combat_fission_balance.hex")))),
+            (super::combat::LEVEL_GAUSS, super::balance::apply_stock(hex(include_str!("data/combat_gauss_balance.hex")))),
         ],
         baselines: vec![
             (LEVEL_SOCIAL, vec![hex(include_str!("data/replicated_delta_unreliable_vars_045c.hex"))]),

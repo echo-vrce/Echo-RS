@@ -8,9 +8,13 @@
 //! (settings, logs, `server-data`, `echocombat.ini`).
 //!
 //! A release is re-uploaded under the same tag, so "installed" is the asset's
-//! upload time, kept in `update-state.json`. The files are swapped only while
-//! the server is stopped; a running executable is renamed aside (`*.old`) and
-//! removed at the next start.
+//! upload time, kept in `update-state.json`. The launcher checks again every
+//! 30 minutes while it runs. The files are swapped only while the server is
+//! stopped: a downloaded release first drains a running server (its matches
+//! take nobody new and finish, idle game servers stop, and it exits once all
+//! are empty), then goes in, and the servers start again on their own; when
+//! the launcher itself changed, the new launcher starts and takes over. A
+//! running executable is renamed aside (`*.old`) and removed at the next start.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -223,6 +227,13 @@ impl Updater {
         let this = self.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<Status, String> {
+                // Debug builds only: a local zip stands in for the newest release.
+                #[cfg(debug_assertions)]
+                if let Ok(p) = std::env::var("ERS_UPDATE_FROM_ZIP") {
+                    let zip = std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?;
+                    this.inner.lock().expect("updater").pending = Some(("local-test".into(), String::new(), zip));
+                    return Ok(Status::Ready("local-test".into()));
+                }
                 let (tag, updated, url) = latest()?;
                 let have: Installed = std::fs::read_to_string(state_path(&dir)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
                 if have.tag == tag && have.asset_updated_at == updated {

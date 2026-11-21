@@ -139,6 +139,9 @@ impl Upstreams {
             .map(|e| *e.key())
             .collect()
     }
+    pub fn busy_ids(&self) -> Vec<u32> {
+        self.instances.iter().filter(|e| e.busy.load(Ordering::Relaxed)).map(|e| *e.key()).collect()
+    }
     pub fn busy_count(&self) -> usize {
         self.instances.iter().filter(|e| e.busy.load(Ordering::Relaxed)).count()
     }

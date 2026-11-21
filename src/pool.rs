@@ -78,9 +78,60 @@ impl Pool {
             }
             self.reap_dead();
             self.hub.reap();
+            if engine::draining() {
+                self.drain_pass().await;
+                if self.count() == 0 {
+                    info!("drained: every game server is stopped");
+                    return;
+                }
+                continue;
+            }
             if let Err(e) = self.rebalance().await {
                 warn!(error = %e, "pool rebalance failed");
             }
+        }
+    }
+
+    /// Draining: stop every game server that has no session; the busy ones
+    /// go on a later pass, once their players have left.
+    async fn drain_pass(&self) {
+        let idle: Vec<u32> = {
+            let instances = self.instances.lock();
+            match self.upstreams.backend {
+                Backend::Builtin => {
+                    let snap = self.hub.embedded_snapshot();
+                    instances
+                        .iter()
+                        .filter(|(_, i)| !snap.iter().any(|(p, idle)| *p == i.inst.port && idle.is_none()))
+                        .map(|(idx, _)| *idx)
+                        .collect()
+                }
+                _ => {
+                    let busy = self.upstreams.busy_ids();
+                    instances.keys().copied().filter(|i| !busy.contains(i)).collect()
+                }
+            }
+        };
+        let busy = self.count() - idle.len();
+        if !idle.is_empty() {
+            info!(stopping = idle.len(), still_in_use = busy, "draining for an update");
+        }
+        for idx in idle {
+            let port = match self.instances.lock().get(&idx) {
+                Some(i) => i.inst.port,
+                None => continue,
+            };
+            // Registered and idle: take it off the list first so no lobby
+            // lands on it; not registered at all: nothing can.
+            if matches!(self.upstreams.backend, Backend::Builtin)
+                && self.hub.embedded_snapshot().iter().any(|(p, _)| *p == port)
+                && !self.hub.retire_port(port)
+            {
+                continue; // got a lobby meanwhile
+            }
+            let Some(slot) = self.instances.lock().remove(&idx) else { continue };
+            crate::upnp::close(crate::upnp::Proto::Udp, port);
+            slot.inst.stop().await;
         }
     }
 
