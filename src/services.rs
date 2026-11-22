@@ -289,7 +289,7 @@ async fn handle(app: &App, conn: &mut Conn, msg: ClientMessage, q: &HashMap<Stri
     Ok(())
 }
 
-// ─── Fleet socket (nevr game servers register here) ─────────────────────────
+// ─── Fleet socket (game servers register here) ──────────────────────────────
 
 async fn fleet_ws(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketAddr>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |s| fleet_socket(app, s, addr)).into_response()
@@ -301,7 +301,7 @@ async fn fleet_socket(app: App, socket: WebSocket, addr: SocketAddr) {
         IpAddr::V6(v) => v.to_ipv4_mapped().unwrap_or(Ipv4Addr::LOCALHOST),
     };
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<nevr_proto::Envelope>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::wire::pb::Envelope>();
     let writer = tokio::spawn(async move {
         while let Some(env) = rx.recv().await {
             if sink.send(Message::Binary(env.encode_to_vec())).await.is_err() {
@@ -317,7 +317,7 @@ async fn fleet_socket(app: App, socket: WebSocket, addr: SocketAddr) {
             }
             continue;
         };
-        let env = match nevr_proto::Envelope::decode(data.as_slice()) {
+        let env = match crate::wire::pb::Envelope::decode(data.as_slice()) {
             Ok(e) => e,
             Err(e) => {
                 warn!(%addr, error = %e, "bad fleet envelope");
@@ -325,7 +325,7 @@ async fn fleet_socket(app: App, socket: WebSocket, addr: SocketAddr) {
             }
         };
         match &env.message {
-            Some(nevr_proto::envelope::Message::GameServerRegistration(reg)) if server_id.is_none() => {
+            Some(crate::wire::pb::envelope::Message::GameServerRegistration(reg)) if server_id.is_none() => {
                 server_id = Some(app.hub.register_server(tx.clone(), reg, peer_ip));
             }
             _ => {

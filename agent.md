@@ -352,7 +352,7 @@ The user's order: **Combat lobby first** (`mpl_lobby_b_combat`, symbol
 - Game ports: use 7000+ for the server's UDP range; Echo clients bind near 6792 and a
   server holding those ports breaks "Broadcaster initialization".
 - Sources to compare against: `J:\EchoVR-Tools-Launcher\nakama3` (nakama, `server/evr`),
-  `J:\EchoVR-Tools-Launcher\EchoRelay`, `J:\EchoVR-Tools-Launcher\nevr-server-rs` (protos).
+  `J:\EchoVR-Tools-Launcher\EchoRelay`. The fleet protobuf messages are ours, in `src/wire/pb.rs`.
 
 ## Ninth pass (Fury feel, lobby vars, stun)
 

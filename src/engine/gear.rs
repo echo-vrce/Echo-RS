@@ -32,12 +32,12 @@ use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use rad_protocol::symbol::MatSym;
+use crate::wire::symbol::mat_sym;
 use serde_json::Value;
 use tracing::{debug, info};
 
 const fn h(name: &str) -> u64 {
-    MatSym::hash(name).data
+    mat_sym(name)
 }
 
 pub const TELEPORT_REQUEST: u64 = h("SR15NetGameplayTeleportPlayerRequest");
@@ -2665,7 +2665,9 @@ impl Gear {
                     }
                     continue;
                 }
-                let fresh: Vec<Hit> = hits.into_iter().filter(|h| !f.hit.contains(&h.0) && !h.3.is_some_and(|a| self.immune(&a, "stun_imm"))).collect();
+                // Never its own thrower: the field opens where the grenade was last
+                // seen, which on a short throw is still the thrower's hand.
+                let fresh: Vec<Hit> = hits.into_iter().filter(|h| h.3 != Some(f.thrower) && !f.hit.contains(&h.0) && !h.3.is_some_and(|a| self.immune(&a, "stun_imm"))).collect();
                 if fresh.is_empty() {
                     ready.push((f.thrower, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &f.kind, &f.mag].concat())));
                 }
@@ -4102,6 +4104,24 @@ mod tests {
         assert!(mid > 2.5 && mid < 4.0, "{mid}");
         assert!((stun_reach(Duration::from_secs(1)) - 4.0).abs() < 0.01);
         assert!((stun_reach(Duration::MAX) - 4.0).abs() < 0.01);
+    }
+
+    /// A STUN FIELD never stuns its own thrower, even one standing in it
+    /// (it opens where the grenade was last seen: on a short throw, the hand).
+    #[test]
+    fn stun_field_spares_its_thrower() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        let at = g.bodies[&me].1;
+        let p = g.bodies[&them].0;
+        g.bodies.insert(them, (p, [at[0] + 1.0, at[1], at[2]]));
+        g.fields.push(Field { kind: EX_STUN, mag: [0; 8], at: [at[0], at[1] - 1.5, at[2]], thrower: me, until: t0 + Duration::from_secs(6), next: t0, every: Duration::from_millis(8), radius: 4.0, start: t0, hit: Vec::new() });
+        g.due(t0 + Duration::from_secs(1));
+        let mine = g.id_of(&me, g.bodies[&me].0);
+        let hit = &g.fields[0].hit;
+        assert!(hit.contains(&g.id_of(&them, p)), "the enemy");
+        assert!(!hit.contains(&mine), "not the thrower");
     }
 
     /// Cheat death follows the settings: EchoCombat's 5 s by default.

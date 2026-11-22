@@ -9,9 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use nevr_proto::rtapi::v1 as pb;
-use nevr_proto::rtapi::v1::envelope::Message as Em;
-use rad_protocol::codec::decoder::DecodedMessage;
+use crate::wire::pb;
+use crate::wire::pb::envelope::Message as Em;
+use crate::wire::codec::DecodedMessage;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -328,6 +328,9 @@ const EV_SD_CALLED: u64 = 0x0ae9_dc18_2d5a_c591;
 const SD_NEW_ROUND_SECS: f32 = 5.0;
 /// From a public match's return to lobby to the session's end.
 const PUBLIC_END_GRACE: Duration = Duration::from_secs(5);
+/// How long a finished public match waits for someone who joined after it
+/// ended to load in and be sent back to the lobby.
+const LATE_JOIN_GRACE: Duration = Duration::from_secs(20);
 /// A match with only spectators in it, before any player has joined a team,
 /// ends after this long (the host, 2026-11-20). Once players have been in it,
 /// it ends as soon as only spectators are left.
@@ -374,8 +377,8 @@ fn wire_clock() -> (u64, u64) {
     (frame, t0 + (frame - f0) * tick)
 }
 
-/// Goal-cycle graph states the fresh round start reuses (names from nevr's
-/// `ARENA_GOAL_STATES` recovery).
+/// Goal-cycle graph states the fresh round start reuses (the arena's goal
+/// state graph, `ARENA_GOAL_STATES`).
 const ST_PRE_LAUNCH_ENTER: u64 = ST_GOAL[8];
 
 // ── Arena rules ────────────────────────────────────────────────────────────
@@ -1314,6 +1317,9 @@ pub struct Session {
     /// ends at this time whoever is still here, so the server goes idle and
     /// nobody (a `-lobbyid` join, the matchmaker) lands in the finished game.
     close_at: Option<Instant>,
+    /// A finished public match's "return to lobby" event, as sent: anyone who
+    /// joins after it gets it too, so their game goes to the lobby.
+    return_ev: Option<Vec<u8>>,
     /// A player has been on a team in this match (not just spectators).
     had_players: bool,
     /// Since when only spectators have been in a match nobody has played yet.
@@ -1448,8 +1454,8 @@ fn hex_str(d: &[u8]) -> String {
 }
 
 /// Native originates one `SR15NetPooledActorDestroy` for every pooled actor
-/// a client creates, its body bytes 40..56 of the create (nevr-server-rs's
-/// measurement of a native 4v4, issue #490). Without it pooled actors are
+/// a client creates, its body bytes 40..56 of the create (measured
+/// in a native 4v4). Without it pooled actors are
 /// never returned to their pool.
 const POOLED_DESTROY_WINDOW: std::ops::Range<usize> = 40..56;
 
@@ -1600,6 +1606,7 @@ impl Session {
             last_activity: Instant::now(),
             ever_joined: false,
             close_at: None,
+            return_ev: None,
             had_players: false,
             spectators_since: None,
             muted: HashSet::new(),
@@ -2124,11 +2131,18 @@ impl Session {
             self.reliable_to(from, DISCONNECT, &[]);
             return;
         }
-        // The match is over and the session about to end: a player let in
-        // now loads into a match that closes on them a moment later, and
-        // their game was left at "matchmaker unavailable". Refused as a full
-        // lobby is, their game asks the matchmaker for another.
-        if self.close_at.is_some() {
+        // The match is over and the session about to end, but the matchmaker
+        // still sends people (spectators especially). Let in, a game loaded
+        // a match that closed on it ("matchmaker unavailable"); refused, it
+        // showed "Server is locked". So a public match that sent everyone
+        // back lets them in, keeps going until they've loaded, and sends
+        // them back to the lobby too (`send_join_sequence`).
+        if let Some(t) = self.close_at
+            && self.return_ev.is_some()
+        {
+            self.close_at = Some(t.max(Instant::now() + LATE_JOIN_GRACE));
+            info!(%from, "match over: late joiner goes back to the lobby once loaded");
+        } else if self.close_at.is_some() {
             let mut rej = [0u8; 20];
             rej[16] = 4;
             self.reliable_to(from, JOIN_REJECTED, &rej);
@@ -2319,6 +2333,12 @@ impl Session {
             p.t.trace = tracing::enabled!(tracing::Level::DEBUG);
         }
         info!(%addr, slot, team, players = self.player_count(), "player joined");
+        if self.close_at.is_some()
+            && let Some(ev) = self.return_ev.clone()
+        {
+            self.reliable_to(addr, COMPONENT_EVENT, &ev);
+            info!(%addr, "match over: sent back to the lobby");
+        }
     }
 
     /// A client's own lobby data (native): stored, and given to everyone,
@@ -3056,15 +3076,39 @@ impl Session {
         if self.had_players {
             if !connecting {
                 info!(spectators = watchers, "every player left, only spectators remain: the session ends");
-                self.close_at = Some(now);
+                self.end_for_spectators(now);
             }
             return;
         }
         let since = *self.spectators_since.get_or_insert(now);
         if now.duration_since(since) >= SPECTATORS_ONLY_GRACE {
             info!(spectators = watchers, grace = ?SPECTATORS_ONLY_GRACE, "no player joined a team, only spectators: the session ends");
-            self.close_at = Some(now);
+            self.end_for_spectators(now);
         }
+    }
+
+    /// A spectators-only match ends as a finished one does: everyone gets
+    /// the return to lobby event (a spectator's game then finds another
+    /// match), late joiners get it too, and the session ends
+    /// `PUBLIC_END_GRACE` later. Without it, spectators were cut off and
+    /// late joiners refused ("Server is locked").
+    fn end_for_spectators(&mut self, now: Instant) {
+        let ev = match self.combat.as_mut() {
+            Some(c) => c.return_to_lobby().into_iter().find_map(|o| match o {
+                super::combat::Out::Event(sym, module, handle, filter) => Some(component_event(sym, module, handle, filter)),
+                _ => None,
+            }),
+            None => Some(component_event(EV_RETURN_TO_LOBBY, MOD_MATCH, self.handles.for_module(MOD_MATCH), FILTER_ALL)),
+        };
+        let Some(ev) = ev else {
+            self.close_at = Some(now);
+            return;
+        };
+        for a in self.joined() {
+            self.reliable_to(a, COMPONENT_EVENT, &ev);
+        }
+        self.return_ev = Some(ev.to_vec());
+        self.close_at = Some(now + PUBLIC_END_GRACE);
     }
 
     /// Whether a finished public match's session is due to end (see `close_at`).
@@ -3506,6 +3550,9 @@ impl Session {
                         self.public_match_over();
                     }
                     let ev = component_event(sym, module, handle, filter);
+                    if sym == super::msg::EV_RETURN_TO_LOBBY && self.combat.as_ref().is_some_and(|c| !c.is_private()) {
+                        self.return_ev = Some(ev.to_vec());
+                    }
                     for a in self.joined() {
                         self.reliable_to(a, COMPONENT_EVENT, &ev);
                     }
@@ -3717,6 +3764,9 @@ impl Session {
                         self.public_match_over();
                     }
                     let ev = component_event(sym, module, handles.for_module(module), filter);
+                    if sym == EV_RETURN_TO_LOBBY && !self.arena.private {
+                        self.return_ev = Some(ev.to_vec());
+                    }
                     for a in &joined {
                         if let Some(p) = self.peers.get_mut(a) {
                             p.t.queue_reliable(COMPONENT_EVENT, &ev);
@@ -4699,7 +4749,14 @@ impl Session {
             self.peers
                 .iter()
                 .filter(|(_, p)| p.stage == Stage::Joined)
-                .filter_map(|(addr, p)| Some((msg::entrant_hold_var(p.generation.unwrap_or(p.genidx), p.slot?)?, u64::from(!self.gear.alive(*addr)))))
+                .filter_map(|(addr, p)| {
+                    let var = msg::entrant_hold_var(p.generation.unwrap_or(p.genidx), p.slot?);
+                    if var.is_none() && server_frame % frame_hz() == 0 {
+                        // Its game keeps its own cease fire: gun folded away.
+                        warn!(%addr, slot = ?p.slot, generation = ?p.generation, genidx = p.genidx, "no cease fire var for this entrant");
+                    }
+                    Some((var?, u64::from(!self.gear.alive(*addr))))
+                })
                 .collect()
         } else {
             Vec::new()
@@ -4977,6 +5034,15 @@ impl Session {
             let filter = if d.len() >= 20 { u16::from_le_bytes([d[18], d[19]]) } else { 0 };
             if d.len() == 24 && filter == FILTER_ALL_ALT {
                 self.relay_reliable(from, COMPONENT_EVENT, d, false);
+                if sym == super::combat::EV_GEAR_ACTIVE
+                    && let Some(c) = self.combat.as_mut()
+                {
+                    // Native's server answers with the show event (the
+                    // others' guns come on).
+                    let outs = c.gear_active();
+                    info!(%from, n = outs.len(), "combat gear active: show sent");
+                    self.combat_outs(outs);
+                }
             }
             // The level scripts' reaction to the server-only ones (native's
             // doors, the war room's objects, area triggers set level vars).
@@ -5259,6 +5325,27 @@ mod server_mute_tests {
         assert_eq!(a.round_counter(), 0);
     }
 
+    /// Someone the matchmaker sends after a public match ended is let in,
+    /// sent back to the lobby once loaded, and the session waits for them.
+    #[test]
+    fn a_late_joiner_is_sent_back_to_the_lobby() {
+        let info = SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL };
+        let mut s = Session::new(info, 1);
+        s.public_match_over();
+        s.return_ev = Some(vec![7; 4]);
+        let addr: SocketAddr = "10.0.0.9:6794".parse().unwrap();
+        let mut p = joined_peer(Uuid::new_v4());
+        p.stage = Stage::Handshake;
+        s.peers.insert(addr, p);
+        let mut req = vec![0u8; 41];
+        req[37..41].copy_from_slice(&2u32.to_le_bytes());
+        s.on_join_request(addr, &req);
+        assert_eq!(s.peers[&addr].stage, Stage::AwaitingAccept, "let in");
+        assert!(s.close_at.is_some_and(|t| t > Instant::now() + Duration::from_secs(15)), "waits for them");
+        s.send_join_sequence(addr);
+        assert!(s.peers[&addr].t.queued_reliable.iter().any(|(ty, d)| *ty == COMPONENT_EVENT && d == &vec![7u8; 4]));
+    }
+
     /// A finished public match ends its session a little after everyone is
     /// sent back to the lobby, whoever is still connected.
     #[test]
@@ -5312,7 +5399,9 @@ mod server_mute_tests {
         // ... then every player leaves: it ends at once.
         s.peers.remove(&b);
         s.watch_spectators(at(61));
-        assert_eq!(s.close_at, Some(at(61)));
+        assert_eq!(s.close_at, Some(at(61) + PUBLIC_END_GRACE));
+        // The spectators (and anyone joining now) get the return to lobby.
+        assert!(s.return_ev.as_deref().is_some_and(|e| e[..8] == msg::EV_RETURN_TO_LOBBY.to_le_bytes()));
 
         // The social lobby is never closed for it.
         let mut s = Session::new(SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL }, 1);

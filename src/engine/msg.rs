@@ -1,31 +1,30 @@
 //! Message type ids (MatSym hashes of the C++ type names), replicated-variable
 //! and event symbols, and the captured payloads the client needs verbatim.
 
-use rad_protocol::message::MsgType as M;
-use rad_protocol::symbol::MatSym;
+use crate::wire::symbol::{mat_sym, symbol_from};
 
 const fn h(name: &str) -> u64 {
-    MatSym::hash(name).data
+    mat_sym(name)
 }
 
-pub const CONNECT: u64 = M::SBROADCASTER_CONNECT_EVENT.data();
-pub const ENCODING_SUPPORT: u64 = M::SBROADCASTER_MSG_ENCODING_SUPPORT_EVENT_1.data();
-pub const ENCODING_FAIL: u64 = M::SBROADCASTER_MSG_ENCODING_FAIL_EVENT.data();
-pub const ENABLE_COMPRESSION: u64 = M::SBROADCASTER_ENABLE_COMPRESSION_EVENT_1.data();
-pub const PING_UPDATE: u64 = M::SBROADCASTER_PING_UPDATE.data();
-pub const KEEPALIVE: u64 = M::SBROADCASTER_NOOP_KEEPALIVE.data();
-pub const DISCONNECT: u64 = M::SBROADCASTER_DISCONNECT_EVENT.data();
+pub const CONNECT: u64 = h("SBroadcasterConnectEvent");
+pub const ENCODING_SUPPORT: u64 = h("SBroadcasterMsgEncodingSupportEvent_1");
+pub const ENCODING_FAIL: u64 = h("SBroadcasterMsgEncodingFailEvent");
+pub const ENABLE_COMPRESSION: u64 = h("SBroadcasterEnableCompressionEvent_1");
+pub const PING_UPDATE: u64 = h("SBroadcasterPingUpdate");
+pub const KEEPALIVE: u64 = 0;
+pub const DISCONNECT: u64 = h("SBroadcasterDisconnectEvent");
 pub const RELIABLE_BATCH: u64 = h("SBroadcasterReliableBatchEvent");
 
-pub const JOIN_REQUEST: u64 = M::SNS_LOBBY_JOIN_REQUEST_V4.data();
-pub const JOIN_REJECTED: u64 = M::SNS_LOBBY_JOIN_REJECTED_INTERNAL.data();
+pub const JOIN_REQUEST: u64 = h("SNSLobbyJoinRequestv4");
+pub const JOIN_REJECTED: u64 = h("SNSLobbyJoinRejectedInternal");
 pub const JOIN_SETUP: u64 = h("SNSLobbyJoinSetup");
 pub const JOIN_ACCEPTED: u64 = h("SNSLobbyJoinAcceptedv2");
 pub const JOIN_COMPLETE: u64 = h("SNSLobbyJoinComplete");
 pub const OWNER_STATE: u64 = h("SNSLobbyOwnerState");
 pub const HOST_STATE: u64 = h("SNSLobbyHostState");
-pub const ENTRANT_STATE: u64 = M::SNS_LOBBY_ENTRANT_STATE_V2.data();
-pub const ENTRANT_REMOVED: u64 = M::SNS_LOBBY_ENTRANT_REMOVED.data();
+pub const ENTRANT_STATE: u64 = h("SNSLobbyEntrantStatev2");
+pub const ENTRANT_REMOVED: u64 = h("SNSLobbyEntrantRemoved");
 /// A lobby entrant's key/value data. Client -> server `[slot u64][key u64][data][u16]`;
 /// server -> everyone (the sender too) `[sender slot u64][key u64][data]`
 /// (netrec-native-srv-1201 and its client netrec-lobby-ours-1959; netrec-lobby-native-20261118).
@@ -53,38 +52,38 @@ pub const UPDATE_PINGS: u64 = h("SNSLobbyUpdatePings");
 pub const ITEM_EQUIPPED: u64 = h("SR15NetItemEquippedNotification");
 /// Client -> server after an equip (4 bytes); native sends nothing back.
 pub const SAVE_LOADOUT_REQUEST: u64 = h("SR15NetSaveLoadoutRequest");
-pub const REFRESH_PROFILE: u64 = M::SNS_REFRESH_PROFILE_FROM_SERVER.data();
+pub const REFRESH_PROFILE: u64 = h("SNSRefreshProfileFromServer");
 
-pub const SERVER_INFO: u64 = M::SR15_NET_SERVER_INFO.data();
-pub const SERVER_FRAME: u64 = M::SR15_NET_SERVER_FRAME_MSG.data();
-pub const USER_PING_EST: u64 = M::SR15_NET_USER_PING_EST.data();
-pub const CLIENT_PING_RESPONSE: u64 = M::SR15_NET_CLIENT_PING_RESPONSE.data();
-pub const IDS_REQUEST: u64 = M::SR15_NET_IDS_REQUEST.data();
-pub const IDS_RESPONSE: u64 = M::SR15_NET_IDS_RESPONSE.data();
-pub const BALANCE_READY: u64 = M::SR15_NET_BALANCE_SETTINGS_CLIENT_READY.data();
-pub const BALANCE_UPDATE: u64 = M::SR15_NET_BALANCE_SETTINGS_MASS_UPDATE.data();
-pub const REPLICATED_READY: u64 = M::SR15_NET_REPLICATED_CLIENT_READY.data();
-pub const REPLICATED_VARS: u64 = M::SR15_NET_REPLICATED_DELTA_UNRELIABLE_VARS.data();
-pub const REPLICATED_ACK: u64 = M::SR15_NET_REPLICATED_DELTA_ACK.data();
-pub const VOIP: u64 = M::SR15_NET_USER_VOIP_EVENT.data();
-pub const PLAYER_STATE: u64 = M::SR15_NET_PLAYER_STATE_MSG.data();
-pub const PHYSICS: u64 = M::SR15_NET_PHYSICS_SIM_STATE_EVENT.data();
-pub const EQUIPMENT: u64 = M::SR15_NET_PLAYER_EQUIPMENT_UPDATE.data();
-pub const LOADOUT_REQUEST: u64 = M::SR15_NET_CURRENT_LOADOUT_REQUEST.data();
-pub const LOADOUT_RESPONSE: u64 = M::SR15_NET_CURRENT_LOADOUT_RESPONSE.data();
-pub const LOADOUT_NUMBER: u64 = M::SR15_NET_LOADOUT_NUMBER_NOTIFICATION.data();
-pub const STUN: u64 = M::SR15_STUN_PLAYER_MSG.data();
-pub const EMOTE: u64 = M::SR15_NET_PLAY_EMOTE.data();
-pub const ACTOR_CREATE: u64 = M::SR15_NET_POOLED_ACTOR_CREATE.data();
-pub const ACTOR_DESTROY: u64 = M::SR15_NET_POOLED_ACTOR_DESTROY.data();
-pub const FORCE_PUSH: u64 = M::SR15_FORCE_PUSH_PLAYER.data();
-pub const NEW_UNLOCKS: u64 = M::SR15_NET_NEW_UNLOCKS.data();
-pub const COMPONENT_EVENT: u64 = M::SR15_NET_COMPONENT_EVENT.data();
-pub const TOUCH_XFER_RELIABLE: u64 = M::SR15_NET_TOUCH_OWNERSHIP_TRANSFER_RELIABLE.data();
-pub const TOUCH_XFER_MAILBOX: u64 = M::SR15_NET_TOUCH_OWNERSHIP_TRANSFER_MAILBOX.data();
-pub const TOUCH_GRANTED: u64 = M::SR15_NET_TOUCH_OWNERSHIP_GRANTED.data();
-pub const TOUCH_DECLINED: u64 = M::SR15_NET_TOUCH_OWNERSHIP_DECLINED.data();
-pub const POST_SCORE: u64 = M::SR15_NET_RELIABLE_POST_SCORE_UPDATE.data();
+pub const SERVER_INFO: u64 = h("SR15NetServerInfo");
+pub const SERVER_FRAME: u64 = h("SR15NetServerFrameMsg");
+pub const USER_PING_EST: u64 = h("SR15NetUserPingEstMsg");
+pub const CLIENT_PING_RESPONSE: u64 = h("SR15NetClientPingResponseMsg");
+pub const IDS_REQUEST: u64 = h("SR15NetIdsRequest");
+pub const IDS_RESPONSE: u64 = h("SR15NetIdsResponse");
+pub const BALANCE_READY: u64 = h("SR15NetBalanceSettingsClientReady");
+pub const BALANCE_UPDATE: u64 = h("SR15NetBalanceSettingsMassUpdate");
+pub const REPLICATED_READY: u64 = h("SR15NetReplicatedClientReady");
+pub const REPLICATED_VARS: u64 = h("SR15NetReplicatedDeltaUnreliableVars");
+pub const REPLICATED_ACK: u64 = h("SR15NetReplicatedDeltaAck");
+pub const VOIP: u64 = h("SR15NetUserVoipEvent");
+pub const PLAYER_STATE: u64 = h("SR15NetPlayerStateMsg");
+pub const PHYSICS: u64 = h("SR15NetPhysicsSimStateEvent");
+pub const EQUIPMENT: u64 = h("SR15NetPlayerEquipmentUpdate");
+pub const LOADOUT_REQUEST: u64 = h("SR15NetCurrentLoadoutRequest");
+pub const LOADOUT_RESPONSE: u64 = h("SR15NetCurrentLoadoutResponse");
+pub const LOADOUT_NUMBER: u64 = h("SR15NetLoadoutNumberNotification");
+pub const STUN: u64 = h("SR15StunPlayerMsg");
+pub const EMOTE: u64 = h("SR15NetPlayEmote");
+pub const ACTOR_CREATE: u64 = h("SR15NetPooledActorCreate");
+pub const ACTOR_DESTROY: u64 = h("SR15NetPooledActorDestroy");
+pub const FORCE_PUSH: u64 = h("SR15ForcePushPlayer");
+pub const NEW_UNLOCKS: u64 = h("SR15NetNewUnlocks");
+pub const COMPONENT_EVENT: u64 = h("SR15NetComponentEvent");
+pub const TOUCH_XFER_RELIABLE: u64 = h("SR15NetTouchOwnershipTransferReliable");
+pub const TOUCH_XFER_MAILBOX: u64 = h("SR15NetTouchOwnershipTransferMailbox");
+pub const TOUCH_GRANTED: u64 = h("SR15NetTouchOwnershipGranted");
+pub const TOUCH_DECLINED: u64 = h("SR15NetTouchOwnershipDeclined");
+pub const POST_SCORE: u64 = h("SR15NetReliablePostScoreUpdate");
 pub const STAT_UPDATE: u64 = h("SR15NetReliableStatUpdate");
 pub const TEAM_STAT_UPDATE: u64 = h("SR15NetReliableTeamStatUpdate");
 pub const TOP_AWARDS: u64 = h("SR15NetTopAwardsMsg");
@@ -605,7 +604,7 @@ pub fn entrant_hold_var(generation: u16, slot: usize) -> Option<u64> {
     d[0] = generation as u8;
     d[2] = (slot % 10) as u8;
     let diff = std::str::from_utf8(&d).ok()?;
-    Some(base ^ rad_protocol::symbol::Symbol::calculate(diff, 0) as u64)
+    Some(base ^ symbol_from(diff, 0))
 }
 
 /// Entrant (0, 10)'s cease fire var (see `entrant_hold_var`).
@@ -674,7 +673,7 @@ pub fn write_disc_transform(p: &mut [u8; 64], x: i32, y: i32, depth: i32) {
 /// A `SR15NetCurrentLoadoutResponse` (452 bytes) as the instance it carries:
 /// its name (`unified`) at 0x44, the item count at 0x74 and (slot, item)
 /// symbol pairs from 0x84.
-pub fn parse_loadout(d: &[u8]) -> Option<nevr_proto::rtapi::v1::LoadoutInstance> {
+pub fn parse_loadout(d: &[u8]) -> Option<crate::wire::pb::LoadoutInstance> {
     let q = |o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().expect("8")));
     let name = q(0x44)?;
     let count = d.get(0x74..0x78).map(|b| u32::from_le_bytes(b.try_into().expect("4")))? as usize;
@@ -686,10 +685,10 @@ pub fn parse_loadout(d: &[u8]) -> Option<nevr_proto::rtapi::v1::LoadoutInstance>
         .filter_map(|i| {
             let o = 0x84 + i * 16;
             let (slot_type, equipped_item) = (q(o)?, q(o + 8)?);
-            (slot_type != 0 && equipped_item != 0).then_some(nevr_proto::rtapi::v1::LoadoutItem { slot_type, equipped_item })
+            (slot_type != 0 && equipped_item != 0).then_some(crate::wire::pb::LoadoutItem { slot_type, equipped_item })
         })
         .collect();
-    Some(nevr_proto::rtapi::v1::LoadoutInstance { instance_name: name, items })
+    Some(crate::wire::pb::LoadoutInstance { instance_name: name, items })
 }
 
 /// Put `item` in `slot_type` of a `SR15NetCurrentLoadoutResponse`, if that

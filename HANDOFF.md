@@ -105,15 +105,15 @@ Repos involved:
     (`evr_pipeline_login.go`, `runtime_event_server_profile_update.go`).
   - Private arena and combat matches return quietly instead of "unknown mode".
   - Skill ratings for arena are not updated through this path.
-- **EVR-Runtime alongside nevr-runtime and the stock game** (`server/evr/login_request.go`,
+- **EVR-Runtime alongside the older client runtime and the stock game** (`server/evr/login_request.go`,
   `evr_session_parameters.go`).
   - New `evr_runtime` login object: version, build, commit, platform, channel, social, plugins.
   - The `nevr_*` fields are still read; if both are present, `evr_runtime` wins.
   - The stock game (neither) works as before.
   - `RuntimeKind`, `RuntimeVersion`, `RuntimeBuild` and `RuntimePlugins` serve all three. The "Login client" log
     line gains `runtime` and `runtime_platform`.
-  - The game-server protocol (`/ws/nevr`, nevr-api protobuf) and the "nevr" database names are unchanged on
-    purpose.
+  - The game-server protocol (the `/ws/nevr` path and its protobuf) and the existing database names are
+    unchanged on purpose.
 - **Tests.**
   - New: `server/evr_echors_profile_test.go`, `server/evr/login_request_runtime_test.go`.
   - `go build` and `go vet` are clean.
@@ -130,7 +130,7 @@ Repos involved:
   - `social: 1` only once it handles the SNS party, friend and recently-met messages (tablet parties need
     every member at level 1 or higher);
   - refresh the auth token with `refresh_token` and `expires_in`;
-  - use its own HMD serial, not nevr's `nEVR-Wine`.
+  - use its own HMD serial, not the older runtime's.
 - It chose the existing SNS party path, so atlas gets no `evr_party_*` RPCs for now.
 - It has a stock PC client logging in to the local atlas, and its friends panel shows in the main menu.
 
@@ -185,8 +185,8 @@ servers re-registered. Atlas now logs to `logs/atlas.stdout.log` (`logs/atlas.lo
   moved to the leader's lobby by the game's FollowParty.
   - New rule: a client that **sends any SNS party request** reads party data from then on
     (`SessionParameters.ReadsPartyData`, `markSNSPartyClient` hooked in `ProcessRequest` next to
-    `applyTabletPartyGroup`). Declared social level still counts as before, so nevr-runtime and EVR-Runtime
-    with `social >= 1` are unchanged.
+    `applyTabletPartyGroup`). Declared social level still counts as before, so runtimes that declare
+    `social >= 1` are unchanged.
   - Both gates use it: the data relay (`partyMembers`, `evr_pipeline_party_data.go`) and `tabletMembersFollow`.
     A party of stock clients, or stock + runtime, now matchmakes as a tablet party.
   - Logged once per session at Info: "Client sent an SNS party request without a declared social level".
@@ -198,13 +198,13 @@ servers re-registered. Atlas now logs to `logs/atlas.stdout.log` (`logs/atlas.lo
   `not_in_game`, `not_in_party` or `target_offline`. The storage-backed website `party/*` RPCs are separate and
   unchanged.
 - **Cosmetics.** Three lossy paths found and fixed:
-  1. **The skip for Rust/nevr servers never fired for split-connection clients.** The remote-log equip skip looked
+  1. **The skip for exact-save (Rust) servers never fired for split-connection clients.** The remote-log equip skip looked
      up the match by the session that sent the remote log, which is the client's *login* connection. Clients play
      on a separate lobby connection, so no match was found and the lossy `item_equipped` equip was applied on
      top of the server's exact save. Now it checks the login session's lobby session too
      (`remoteLogEquipSavedByServer`, `evr_runtime_event_remotelogset.go`).
-  2. **`decalborder` and `decalback` were dropped from every GameServerSaveLoadout** (Rust legacy JSON and nevr
-     protobuf). Their symbols are not in atlas's symbol table, so the slot came back as hex and was skipped. Slots
+  2. **`decalborder` and `decalback` were dropped from every GameServerSaveLoadout** (Rust legacy JSON and the
+     protobuf path). Their symbols are not in atlas's symbol table, so the slot came back as hex and was skipped. Slots
      are now resolved against the loadout's own slot names (`loadoutSlotName`, `evr_pipeline_gameserver_loadout.go`).
      Unowned items in those slots are still stripped (to empty, their default).
   3. **Stock servers: a decal border equip failed** as "unknown category". `LoadoutEquipItem` now has `decalborder`.
@@ -213,8 +213,8 @@ servers re-registered. Atlas now logs to `logs/atlas.stdout.log` (`logs/atlas.lo
   - **Not fixable on stock servers without slot data:** the client's `item_equipped` remote log names the item,
     never the slot. So an emote fills both `emote` and `secondemote`, a decal both `decal` and `decal_body`, a
     pattern both pattern slots, a tint `tint` and `tint_body` (alignment tints also their alignment slot). Two
-    different emotes, or different heraldry and body decals, cannot be kept on a stock server. Rust and nevr
-    servers save the exact slots.
+    different emotes, or different heraldry and body decals, cannot be kept on a stock server. Servers that
+    send GameServerSaveLoadout (ours) save the exact slots.
 
 ### /mute-player: server voice mute (2026-11-17, late night)
 
@@ -528,7 +528,7 @@ accounts show the same thing, so it is not the shared-account test setup.
   `0x6aea99ee` high word, baseline included. Deployed in `dist/windows/echo-rust-server.exe` (previous
   `echo-rust-server.pre-ceasefire.exe`); 124 tests pass; uncommitted. The user tested at 18:02: no change.
 
-**What the evidence says (no nevr references; captures and echovr.exe only):**
+**What the evidence says (captures and echovr.exe only):**
 - Server log `dist/windows/logs/server-1795024916.log` (debug on): both slots get "lobby cease fire on". Both ack
   `SR15NetReplicatedDeltaAck`. Nothing differs per slot server-side.
 - Native addressing matches ours. In `captures/native-2p-20261115`, the replicated-vars mailbox key low nibble =
@@ -631,7 +631,7 @@ Deployed in `dist/windows/echo-rust-server.exe` (previous build still `echo-rust
 - Unknown without a native capture: the exact events between the OT states (we send disable-local-disc / restart
   disc only), and whether an OT goal ends the match at once or after the 15 s celebration (we keep the celebration).
 - Static graph tracing note: the node logic is a big node-id switch; a symbol map of every DLL string plus our Rust
-  constants (`scratchpad names.txt` → hashes) labels ~540 of its constants. Recreate with rad_protocol's Symbol.
+  constants (`scratchpad names.txt` → hashes) labels ~540 of its constants. Recreate with `wire::symbol`.
 
 ### 2026-11-18 19:45: lobby now relays clients' filter-13 events (stun outside brawler: candidate fix)
 

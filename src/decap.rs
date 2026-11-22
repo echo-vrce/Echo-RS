@@ -35,7 +35,7 @@ fn key32(v: &[u8]) -> [u8; 32] {
 }
 
 /// Every SessionSuccess v5 EchoRelay handed the server: one per client.
-fn find_keys(dir: &Path) -> Result<Vec<nevr_proto::rtapi::v1::SnsLobbySessionSuccessV5Message>> {
+fn find_keys(dir: &Path) -> Result<Vec<crate::wire::pb::SnsLobbySessionSuccessV5Message>> {
     let mut all = Vec::new();
     // `tools/record_client.py`: each SessionSuccess v5 body the client got.
     if let Ok(text) = fs::read_to_string(dir.join("sessions.jsonl")) {
@@ -74,7 +74,7 @@ fn find_keys(dir: &Path) -> Result<Vec<nevr_proto::rtapi::v1::SnsLobbySessionSuc
 }
 
 /// (client -> server, server -> client) transports for one key set.
-fn transports(s: &nevr_proto::rtapi::v1::SnsLobbySessionSuccessV5Message) -> (Transport, Transport) {
+fn transports(s: &crate::wire::pb::SnsLobbySessionSuccessV5Message) -> (Transport, Transport) {
     let server = SessionCrypto {
         out_flags: s.server_encoder_flags,
         out_aes: key32(&s.server_enc_key),
@@ -158,7 +158,7 @@ pub fn run(dir: &Path, out: &Path) -> Result<()> {
         let rel = t - t0;
         for (ch, list) in [("rel", &r.reliable), ("mb", &r.mailbox)] {
             for m in list {
-                let mname = rad_protocol::message_registry::lookup_message_name(m.type_).unwrap_or("");
+                let mname = crate::wire::names::message_name(m.type_).unwrap_or("");
                 writeln!(w, "{name},{rel:.4},{ch},{:#018x},{mname},{:#018x},{},{},{port}", m.type_, m.mailbox, m.data.len(), hex(&m.data))?;
                 rows += 1;
             }
@@ -219,7 +219,7 @@ pub fn netrec(dir: &Path, out: &Path) -> Result<()> {
                 &[]
             };
             i += HEAD + if stored { len } else { 0 };
-            let name = rad_protocol::message_registry::lookup_message_name(ty).unwrap_or("");
+            let name = crate::wire::names::message_name(ty).unwrap_or("");
             let ch = if dir_c == 0 { "rx" } else if key == -1 { "rel" } else { "mb" };
             let peer = if peer == u32::MAX { -1 } else { i64::from(peer) };
             writeln!(

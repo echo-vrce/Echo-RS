@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use nevr_proto::rtapi::v1 as pb;
-use nevr_proto::rtapi::v1::envelope::Message as Em;
+use crate::wire::pb;
+use crate::wire::pb::envelope::Message as Em;
 use prost::Message as _;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;

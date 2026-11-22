@@ -1,6 +1,6 @@
 [package]
 name = "echo-rust-server"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 description = "Standalone, all-Rust Echo VR server: login/config/matching services plus its own game-server engine. No Echo VR install needed."
 license = "MIT"
@@ -10,12 +10,6 @@ name = "echo-rust-server"
 path = "src/main.rs"
 
 [dependencies]
-# Wire primitives only: packet crypto, the message codec and symbol hashes,
-# and the fleet protobuf schema. The game server itself is `src/engine`.
-nevr-crypto = { path = "../nevr-server-rs/nevr-crypto" }
-rad-protocol = { path = "../nevr-server-rs/rad-protocol" }
-nevr-proto = { path = "../nevr-server-rs/nevr-proto" }
-
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
@@ -36,6 +30,9 @@ parking_lot = "0.12"
 dashmap = "6"
 bytes = "1"
 sha2 = "0.10"
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
 socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
@@ -54,5 +51,3 @@ debug = "line-tables-only"
 
 [profile.dev]
 opt-level = 1
-
-# The ../nevr-server-rs crates above are used unmodified.

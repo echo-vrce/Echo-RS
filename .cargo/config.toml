@@ -1,8 +1,3 @@
-# prost-build (used by nevr-proto) needs a protoc. protox is a pure-Rust,
-# protoc-compatible compiler installed by `cargo install protox --features bin --root tools`.
-[env]
-PROTOC = { value = "tools/bin/protox.exe", relative = true }
-
 # Build the C runtime into Windows exes so they run on PCs without the
 # Visual C++ redistributable.
 [target.x86_64-pc-windows-msvc]

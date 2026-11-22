@@ -80,7 +80,7 @@ pub mod sym {
 
 /// Hash a name into a RAD symbol (same function the game uses).
 pub fn symbol(name: &str) -> u64 {
-    rad_protocol::symbol::Symbol::generate(name).value as u64
+    crate::wire::symbol::symbol(name)
 }
 
 // ─── Framing ────────────────────────────────────────────────────────────────
@@ -759,9 +759,9 @@ impl SessionSuccess {
         w.finish(sym::SESSION_SUCCESS_V5, out);
     }
 
-    /// The fleet (protobuf) form handed to a nevr game server.
-    pub fn to_proto(&self) -> nevr_proto::rtapi::v1::SnsLobbySessionSuccessV5Message {
-        nevr_proto::rtapi::v1::SnsLobbySessionSuccessV5Message {
+    /// The fleet (protobuf) form handed to a game server.
+    pub fn to_proto(&self) -> crate::wire::pb::SnsLobbySessionSuccessV5Message {
+        crate::wire::pb::SnsLobbySessionSuccessV5Message {
             game_mode: self.mode,
             lobby_id: self.lobby_id.to_string(),
             group_id: self.group_id.to_string(),

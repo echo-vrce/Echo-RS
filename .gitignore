@@ -13,7 +13,7 @@
 *.pcap
 *.pcapng
 
-# protox, installed locally by `cargo install protox --features bin --root tools`
+# Locally installed cargo tools (`cargo install --root tools`)
 /tools/bin/
 /tools/.crates.toml
 /tools/.crates2.json

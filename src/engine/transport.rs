@@ -6,17 +6,15 @@
 //! both ends draw it from a Keccak PRNG seeded with the session's random key,
 //! one IV per sequence number (including numbers the sender skipped).
 //!
-//! Only the primitives come from `nevr-crypto` (AES/HMAC/Keccak) and
-//! `rad-protocol` (message codec, header bits, checksum).
+//! The primitives (packet crypto, header bits, message codec) are in
+//! `crate::wire`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use nevr_crypto::aes_cbc::{self, SessionKeys, WireConfig};
-use nevr_crypto::keccak::KeccakPrng;
-use rad_protocol::codec::decoder::{DecodedMessage, MessageDecoder};
-use rad_protocol::codec::encoder::MessageEncoder;
-use rad_protocol::header::{PacketHeader, compute_checksum};
+use crate::wire::codec::{DecodedMessage, MessageDecoder, MessageEncoder};
+use crate::wire::crypto::{self, IvGenerator, SessionKeys, WireConfig};
+use crate::wire::header::{PacketHeader, checksum};
 
 /// Frame numbers wrap on a 1023-entry ring (0x3ff is "none").
 pub const FRAME_RING: u16 = 1023;
@@ -56,14 +54,14 @@ pub struct SessionCrypto {
 struct Outbound {
     wire: WireConfig,
     keys: SessionKeys,
-    prng: KeccakPrng,
+    prng: IvGenerator,
     seq: u64,
 }
 
 struct Inbound {
     wire: WireConfig,
     keys: SessionKeys,
-    prng: KeccakPrng,
+    prng: IvGenerator,
     init_seq: u64,
     /// PRNG index of the next IV to draw.
     drawn: u64,
@@ -94,7 +92,7 @@ impl Inbound {
 pub fn mac_matches(flags: u64, mac: &[u8; 32], packet: &[u8]) -> bool {
     let wire = WireConfig::from_flags(flags);
     let keys = SessionKeys::new([0; 32], *mac);
-    aes_cbc::authenticate_packet(&wire, &keys, packet).is_some()
+    crypto::authenticate(&wire, &keys, packet).is_some()
 }
 
 struct Retained {
@@ -171,13 +169,13 @@ impl Transport {
         let out = Outbound {
             wire: WireConfig::from_flags(c.out_flags),
             keys: SessionKeys::new(c.out_aes, c.out_mac),
-            prng: KeccakPrng::new(&c.out_rnd),
+            prng: IvGenerator::new(&c.out_rnd),
             seq: c.out_seq,
         };
         let inb = Inbound {
             wire: WireConfig::from_flags(c.in_flags),
             keys: SessionKeys::new(c.in_aes, c.in_mac),
-            prng: KeccakPrng::new(&c.in_rnd),
+            prng: IvGenerator::new(&c.in_rnd),
             init_seq: c.in_seq,
             drawn: 0,
             ivs: VecDeque::with_capacity(64),
@@ -185,20 +183,14 @@ impl Transport {
         Self {
             out,
             inb,
-            rel_enc: MessageEncoder::new(),
-            mb_enc: MessageEncoder::with_mailbox(true),
+            rel_enc: MessageEncoder::new(false),
+            mb_enc: MessageEncoder::new(true),
             rel_encoded: false,
             mb_encoded: false,
             rel_ece_pending: false,
             mb_ece_pending: false,
-            rel_dec: MessageDecoder::new(),
-            mb_dec: {
-                // Mailbox records carry a key after the type; without this
-                // every record after the first in a frame is misread.
-                let mut d = MessageDecoder::new();
-                d.is_mailbox = true;
-                d
-            },
+            rel_dec: MessageDecoder::new(false),
+            mb_dec: MessageDecoder::new(true),
             rel_next: 0,
             mb_next: 0,
             mb_sent: vec![None; usize::from(FRAME_RING)],
@@ -228,11 +220,11 @@ impl Transport {
     /// Decrypt and process one datagram. Returns the decoded messages, or
     /// `None` if the packet is not ours.
     pub fn receive(&mut self, packet: &[u8]) -> Option<Received> {
-        let auth = aes_cbc::authenticate_packet(&self.inb.wire, &self.inb.keys, packet)?;
+        let auth = crypto::authenticate(&self.inb.wire, &self.inb.keys, packet)?;
         let seq = auth.sequence();
         let iv = self.inb.iv_for(seq)?;
         let mut plain = Vec::with_capacity(packet.len());
-        aes_cbc::decrypt_authenticated_into(auth, &self.inb.keys, &iv, &mut plain).ok()?;
+        crypto::decrypt(auth, &self.inb.keys, &iv, &mut plain)?;
         if plain.len() < 8 {
             return None;
         }
@@ -321,19 +313,15 @@ impl Transport {
         let hdr = PacketHeader::from_le_bytes(frame[..8].try_into().unwrap_or([0; 8]));
         let dec = if reliable { &mut self.rel_dec } else { &mut self.mb_dec };
         if hdr.encoded() {
-            dec.enable_encoding();
+            dec.encoded = true;
         }
-        let raw_mode = !dec.encoding_enabled;
-        dec.begin_frame();
-        dec.set_input(&frame[8..]);
         let mut scratch = Vec::new();
-        if dec.decode_input_into(raw_mode, &mut scratch).is_ok() || !scratch.is_empty() {
-            for m in scratch {
-                if reliable && m.type_ == crate::engine::msg::RELIABLE_BATCH {
-                    unpack_batch(&m.data, out);
-                } else {
-                    out.push(m);
-                }
+        dec.decode(&frame[8..], &mut scratch);
+        for m in scratch {
+            if reliable && m.type_ == crate::engine::msg::RELIABLE_BATCH {
+                unpack_batch(&m.data, out);
+            } else {
+                out.push(m);
             }
         }
     }
@@ -450,7 +438,7 @@ impl Transport {
     }
 
     fn stamp(plain: &mut [u8], hdr: PacketHeader) {
-        let cs = compute_checksum(hdr, &plain[8..]);
+        let cs = checksum(hdr, &plain[8..]);
         plain[..8].copy_from_slice(&hdr.with_checksum(cs).to_le_bytes());
     }
 
@@ -458,7 +446,7 @@ impl Transport {
         let iv = self.out.prng.next_iv();
         let seq = self.out.seq;
         self.out.seq = self.out.seq.wrapping_add(1);
-        out.push(aes_cbc::encrypt_packet_v2(&self.out.wire, &self.out.keys, &iv, seq, plain));
+        out.push(crypto::seal(&self.out.wire, &self.out.keys, &iv, seq, plain));
         self.packets_out += 1;
     }
 

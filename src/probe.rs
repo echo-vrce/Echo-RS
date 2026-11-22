@@ -102,7 +102,7 @@ pub async fn run(args: ProbeArgs) -> Result<()> {
         let s = &j.success;
         let h = hex_encode;
         println!(
-            "\nUDP join check (nevr-server-rs/target/release):\n  nevr-test-client --server {}:{} --server-enc-key {} --server-mac-key {} --server-random-key {} \
+            "\nUDP join check (arguments for an external test client):\n  --server {}:{} --server-enc-key {} --server-mac-key {} --server-random-key {} \
              --client-enc-key {} --client-mac-key {} --client-random-key {} --server-seq {} --client-seq {} --requested-team {}",
             s.internal_ip,
             s.port,

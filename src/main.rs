@@ -20,6 +20,7 @@ mod sns;
 mod store;
 mod upnp;
 mod upstream;
+mod wire;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;

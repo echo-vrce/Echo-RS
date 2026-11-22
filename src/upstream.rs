@@ -1,12 +1,12 @@
 //! Bridges for embedded game servers that serve an external backend instead
 //! of this process's own matchmaker.
 //!
-//! Each embedded nevr instance connects its fleet client to
+//! Each embedded game server connects its fleet client to
 //! `ws://127.0.0.1:<port>/upstream/<idx>`; this module opens the matching
 //! upstream connection and relays:
 //!
 //! * **nakama**: nakama's fleet speaks the same protobuf `Envelope` protocol
-//!   (bare, or wrapped in the EVR `NEVRProtobufMessageV1` frame in legacy
+//!   (bare, or wrapped in an SNS frame, [`PROTOBUF_FRAME`], in legacy
 //!   mode). Frames are relayed as-is; only the registration's internal IP is
 //!   rewritten from loopback to this host's LAN address.
 //! * **EchoRelay**: ServerDB speaks the `ERGameServer*` SNS messages its
@@ -26,8 +26,8 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use nevr_proto::envelope::Message as Em;
-use nevr_proto::rtapi::v1 as pb;
+use crate::wire::pb;
+use crate::wire::pb::envelope::Message as Em;
 use prost::Message as _;
 use tokio_tungstenite::tungstenite::Message as TMsg;
 use tracing::{debug, error, info, warn};
@@ -37,7 +37,10 @@ use crate::lobby::{VERSION_LOCK, env_msg};
 use crate::services::App;
 use crate::sns::{self, Reader, Writer, sym};
 
-const NEVR_PROTOBUF_V1: u64 = 0x9ee5_107d_9e29_fd63;
+/// The SNS message symbol nakama wraps a protobuf `Envelope` in on its
+/// legacy socket (and with its registration reply). The value is the wire
+/// contract with nakama and must not change.
+const PROTOBUF_FRAME: u64 = 0x9ee5_107d_9e29_fd63;
 /// nakama's own ServerDB message for a loadout a player saved
 /// (`ERGameServerSaveLoadoutRequest`). EchoRelay uses this symbol for
 /// something else, so it only goes to nakama.
@@ -187,7 +190,7 @@ pub async fn upstream_ws(State(app): State<App>, ConnectInfo(addr): ConnectInfo<
 fn decode_any(data: &[u8]) -> Option<(pb::Envelope, bool)> {
     if data.starts_with(&sns::MARKER) {
         let msgs = sns::split(data).ok()?;
-        msgs.into_iter().find(|(s, _)| *s == NEVR_PROTOBUF_V1).and_then(|(_, p)| pb::Envelope::decode(p).ok()).map(|e| (e, true))
+        msgs.into_iter().find(|(s, _)| *s == PROTOBUF_FRAME).and_then(|(_, p)| pb::Envelope::decode(p).ok()).map(|e| (e, true))
     } else {
         pb::Envelope::decode(data).ok().map(|e| (e, false))
     }
@@ -197,7 +200,7 @@ fn encode_as(env: &pb::Envelope, legacy: bool) -> Vec<u8> {
     let b = env.encode_to_vec();
     if legacy {
         let mut out = Vec::with_capacity(b.len() + 24);
-        sns::frame(&mut out, NEVR_PROTOBUF_V1, &b);
+        sns::frame(&mut out, PROTOBUF_FRAME, &b);
         out
     } else {
         b
@@ -213,7 +216,7 @@ fn observe(up: &Upstreams, idx: u32, env: &pb::Envelope) {
 }
 
 /// A nakama `serverdb_host` (`…/serverdb?…`) speaks EchoRelay's ServerDB
-/// protocol, the one the game's own server DLL uses, not nevr's protobuf fleet.
+/// protocol, the one the game's own server DLL uses, not the protobuf fleet.
 fn is_serverdb(url: &str) -> bool {
     url.split('?').next().is_some_and(|p| p.trim_end_matches('/').ends_with("/serverdb"))
 }
@@ -351,7 +354,7 @@ fn one_byte(symbol: u64) -> Vec<u8> {
     er_message(symbol, w)
 }
 
-/// nevr → EchoRelay. `None` means the envelope has no ServerDB equivalent.
+/// Our game server's envelope → EchoRelay. `None` means the envelope has no ServerDB equivalent.
 fn to_echorelay(up: &Upstreams, idx: u32, env: &pb::Envelope) -> Option<Vec<u8>> {
     Some(match env.message.as_ref()? {
         Em::GameServerRegistration(reg) => {
@@ -387,7 +390,7 @@ fn to_echorelay(up: &Upstreams, idx: u32, env: &pb::Envelope) -> Option<Vec<u8>>
     })
 }
 
-/// EchoRelay → nevr.
+/// EchoRelay → an envelope for our game server.
 fn from_echorelay(up: &Upstreams, idx: u32, symbol: u64, p: &[u8]) -> Result<Option<pb::Envelope>> {
     let mut r = Reader::new(p);
     Ok(Some(match symbol {
@@ -536,7 +539,7 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                             }
                             // Only nakama sends protobuf frames on this socket
                             // (with its registration reply).
-                            if symbol == NEVR_PROTOBUF_V1 {
+                            if symbol == PROTOBUF_FRAME {
                                 if !nakama {
                                     info!(instance = idx, "backend is nakama");
                                 }

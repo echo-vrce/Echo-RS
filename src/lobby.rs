@@ -1,6 +1,6 @@
 //! Lobby registry and matchmaker.
 //!
-//! Game servers (embedded nevr instances, or external nevr-server processes
+//! Game servers (the embedded engine instances, or external game servers
 //! pointed at `/fleet`) register here. Client lobby requests are matched to an
 //! existing lobby or allocated a free game server. All state sits behind one
 //! short-held lock that is never held across an await, so matching is a few
@@ -11,8 +11,8 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nevr_proto::rtapi::v1 as pb;
-use nevr_proto::rtapi::v1::envelope::Message as Em;
+use crate::wire::pb;
+use crate::wire::pb::envelope::Message as Em;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};

@@ -16,26 +16,16 @@ The pool can also serve an external **EchoRelay** or **nakama (EchoVRCE)** backe
 ### Requirements
 
 - Rust 1.85 or newer (edition 2024)
-- A checkout of [nevr-server-rs](https://github.com/EchoTools/nevr-server-rs) **next to this repo**. Only its wire primitives are used, unmodified: `nevr-crypto` (AES/HMAC/Keccak), `rad-protocol` (message codec, header bits, symbol hashes) and `nevr-proto` (the fleet protobuf schema). The game server itself is not nevr-server.
-- `protox`, a pure-Rust `protoc`, so you don't need to install protoc.
 
-```
-some-folder/
-├── nevr-server-rs/     # git clone https://github.com/EchoTools/nevr-server-rs
-└── echo-rust-server/   # this repo
-```
+Nothing else: the wire formats (packet crypto, the message codec, the name hashes and the fleet protobuf messages) are this project's own code, in `src/wire`. No `protoc` is needed.
 
 ### Steps
 
 ```
-git clone https://github.com/EchoTools/nevr-server-rs
 git clone <this repo> echo-rust-server
 cd echo-rust-server
-cargo install protox --features bin --root tools
 cargo build --release
 ```
-
-`.cargo/config.toml` points `PROTOC` at `tools/bin/protox.exe`. On Linux or macOS, set it yourself: `PROTOC=tools/bin/protox cargo build --release` (an existing `PROTOC` environment variable takes precedence over the config).
 
 Run the tests with `cargo test`.
 
@@ -104,7 +94,7 @@ Append `?api_key=...` to the upstream URL if EchoRelay requires one. Clients kee
 echo-rust-server --backend nakama --upstream "ws://<nakama-host>:7350/ws/nevr?token=<session token>"
 ```
 
-nakama serves nevr game servers at `/ws/nevr`, which takes a session `token`. The bridge accepts both bare and legacy-wrapped protobuf framing, and it rewrites a loopback registration address to the LAN IP.
+nakama serves game servers at its `/ws/nevr` path, which takes a session `token`. The bridge accepts both bare and legacy-wrapped protobuf framing, and it rewrites a loopback registration address to the LAN IP.
 
 ## Test client (`--probe`)
 
@@ -115,7 +105,7 @@ echo-rust-server --probe ws://127.0.0.1:7777 --probe-clients 60 --probe-mode soc
 echo-rust-server --probe ws://127.0.0.1:777  # through EchoRelay
 ```
 
-It prints where each client was placed. It also prints a `nevr-test-client` command line (an external test tool), which runs the encrypted UDP handshake and join request with the issued keys. Use `--probe-hold-secs` to keep the seats while that runs.
+It prints where each client was placed, with the session keys each one was issued, for an external UDP test client to run the encrypted handshake and join request with. Use `--probe-hold-secs` to keep the seats while that runs.
 
 ## Game-server engine (`src/engine`)
 
@@ -208,4 +198,4 @@ The recorder needs no libpcap: loopback traffic never reaches a capture driver o
 
 ## License
 
-MIT. The `nevr-server-rs` crates it depends on are licensed separately (Apache-2.0).
+MIT.

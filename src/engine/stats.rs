@@ -4,8 +4,8 @@
 //! **Native sends running match totals, not deltas.** In the recorded native
 //! game (`captures/native-20261111`) every `SR15NetReliableStatUpdate` repeats
 //! the whole total each 3 s (`"Points":{"op":"add","val":2}` again and again,
-//! then 5 after a 3-pointer). nevr-server-rs reached the same conclusion from
-//! the binary (`OnScoreCB` accumulates, nothing clears on send).
+//! then 5 after a 3-pointer). The binary agrees (`OnScoreCB` accumulates,
+//! nothing clears on send).
 //!
 //! The twelve screen stats, in native's list order. The team update's twelve
 //! record hashes follow this same order (`msg::TEAM_STATS`): the recorded
