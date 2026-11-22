@@ -94,7 +94,7 @@ Append `?api_key=...` to the upstream URL if EchoRelay requires one. Clients kee
 echo-rust-server --backend nakama --upstream "ws://<nakama-host>:7350/ws/nevr?token=<session token>"
 ```
 
-nakama serves game servers at its `/ws/nevr` path, which takes a session `token`. The bridge accepts both bare and legacy-wrapped protobuf framing, and it rewrites a loopback registration address to the LAN IP.
+nakama serves game servers at the websocket path above, which takes a session `token`. The bridge accepts both bare and legacy-wrapped protobuf framing, and it rewrites a loopback registration address to the LAN IP.
 
 ## Test client (`--probe`)
 
@@ -107,9 +107,18 @@ echo-rust-server --probe ws://127.0.0.1:777  # through EchoRelay
 
 It prints where each client was placed, with the session keys each one was issued, for an external UDP test client to run the encrypted handshake and join request with. Use `--probe-hold-secs` to keep the seats while that runs.
 
+## Wire formats (`src/wire`)
+
+- `crypto.rs`: packet MAC (HMAC-SHA512 prefix), sequence and AES-256-CBC, and the Keccak IV generator.
+- `header.rs`: the 64-bit packet header and its 11-bit checksum.
+- `codec.rs`: the message codec, raw and encoded (delta) frames, for the reliable and mailbox channels.
+- `symbol.rs`: the game's two name hashes (`symbol` for JSON and ServerDB names, `mat_sym` for message type ids), both `const fn`.
+- `names.rs`: message type id to name, for capture decoding.
+- `pb.rs`: the fleet protobuf messages (`rtapi.v1`) this project uses. The tags are the wire contract with nakama.
+
 ## Game-server engine (`src/engine`)
 
-- `transport.rs`: packet crypto (MAC, sequence, AES-CBC, Keccak IV stream with reorder tolerance), reliable channel (in-order, windowed, retransmit at about 2× round-trip time, capped at 60 ms), mailbox channel (latest wins, never stalls on loss), fragmentation, and the compression switch-over.
+- `transport.rs`: packet crypto on top of `src/wire` (Keccak IV stream with reorder tolerance), reliable channel (in-order, windowed, retransmit at about 2× round-trip time, capped at 60 ms), mailbox channel (latest wins, never stalls on loss), fragmentation, and the compression switch-over.
 - `session.rs`: the join sequence (`SNSLobbyJoinSetup`, entrant states, owner/host state, `SNSLobbyJoinAcceptedv2`, then `SNSLobbyJoinComplete` and server info), message relay, replicated game state, disc ownership arbitration, and the arena rules.
 - **Relay.** Player and physics traffic is forwarded the moment it is decoded, not on the next frame.
 - **Ping.** Ping is measured, never a constant. The transport times each outbound mailbox frame until the client's mailack for it comes back. A client only acks on its next outgoing frame, so one client send interval (the median gap between its frames, about 13.9 ms at 72 Hz) is taken off: that is the client's render cadence, not network distance. The reported value is the minimum over the last 32 round trips, so a local server shows about 0 ms.
@@ -155,10 +164,11 @@ It prints where each client was placed, with the session keys each one was issue
   - **Quarter court.** A disc passing through the goal ring from the front scores 2 points, or 3 when it was thrown from outside the bubble in front of the goal. The server sends native's game-state change, scoring event and `PostScoreUpdate`.
   - **Combat room.** All 11 barriers hide when broken and respawn after 30 s. The ability station and the room's other switches are replicated vars set from the clients' events.
   - **Joining.** Others' body state reaches a newcomer only after the newcomer's first equipment update, which is when native starts sending it too. After it, the newcomer gets everyone's latest equipment. The server publishes each entrant's lobby data (`afk`, `spawned`, `mm|status`) and relays the clients' level-script events. Replicated vars carry the lobby frame as their sequence and go out every frame.
-- **Combat explosions** follow native's query and falloff. A victim not on blue or orange is never hit, and the owner's teammates are skipped, but the owner is hit by their own blast. Damage is scored per body part (fixed offsets below the tracked head) with the damage table, and the best part counts.
+- **Combat explosions** follow native's query and falloff. A victim not on blue or orange is never hit, and the owner's teammates are skipped, but the owner is hit by their own blast. A STUN FIELD is the exception: it never stuns its own thrower, because it opens where the grenade was last seen, which on a short throw is still the thrower's hand. Damage is scored per body part (fixed offsets below the tracked head) with the damage table, and the best part counts.
 - **Component events are addressed to real handles.** The arena IdsResponse we send (native's own) assigns the match graph handle `0xa02d` and the disc-FX handle `0xa01b`, so round-start, scoring and announcer events go to those handles, as native does. The handles come from whatever IdsResponse the server sends: a different native session used `0x002f`/`0x001b`.
 - **Arena baseline.** The replicated-variable baseline is native's own pre-match set from a fresh public match. An older baseline taken mid-match carried flag values that made the client run pre-match like a private match, with the tunnels open.
 - **Session end.** A session ends 3 s after its last player leaves (90 s if nobody joined), and the server is reported free to its backend (EchoRelay gets `EndSession`). EchoRelay itself marks a server Locked when its player count reaches 0, so ending quickly keeps that window short. Servers then stay registered, blank and idle.
+- **Joins after the match.** A player or spectator joining a match that has just ended is let in, and the match stays open up to 20 s while they load. Once loaded they get the same "return to lobby" event everyone else got: a player's game goes to the lobby, a spectator's looks for another match. A match left with only spectators (every player left, or nobody joined a team in time) sends them the same event and closes 5 s later.
 - **Captured data.** The level object ids, balance settings and replicated-variable baselines (`src/engine/data`) are captured protocol data the client needs byte for byte. They exist for `mpl_lobby_b2` (social), `mpl_arena_a` (arena) and the four combat maps (Combustion, Dyson, Fission, Gauss), with each combat map's barriers, reflexes and payload track vars.
 
 ## Recording a native game
@@ -174,6 +184,7 @@ The recorder needs no libpcap: loopback traffic never reaches a capture driver o
 ## Verified
 
 - **Codec.** Every encoder and decoder matches byte for byte the vectors from nakama's `server/evr` Go implementation (`cargo test`).
+- **Own wire code (0.2.5).** `src/wire` replaced the third-party crates the server used before. It was run side by side with them on the same inputs, and every output matched: all 184 message names and 200k random strings (both hashes), every message id, 500k packet headers and checksums, 37,800 packets over 126 flag sets (IVs, sealed bytes, MAC checks, decryption, tampered and junk packets), and 22,809 codec frames with 619,620 messages (both channels, the raw-to-encoded switch, 20% frame loss, corrupted frames). The protobuf tags and field types match the original `.proto`. Not yet run in a live match.
 - **Built-in mode, own engine.** Probe login and placement, then the test client's raw ping, encrypted handshake, key claim, `SNSLobbyJoinRequestv4`, backend accept and join batch, all against `src/engine`.
 - **Game clients on the new engine.** Social lobbies, public and private arena matches and combat matches have been played with real clients, multiplayer included.
 - **Load (previous engine).** 60 concurrent clients were packed into 5 full lobbies of 12. With 64 game servers up, the process used **47 MB RAM and 0.4 s of CPU in total**.
@@ -183,7 +194,7 @@ The recorder needs no libpcap: loopback traffic never reaches a capture driver o
   3. Session start
   4. UDP join
   5. PlayersAccepted
-- **nakama mode** runs against a live nakama (Atlas): registration, matchmaking, profile and stats updates.
+- **nakama mode** runs against a live nakama (Atlas): registration, matchmaking, profile and stats updates. This was before 0.2.5; it has not been rerun with our own wire code yet.
 
 ## Notes
 
