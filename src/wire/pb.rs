@@ -96,6 +96,10 @@ pub struct GameServerRegistrationMessage {
     pub time_step_usecs: u32,
     #[prost(string, tag = "8")]
     pub version: String,
+    /// The levels this server can load (symbols). Atlas only gives a server
+    /// matches on a level in this list; empty means every level.
+    #[prost(fixed64, repeated, tag = "9")]
+    pub installed_levels: Vec<u64>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

@@ -186,6 +186,7 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
         port: u32::from(port),
         time_step_usecs: 1_000_000 / 120,
         version: env!("CARGO_PKG_VERSION").into(),
+        installed_levels: filter::installed_levels(),
         ..Default::default()
     }));
     if tx.send(WsMsg::Binary(reg.encode_to_vec())).await.is_err() {

@@ -109,6 +109,9 @@ pub struct Upstreams {
     /// registration without ever sounding like nakama gets EchoRelay's next.
     wide_registration: AtomicBool,
     registration_confirmed: AtomicBool,
+    /// The ServerDB socket has answered with protobuf frames: it is nakama
+    /// (Atlas), which also takes the protobuf registration there.
+    backend_nakama: AtomicBool,
     /// Registrations that ended unanswered and switched the layout.
     layout_flips: std::sync::atomic::AtomicU32,
     /// The last failure only switched the layout for the first time: the
@@ -125,7 +128,7 @@ impl Upstreams {
             Backend::EchoRelay { url } | Backend::Nakama { url } if is_serverdb(url) => Some(login_from_serverdb(url)),
             _ => None,
         });
-        Arc::new(Self { backend, lan_ip, region: sns::symbol(region), login_url, instances: DashMap::new(), wide_registration: AtomicBool::new(true), registration_confirmed: AtomicBool::new(false), layout_flips: Default::default(), layout_quick: AtomicBool::new(false), gate: Gate::new(), start: Instant::now() })
+        Arc::new(Self { backend, lan_ip, region: sns::symbol(region), login_url, instances: DashMap::new(), wide_registration: AtomicBool::new(true), registration_confirmed: AtomicBool::new(false), backend_nakama: AtomicBool::new(false), layout_flips: Default::default(), layout_quick: AtomicBool::new(false), gate: Gate::new(), start: Instant::now() })
     }
     fn state(&self, idx: u32) -> Arc<InstanceState> {
         self.instances.entry(idx).or_default().clone()
@@ -354,11 +357,37 @@ fn one_byte(symbol: u64) -> Vec<u8> {
     er_message(symbol, w)
 }
 
+/// The registration as nakama's protobuf frame, for a ServerDB socket known to
+/// be nakama and a server with a map list to send. The legacy registration has
+/// no field for the levels a server hosts, so without this nakama would offer
+/// it matches on maps it refuses. The other fields are the ones nakama reads
+/// from the legacy registration, so it registers the server the same way.
+fn nakama_registration(up: &Upstreams, reg: &pb::GameServerRegistrationMessage, internal: Ipv4Addr) -> Option<Vec<u8>> {
+    if reg.installed_levels.is_empty() || !up.backend_nakama.load(Ordering::Relaxed) {
+        return None;
+    }
+    let env = env_msg(Em::GameServerRegistration(pb::GameServerRegistrationMessage {
+        server_id: reg.server_id,
+        internal_ip_address: internal.to_string(),
+        port: reg.port,
+        region: up.region,
+        version_lock: VERSION_LOCK,
+        installed_levels: reg.installed_levels.clone(),
+        ..Default::default()
+    }));
+    let mut out = Vec::new();
+    sns::frame(&mut out, PROTOBUF_FRAME, &env.encode_to_vec());
+    Some(out)
+}
+
 /// Our game server's envelope → EchoRelay. `None` means the envelope has no ServerDB equivalent.
 fn to_echorelay(up: &Upstreams, idx: u32, env: &pb::Envelope) -> Option<Vec<u8>> {
     Some(match env.message.as_ref()? {
         Em::GameServerRegistration(reg) => {
             let internal = reg.internal_ip_address.parse::<Ipv4Addr>().ok().filter(|ip| !ip.is_loopback()).unwrap_or(up.lan_ip);
+            if let Some(out) = nakama_registration(up, reg, internal) {
+                return Some(out);
+            }
             let mut w = Writer::new();
             let pad = if up.wide_registration.load(Ordering::Relaxed) { 10 } else { 2 };
             w.u64(reg.server_id).ipv4(internal).u16(reg.port as u16).zeros(pad).u64(up.region).u64(VERSION_LOCK);
@@ -463,6 +492,8 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
     let mut nakama = false;
     let mut registering = false;
     let mut registered = false;
+    // This registration went out without the server's map list.
+    let mut levels_unsent = false;
     let unanswered = tokio::time::sleep(REG_RETRY);
     tokio::pin!(unanswered);
     let (mut rtx, mut rrx) = remote.split();
@@ -514,7 +545,12 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                     }
                     continue;
                 }
-                registering |= matches!(env.message, Some(Em::GameServerRegistration(_)));
+                if let Some(Em::GameServerRegistration(reg)) = &env.message {
+                    registering = true;
+                    // Before the backend has shown it is nakama, the map list
+                    // cannot go with the registration (see `nakama_registration`).
+                    levels_unsent = !reg.installed_levels.is_empty() && !up.backend_nakama.load(Ordering::Relaxed);
+                }
                 if let Some(out) = to_echorelay(up, idx, &env) {
                     rtx.send(TMsg::Binary(out)).await?;
                 }
@@ -544,6 +580,7 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                                     info!(instance = idx, "backend is nakama");
                                 }
                                 nakama = true;
+                                up.backend_nakama.store(true, Ordering::Relaxed);
                                 up.wide_registration.store(true, Ordering::Relaxed);
                                 up.registration_confirmed.store(true, Ordering::Relaxed);
                                 // nakama explains a refusal here, not in the legacy failure message.
@@ -558,6 +595,12 @@ async fn bridge_echorelay(up: &Upstreams, idx: u32, local: WebSocket, url: &str)
                                             registered = true;
                                             up.gate.registered(idx);
                                             info!(instance = idx, server_id = ok.server_id, external_ip = %ok.external_ip_address, "registered with nakama");
+                                            if levels_unsent {
+                                                // Now known to be nakama: register again, this
+                                                // time with the maps this server hosts.
+                                                info!(instance = idx, "registering again so nakama gets this server's map list");
+                                                return Ok(());
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -1003,6 +1046,48 @@ mod tests {
         assert_eq!(login_from_serverdb("ws://127.0.0.1:777/serverdb"), "ws://127.0.0.1:777/login");
         assert_eq!(login_from_serverdb("ws://h:80/serverdb?api_key=x&regions=a"), "ws://h:80/login");
         assert!(is_serverdb("ws://h:80/serverdb?x=1") && !is_serverdb("ws://h:7350/ws/nevr?token=t"));
+    }
+
+    /// With a map list and a ServerDB socket known to be nakama, the
+    /// registration goes as nakama's protobuf frame carrying the levels;
+    /// otherwise as the legacy registration.
+    #[test]
+    fn map_list_goes_in_the_protobuf_registration() {
+        let up = Upstreams::new(Backend::EchoRelay { url: "ws://h:80/serverdb".into() }, Ipv4Addr::new(192, 168, 1, 5), "default", None);
+        let levels = vec![sns::symbol("mpl_arena_a"), sns::symbol("mpl_combat_fission")];
+        let reg = |installed_levels: Vec<u64>| {
+            env_msg(Em::GameServerRegistration(pb::GameServerRegistrationMessage {
+                server_id: 7,
+                internal_ip_address: "127.0.0.1".into(),
+                port: 6792,
+                installed_levels,
+                ..Default::default()
+            }))
+        };
+        let legacy = |b: &[u8]| sns::split(b).unwrap()[0].0 == sym::ER_REGISTRATION_REQUEST;
+
+        // Not yet known to be nakama: legacy, whatever the list.
+        assert!(legacy(&to_echorelay(&up, 0, &reg(levels.clone())).unwrap()));
+        up.backend_nakama.store(true, Ordering::Relaxed);
+        // No list (no map excluded): still legacy.
+        assert!(legacy(&to_echorelay(&up, 0, &reg(Vec::new())).unwrap()));
+
+        let out = to_echorelay(&up, 0, &reg(levels.clone())).unwrap();
+        let msgs = sns::split(&out).unwrap();
+        assert_eq!(msgs[0].0, PROTOBUF_FRAME);
+        let Some(Em::GameServerRegistration(r)) = pb::Envelope::decode(msgs[0].1).unwrap().message else { panic!("not a registration") };
+        assert_eq!(r.installed_levels, levels);
+        assert_eq!((r.server_id, r.port, r.internal_ip_address.as_str()), (7, 6792, "192.168.1.5"));
+        assert_eq!((r.region, r.version_lock), (sns::symbol("default"), VERSION_LOCK));
+
+        // nakama's field 9 is `repeated fixed64`, packed: key 0x4a, then the
+        // byte length and the little-endian words.
+        let body = pb::GameServerRegistrationMessage { installed_levels: levels.clone(), ..Default::default() }.encode_to_vec();
+        let mut want = vec![0x4a, 16];
+        for l in &levels {
+            want.extend_from_slice(&l.to_le_bytes());
+        }
+        assert_eq!(body, want);
     }
 }
 

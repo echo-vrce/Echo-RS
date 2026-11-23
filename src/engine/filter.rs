@@ -61,6 +61,21 @@ pub fn allows(mode: u64, level: u64) -> bool {
     (f.only_modes.is_empty() || f.only_modes.contains(&mode)) && !f.exclude_modes.contains(&mode) && !f.exclude_maps.contains(&level)
 }
 
+/// The levels to tell the backend this server hosts: every map in [`MAPS`]
+/// except the excluded ones. Empty when no map is excluded, so the backend
+/// keeps treating the server as able to host any level.
+pub fn installed_levels() -> Vec<u64> {
+    let Some(f) = FILTER.get() else { return Vec::new() };
+    levels_without(&f.exclude_maps)
+}
+
+fn levels_without(excluded: &[u64]) -> Vec<u64> {
+    if excluded.is_empty() {
+        return Vec::new();
+    }
+    MAPS.iter().map(|(n, _)| symbol(n)).filter(|l| !excluded.contains(l)).collect()
+}
+
 pub fn mode_name(mode: u64) -> String {
     MODES.iter().find(|(n, _)| symbol(n) == mode).map(|(n, _)| n.to_string()).unwrap_or_else(|| format!("{mode:#018x}"))
 }
@@ -79,5 +94,18 @@ mod tests {
         // seen in captures.
         assert_eq!(symbol("mpl_arena_a"), 0x576e_d3f8_428e_bc4b);
         assert_eq!(symbol("echo_arena_private"), 0x0999_0965_f4db_8c03);
+    }
+
+    /// No exclusion: no list, so the backend treats the server as hosting
+    /// any level. An exclusion: every other known map.
+    #[test]
+    fn installed_levels_leave_out_the_excluded_maps() {
+        assert!(levels_without(&[]).is_empty());
+        let dyson = symbol("mpl_combat_dyson");
+        let levels = levels_without(&[dyson]);
+        assert_eq!(levels.len(), MAPS.len() - 1);
+        assert!(!levels.contains(&dyson));
+        assert!(levels.contains(&symbol("mpl_arena_a")));
+        assert!(levels.contains(&symbol("mpl_combat_fission")));
     }
 }
