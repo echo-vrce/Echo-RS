@@ -127,8 +127,8 @@ struct Args {
     no_unlock_all: bool,
 
     /// Game frames per second (replication, the disc, match rules), 10 to
-    /// 200. The client's own 120 Hz frame clock is separate and unchanged.
-    #[arg(long, env = "ERS_FRAME_HZ", default_value_t = 20, value_parser = clap::value_parser!(u64).range(10..=240))]
+    /// 240. The client's own 120 Hz frame clock is separate and unchanged.
+    #[arg(long, env = "ERS_FRAME_HZ", default_value_t = 120, value_parser = clap::value_parser!(u64).range(10..=240))]
     frame_hz: u64,
 
     /// Host only these game modes (comma-separated game-type names, e.g.

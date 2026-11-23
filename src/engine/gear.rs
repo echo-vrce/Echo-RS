@@ -611,6 +611,11 @@ struct Mag {
     item: [u8; 8],
     thrower: SocketAddr,
     ending: bool,
+    /// The thrower's last thrown-ordnance position when this one spawned:
+    /// still the same when it is used means this one never sent its own
+    /// (an INSTANT REPAIR let go of in the hand), so that position is an
+    /// older grenade's.
+    at_spawn: Option<[f32; 3]>,
 }
 
 /// An ARC MINE let go of: where it is (its last thrown position until it
@@ -659,7 +664,21 @@ struct Field {
     start: Instant,
     /// Victims a stun field already stunned.
     hit: Vec<[u8; 8]>,
+    /// A STUN FIELD rolls with its grenade (`rolling_effect_lifetime`):
+    /// when `at` last followed the grenade's position.
+    moved: Instant,
+    /// Whether the grenade has sent a position since the field opened: until
+    /// it does, `at` may still be the thrower's hand.
+    tracked: bool,
 }
+
+/// How long a STUN FIELD waits for its grenade's own position before it
+/// stuns where it opened.
+const STUN_SETTLE: Duration = Duration::from_millis(150);
+/// The fastest a STUN FIELD's grenade is followed (m/s), plus a margin:
+/// a bigger jump is another of its thrower's objects, not this grenade.
+const STUN_FOLLOW_SPEED: f32 = 40.0;
+const STUN_FOLLOW_SLACK: f32 = 2.0;
 
 /// (victim id, reported position, distance, player, marker hit code)
 type Hit = ([u8; 8], [f32; 3], f32, Option<SocketAddr>, u32);
@@ -2030,7 +2049,8 @@ impl Gear {
             }
             SPAWN_MAGAZINE if d.len() == 40 => {
                 info!(%from, item = %hex8(arr8(d, 24)), mag = %hex8(arr8(d, 32)), "ordnance spawned");
-                self.mags.insert(arr8(d, 32), Mag { owner: arr8(d, 0), item: arr8(d, 24), thrower: from, ending: false });
+                let at_spawn = self.thrown_at.get(&from).copied();
+                self.mags.insert(arr8(d, 32), Mag { owner: arr8(d, 0), item: arr8(d, 24), thrower: from, ending: false, at_spawn });
                 vec![out(To::Others, ty, d)]
             }
             MAGAZINE_STATE if d.len() == 24 => {
@@ -2104,11 +2124,14 @@ impl Gear {
                         let every = if dot { Duration::from_secs_f32(1.0 / g("ticks_per_second", 3.0).max(0.5)) } else { Duration::from_millis(8) };
                         let radius = if dot { g("radius", 2.5) } else { stun_reach(Duration::MAX) };
                         let kind = if dot { EX_DOT } else { EX_STUN };
-                        self.fields.push(Field { kind, mag: id, at, thrower, until: now + lifetime(item), next: now, every, radius, start: now, hit: Vec::new() });
+                        self.fields.push(Field { kind, mag: id, at, thrower, until: now + lifetime(item), next: now, every, radius, start: now, hit: Vec::new(), moved: now, tracked: false });
                     }
                 }
                 if let Some(m) = self.mags.get_mut(&id).filter(|m| !m.ending) {
-                    if state == MAG_THROWN {
+                    // INSTANT REPAIR thrown (not just let go of) still pops on
+                    // its client's own used state ~1 s later. Ended here, that
+                    // used state was ignored and nobody was ever healed.
+                    if state == MAG_THROWN && m.item != ITEM_BURST {
                         m.ending = true;
                         let used = now + lifetime(m.item);
                         let mut b = d[..16].to_vec();
@@ -2125,7 +2148,11 @@ impl Gear {
                         if item == ITEM_BURST {
                             // INSTANT REPAIR: its thrower's client says when it
                             // pops (native: held, released, then used ~1 s later).
-                            let at = self.thrown_at.get(&thrower).or_else(|| self.bodies.get(&thrower).map(|b| &b.1)).copied();
+                            // Where: this one's own thrown position if it sent
+                            // any, else its thrower (an older grenade's spot
+                            // healed nobody near the player).
+                            let own = self.thrown_at.get(&thrower).copied().filter(|p| self.mags.get(&id).is_none_or(|m| m.at_spawn != Some(*p)));
+                            let at = own.or_else(|| self.bodies.get(&thrower).map(|b| b.1));
                             if let Some(at) = at {
                                 v.extend(self.burst_heal(thrower, at));
                             }
@@ -2638,6 +2665,20 @@ impl Gear {
         self.neutron_blasts(now, &mut ready);
         let mut fields = std::mem::take(&mut self.fields);
         for f in &mut fields {
+            // A STUN FIELD rolls with its grenade for its whole life. Kept
+            // where it opened, it stunned players at that spot (often the
+            // thrower's hand) seconds after the field had rolled away.
+            if f.kind == EX_STUN
+                && let Some(&p) = self.thrown_at.get(&f.thrower)
+                && p != f.at
+            {
+                let dt = now.saturating_duration_since(f.moved).as_secs_f32();
+                if dist(p, f.at) <= STUN_FOLLOW_SLACK + STUN_FOLLOW_SPEED * dt {
+                    f.at = p;
+                    f.moved = now;
+                    f.tracked = true;
+                }
+            }
             while f.next <= now && f.next < f.until {
                 f.next += f.every;
                 // A DOT FIELD reaches exactly its radius (to the body's line, no
@@ -2663,6 +2704,11 @@ impl Gear {
                     for o in self.blast_mines_in(f.thrower, f.at, f.radius, &move |_| tick, now, true) {
                         ready.push((f.thrower, o));
                     }
+                    continue;
+                }
+                // Nobody until the grenade's own position is in (or it had
+                // time to send one): before that `at` can be the hand.
+                if !f.tracked && f.next.saturating_duration_since(f.start) < STUN_SETTLE {
                     continue;
                 }
                 // Never its own thrower: the field opens where the grenade was last
@@ -3841,6 +3887,43 @@ mod tests {
         assert_eq!(g.credits, vec![Credit::Heal { by: me, amount: 50.0 }]);
     }
 
+    /// INSTANT REPAIR thrown (not just let go of): its later used state still
+    /// heals (the throw used to end it, and the used state was ignored).
+    #[test]
+    fn instant_repair_thrown_still_heals() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        for _ in 0..4 {
+            g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
+        }
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 0);
+        let mag = "84fec19782c6fd39";
+        g.on_message(me, SPAWN_MAGAZINE, &unhex(&format!("f234d5099974113f010000009d24204220836f3f5f49bfc1e9ed9ca8b1d0e8c8{mag}")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("193a620c7adae243{mag}6388fd280387e323")), t0);
+        g.on_message(me, MAGAZINE_STATE, &unhex(&format!("193a620c7adae243{mag}a9509fd4dfc72de3")), t0);
+        let v = g.on_message(me, MAGAZINE_STATE, &unhex(&format!("193a620c7adae243{mag}6281fb261b84f533")), t0);
+        assert!(v.iter().any(|o| o.ty == HEALTH_BROADCAST));
+        assert_eq!(g.lives.get(&them).map(|l| l.health), Some(112.0 - 4.0 * 13.5 + 50.0));
+    }
+
+    /// A STUN FIELD rolls with its grenade: once the grenade has moved on,
+    /// a player at the spot where it opened is not stunned.
+    #[test]
+    fn stun_field_follows_its_grenade() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        let p = g.bodies[&them].0;
+        let spot = g.bodies[&them].1;
+        let opened = [spot[0], spot[1] - 1.5, spot[2]];
+        g.thrown_at.insert(me, opened);
+        g.fields.push(Field { kind: EX_STUN, mag: [0; 8], at: opened, thrower: me, until: t0 + Duration::from_secs(6), next: t0, every: Duration::from_millis(8), radius: 4.0, start: t0, hit: Vec::new(), moved: t0, tracked: false });
+        // The grenade rolls 10 m away over 0.5 s, before the field stuns anyone there.
+        g.thrown_at.insert(me, [opened[0] + 10.0, opened[1], opened[2]]);
+        g.due(t0 + Duration::from_millis(500));
+        assert!(!g.fields[0].hit.contains(&g.id_of(&them, p)), "not stunned where it opened");
+    }
+
     /// PHASE SHIFT: while it is on (its user's AbilityActivate on, with the
     /// `wraith` tac mod equipped), shots and blasts do nothing; off ends it.
     #[test]
@@ -4116,7 +4199,7 @@ mod tests {
         let at = g.bodies[&me].1;
         let p = g.bodies[&them].0;
         g.bodies.insert(them, (p, [at[0] + 1.0, at[1], at[2]]));
-        g.fields.push(Field { kind: EX_STUN, mag: [0; 8], at: [at[0], at[1] - 1.5, at[2]], thrower: me, until: t0 + Duration::from_secs(6), next: t0, every: Duration::from_millis(8), radius: 4.0, start: t0, hit: Vec::new() });
+        g.fields.push(Field { kind: EX_STUN, mag: [0; 8], at: [at[0], at[1] - 1.5, at[2]], thrower: me, until: t0 + Duration::from_secs(6), next: t0, every: Duration::from_millis(8), radius: 4.0, start: t0, hit: Vec::new(), moved: t0, tracked: false });
         g.due(t0 + Duration::from_secs(1));
         let mine = g.id_of(&me, g.bodies[&me].0);
         let hit = &g.fields[0].hit;

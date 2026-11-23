@@ -2,8 +2,8 @@
 //! game state, real per-peer ping, disc ownership and the arena rules.
 //!
 //! Everything here is driven by two calls: [`Session::on_packet`] for each
-//! datagram and [`Session::server_frame`] at `--frame-hz` (default 20). Relayed player traffic is
-//! forwarded as soon as it is decoded; nothing waits for the next frame.
+//! datagram and [`Session::server_frame`] at `--frame-hz` (default 120). Player body states and a held
+//! disc go out with the next server frame; a disc in flight goes out at once.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -25,7 +25,7 @@ pub const MAX_SLOTS: usize = 16;
 /// Server frames per second (frame message, replication, rules): `--frame-hz`
 /// at startup, `frame-hz N` on stdin while running. Every timing in the rules
 /// is in seconds and converted with this, so any rate runs the same match.
-static FRAME_HZ_V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(20);
+static FRAME_HZ_V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(120);
 
 pub fn frame_hz() -> u64 {
     FRAME_HZ_V.load(std::sync::atomic::Ordering::Relaxed)
@@ -2593,6 +2593,24 @@ impl Session {
                 self.props.on_grant(from, new_owner, object, entry_id);
             }
         } else {
+            // A close call: someone else got the disc just before. Logged
+            // with both pings, to see how often the lower ping decides it.
+            if self.arena_level && !release && !locked && e.owner != u32::MAX && e.owner != sender {
+                let since_ms = self.arena.granted_at.elapsed().as_millis();
+                if since_ms < 200 {
+                    let rtt_ms = |a: Option<SocketAddr>| a.and_then(|a| self.peers.get(&a)).and_then(|p| p.rtt_us()).map(|u| (u + 500) / 1000);
+                    let owner_addr = self.slot_addr.get((e.owner & 0xffff) as usize).copied().flatten();
+                    info!(
+                        loser = sender & 0xffff,
+                        loser_ping_ms = ?rtt_ms(Some(from)),
+                        winner = e.owner & 0xffff,
+                        winner_ping_ms = ?rtt_ms(owner_addr),
+                        after_ms = since_ms,
+                        disc_at = ?self.arena.disc_at,
+                        "contested grab: declined"
+                    );
+                }
+            }
             reply[0x08..0x0c].copy_from_slice(&e.owner.to_le_bytes());
             reply[0x18..0x1a].copy_from_slice(&u16::from(e.generation & 0xf).to_le_bytes());
             self.reliable_to(from, TOUCH_DECLINED, &reply);
@@ -3039,7 +3057,8 @@ impl Session {
                 code: code.unwrap_or(pb::lobby_entrant_removed_message::Code::Disconnected) as i32,
             })));
         }
-        info!(%addr, slot = p.slot, players = self.player_count(), "player left");
+        let l = p.t.stats;
+        info!(%addr, slot = p.slot, players = self.player_count(), ping_ms = ?p.t.rtt_us().map(|u| (u + 500) / 1000), loss_pct = format_args!("{:.1}", l.loss_pct()), late = l.mb_late, resends = l.resends, "player left");
         self.last_activity = Instant::now();
     }
 
@@ -3360,6 +3379,12 @@ impl Session {
                     let ms = ((rtt + 500) / 1000).min(999) as u16;
                     b[1 + s * 2..3 + s * 2].copy_from_slice(&ms.to_le_bytes());
                     debug!(slot = s, rtt_us = rtt, raw_rtt_us = ?p.t.raw_rtt_us(), client_frame_us = p.t.client_frame_us(), samples = p.t.rtt_sample_count(), "measured ping");
+                    // Link quality every 30 s, for tuning: what the player's
+                    // packets to us lose and how unevenly they arrive.
+                    if self.frame % (30 * frame_hz()) == 0 {
+                        let l = p.t.stats;
+                        info!(slot = s, ping_ms = ms, jitter_ms = p.t.jitter_us() / 1000, loss_pct = format_args!("{:.1}", l.loss_pct()), late = l.mb_late, resends = l.resends, "link");
+                    }
                     if !p.seen_types.is_empty() {
                         let mut v: Vec<_> = p.seen_types.drain().collect();
                         v.sort_by(|a, b| b.1.cmp(&a.1));

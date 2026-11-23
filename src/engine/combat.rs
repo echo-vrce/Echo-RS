@@ -455,8 +455,9 @@ const VO_MATCH_STARTING: u64 = crate::wire::symbol::symbol("evt_vo_anc_match_sta
 const VO_ROUND_STARTING: u64 = crate::wire::symbol::symbol("evt_vo_anc_round_starting");
 const VO_TIME_EXTENDED: u64 = crate::wire::symbol::symbol("evt_vo_anc_match_time_extended");
 const VO_MATCH_COMPLETE: u64 = crate::wire::symbol::symbol("evt_vo_anc_match_complete");
-/// "Ten" .. "One" (index 0 is "one"). The capture maps' own script raises
-/// one to five itself, so there only six to ten are sent.
+/// "Ten" .. "One" (index 0 is "one"). All ten are sent: the capture maps'
+/// script was thought to say one to five itself, but in game (2026-11-23)
+/// the count stopped at six.
 const VO_COUNTDOWN: [u64; 10] = [
     crate::wire::symbol::symbol("evt_vo_anc_countdown_01"),
     crate::wire::symbol::symbol("evt_vo_anc_countdown_02"),
@@ -633,19 +634,25 @@ impl Track {
         self.checkpoints.last().copied().unwrap_or(0.0)
     }
 
-    /// Which way the payload faces at `dist`: along the track. Where the
-    /// track drops (Fission's lift after checkpoint 1: 2.79 m straight
-    /// down), native's payload stays level and faces the way it came, then
-    /// sinks; facing along the drop pointed ours nose-down.
+    /// The track's own direction at `dist` (rises and drops included): the
+    /// way the payload moves.
+    fn along(&self, d: f32) -> [f32; 3] {
+        let (a, b) = (self.pos((d - 0.5).max(0.0)), self.pos(d + 0.5));
+        [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+    }
+
+    /// Which way the payload faces at `dist`: along the track, always level
+    /// (native's payload keeps +Y up). Where the track drops (Fission's lift
+    /// after checkpoint 1: 2.79 m straight down) it faces the way it came,
+    /// then sinks. Only a near-vertical stretch used to be levelled: at the
+    /// lift's edge the track ran half flat, half down, and the payload
+    /// pitched 45 degrees nose-down (the "dive bomb").
     fn facing(&self, dist: f32) -> [f32; 3] {
-        let dir = |d: f32| {
-            let (a, b) = (self.pos((d - 0.5).max(0.0)), self.pos(d + 0.5));
-            [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
-        };
+        let dir = |d: f32| self.along(d);
         let steep = |f: [f32; 3]| f[0] * f[0] + f[2] * f[2] < f[1] * f[1];
         let f = dir(dist);
         if !steep(f) {
-            return f;
+            return [f[0], 0.0, f[2]];
         }
         let mut back = dist;
         while back > 0.0 {
@@ -1668,7 +1675,7 @@ impl Combat {
                     if before > ROUND_STARTING_AT && self.countdown <= ROUND_STARTING_AT {
                         out.push(Self::announcer(VO_ROUND_STARTING));
                     }
-                    out.extend(Self::announce_count(before, self.countdown, 6));
+                    out.extend(Self::announce_count(before, self.countdown, 1));
                 }
                 self.team_room_for += dt;
                 while self.cues_left > 0 && self.team_room_for >= TEAM_ROOM_CUES[TEAM_ROOM_CUES.len() - self.cues_left] {
@@ -2007,7 +2014,14 @@ impl Combat {
                 }
                 out.push(Out::Reliable(PAYLOAD_POS, b));
             }
-            if p.next < p.track.checkpoints.len() && p.dist >= p.track.checkpoints[p.next] - 0.01 {
+            // Clients draw the payload a little ahead of the server's (they
+            // run it on from its last speed), so players let go when they see
+            // it on the checkpoint and the server's stopped just short: it
+            // only counted at the next push. Within CHECKPOINT_SNAP, not rolling
+            // back, it is there (and put exactly on it).
+            let snap = if p.speed >= 0.0 && p.hud.2 >= 0 { CHECKPOINT_SNAP } else { 0.01 };
+            if p.next < p.track.checkpoints.len() && p.dist >= p.track.checkpoints[p.next] - snap {
+                p.dist = p.dist.max(p.track.checkpoints[p.next]);
                 if p.next + 1 == p.track.checkpoints.len() {
                     finished = true;
                 } else {
@@ -2320,9 +2334,11 @@ impl Combat {
         // Its speed along the track (rolling back: x SLOW_REVERSE), 0 held.
         let moving = p.hud.2 != 0 || p.autodrive_to.is_some();
         let v = if !moving || p.hold > 0.0 { 0.0 } else if p.speed < 0.0 { p.speed * SLOW_REVERSE } else { p.speed };
-        let l = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt().max(1e-6);
+        // Velocity along the track itself (down the lift too), not the level facing.
+        let m = p.track.along(p.dist);
+        let l = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt().max(1e-6);
         for k in 0..3 {
-            phys_set(&mut d, r + PHYS_VEL + 12 * k, 12, (f[k] / l * v * 32.0 + 1536.0).round().clamp(0.0, 4095.0) as u32);
+            phys_set(&mut d, r + PHYS_VEL + 12 * k, 12, (m[k] / l * v * 32.0 + 1536.0).round().clamp(0.0, 4095.0) as u32);
         }
         Some(d)
     }
@@ -2342,6 +2358,9 @@ const PHYS_RECORD_BITS: usize = 284;
 const PHYS_POS: usize = 75;
 const PHYS_ROT: usize = 132;
 const PHYS_VEL: usize = 164;
+/// How far short of a checkpoint a payload pushed forward counts as on it (m):
+/// about how far ahead the clients draw it (1.25 m/s x ~0.25 s).
+const CHECKPOINT_SNAP: f32 = 0.35;
 /// The payload stands this far above its track's points.
 const PAYLOAD_RIDE: f32 = 0.651;
 pub const PAYLOAD_PHYS_KEY: u64 = 0x2824;
@@ -2508,6 +2527,33 @@ mod tests {
         assert!(f[1].abs() < 1e-6 && (f[0] * f[0] + f[2] * f[2]) > 0.01, "level: {f:?}");
         let g = p.track.facing(20.0);
         assert!((f[0] * g[0] + f[2] * g[2]) != 0.0);
+    }
+
+    /// The payload never pitches: level all along Fission's track, the lift's
+    /// edge included (it dived nose-down there).
+    #[test]
+    fn payload_stays_level_on_fission() {
+        let c = playing(fission());
+        let p = c.payload.as_ref().expect("p");
+        let mut d = 0.0;
+        while d <= p.track.end() {
+            let f = p.track.facing(d);
+            assert!(f[1].abs() < 1e-6 && (f[0] * f[0] + f[2] * f[2]) > 1e-4, "at {d}: {f:?}");
+            d += 0.1;
+        }
+    }
+
+    /// Let go of just short of a checkpoint (where the clients already draw
+    /// it on the checkpoint), it counts without another push.
+    #[test]
+    fn checkpoint_counts_when_let_go_just_short() {
+        let mut c = playing(fission());
+        let cp = c.payload.as_ref().expect("p").track.checkpoints[0];
+        c.payload.as_mut().expect("p").dist = cp - 0.2;
+        c.step(0.05, &[]);
+        let p = c.payload.as_ref().expect("p");
+        assert_eq!(p.next, 1, "checkpoint 1 reached");
+        assert!(p.dist >= cp);
     }
 
     /// Native Gauss: the clock hits 0 with attackers on it: overtime events

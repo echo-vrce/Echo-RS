@@ -101,7 +101,7 @@ impl Default for Setup {
             max_games: 16,
             keep_running: 2,
             udp_port: 6792,
-            frame_hz: 20,
+            frame_hz: 120,
             mode_choice: ModeChoice::All,
             only_mode: "echo_arena".into(),
             excluded_modes: Vec::new(),
@@ -253,7 +253,9 @@ struct Shared {
     /// servers start again.
     drain: Mutex<Option<Instant>>,
     auto_update: AtomicBool,
-    hidden: AtomicBool,
+    /// Hidden to the tray (shared with the log pumps, which then stop
+    /// waking the window).
+    hidden: Arc<AtomicBool>,
     /// A status line for the window, from the steward.
     notice: Mutex<Option<String>>,
 }
@@ -298,10 +300,10 @@ impl Shared {
         }
         let mut child = cmd.spawn()?;
         if let Some(o) = child.stdout.take() {
-            pump(o, log.clone(), ctx.clone());
+            pump(o, log.clone(), ctx.clone(), self.hidden.clone());
         }
         if let Some(e) = child.stderr.take() {
-            pump(e, log.clone(), ctx.clone());
+            pump(e, log.clone(), ctx.clone(), self.hidden.clone());
         }
         let stdin = child.stdin.take();
         *self.running.lock().expect("running") = Some(Running { child, stdin, exited: None });
@@ -349,6 +351,16 @@ impl Shared {
 /// asks once as it starts).
 const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
 
+/// Ask the window to redraw, unless it is hidden to the tray. On Windows a
+/// redraw asked of a hidden window is never delivered, and eframe then polls
+/// its event loop nonstop (a whole core) until the window is shown again.
+/// Showing it redraws anyway.
+fn redraw(ctx: &egui::Context, hidden: &AtomicBool) {
+    if !hidden.load(Ordering::Relaxed) {
+        ctx.request_repaint();
+    }
+}
+
 /// The update steward: checks for releases, drains a running server when one
 /// is downloaded, installs it once the server is gone, and starts the servers
 /// again (or the new launcher, when the launcher itself changed).
@@ -359,7 +371,7 @@ fn steward(shared: Arc<Shared>, updater: update::Updater, log: Log, ctx: egui::C
         std::thread::sleep(Duration::from_secs(2));
         if let Some(msg) = shared.reap(&log) {
             *shared.notice.lock().expect("notice") = Some(format!("Server {msg}."));
-            ctx.request_repaint();
+            redraw(&ctx, &shared.hidden);
         }
         let live = shared.live();
         let auto = shared.auto_update.load(Ordering::Relaxed);
@@ -367,15 +379,15 @@ fn steward(shared: Arc<Shared>, updater: update::Updater, log: Log, ctx: egui::C
         if auto && Instant::now() >= next_check {
             next_check = Instant::now() + CHECK_EVERY;
             if !updater.busy() && !matches!(status, Status::Ready(_) | Status::Installed { restart: true, .. }) {
-                let c = ctx.clone();
-                updater.check(exe_dir(), false, move || c.request_repaint());
+                let (c, h) = (ctx.clone(), shared.hidden.clone());
+                updater.check(exe_dir(), false, move || redraw(&c, &h));
             }
         }
         let Status::Ready(tag) = status else { continue };
         if live {
             if auto {
                 shared.begin_drain(&log, &tag);
-                ctx.request_repaint();
+                redraw(&ctx, &shared.hidden);
             }
             continue;
         }
@@ -423,7 +435,7 @@ fn steward(shared: Arc<Shared>, updater: update::Updater, log: Log, ctx: egui::C
                 }
             }
         }
-        ctx.request_repaint();
+        redraw(&ctx, &shared.hidden);
     }
 }
 
@@ -488,15 +500,19 @@ fn push(log: &Log, line: String) {
     l.push_back(line);
 }
 
-fn pump(stream: impl Read + Send + 'static, log: Log, ctx: egui::Context) {
+fn pump(stream: impl Read + Send + 'static, log: Log, ctx: egui::Context, hidden: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut r = BufReader::new(stream);
         let mut buf = Vec::new();
         while matches!(r.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
             push(&log, strip_ansi(String::from_utf8_lossy(&buf).trim_end()));
             buf.clear();
-            // Redraw for new output, batched; nothing is drawn while hidden.
-            ctx.request_repaint_after(Duration::from_millis(200));
+            // Redraw for new output, batched. Not while hidden: eframe still
+            // runs and paints a hidden window's frames, so a busy log kept the
+            // launcher drawing (on the software renderer) in the tray.
+            if !hidden.load(Ordering::Relaxed) {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
         }
     });
 }
@@ -576,11 +592,11 @@ impl App {
         let me = std::env::current_exe().ok();
         update::clean_old(&exe_dir());
         let updater = update::Updater::default();
-        if setup.auto_update {
-            let ctx = cc.egui_ctx.clone();
-            updater.check(exe_dir(), false, move || ctx.request_repaint());
-        }
         let shared = Arc::new(Shared::default());
+        if setup.auto_update {
+            let (ctx, hidden) = (cc.egui_ctx.clone(), shared.hidden.clone());
+            updater.check(exe_dir(), false, move || redraw(&ctx, &hidden));
+        }
         shared.auto_update.store(setup.auto_update, Ordering::Relaxed);
         let log: Log = Arc::default();
         {
@@ -1137,6 +1153,13 @@ impl eframe::App for App {
             self.hide_to_tray(ctx);
         }
         self.reap();
+        // Brought back some other way than the tray (Wayland only minimises,
+        // and the taskbar restores it): it is shown again, and its log
+        // redraws again.
+        if self.hidden && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true)))) {
+            self.hidden = false;
+            self.shared.hidden.store(false, Ordering::Relaxed);
+        }
         let live = self.live();
         let problems = self.setup.problems();
 

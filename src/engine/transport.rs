@@ -153,6 +153,28 @@ pub struct Transport {
     srtt: Duration,
     pub packets_out: u64,
     pub packets_in: u64,
+    /// Link quality, for the logs: the peer's mailbox frames taken, the
+    /// ones that never arrived (skipped over), late or repeated ones
+    /// dropped, and our reliable frames sent again (lost on the way out or
+    /// their ack lost on the way back).
+    pub stats: LinkStats,
+}
+
+/// Counters for one peer's link since it joined.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LinkStats {
+    pub mb_in: u64,
+    pub mb_lost: u64,
+    pub mb_late: u64,
+    pub resends: u64,
+}
+
+impl LinkStats {
+    /// The peer's mailbox frames that never arrived, in percent.
+    pub fn loss_pct(&self) -> f32 {
+        let total = self.mb_in + self.mb_lost;
+        if total == 0 { 0.0 } else { self.mb_lost as f32 * 100.0 / total as f32 }
+    }
 }
 
 fn ring_add(f: u16, n: u16) -> u16 {
@@ -214,6 +236,7 @@ impl Transport {
             srtt: Duration::from_millis(30),
             packets_out: 0,
             packets_in: 0,
+            stats: LinkStats::default(),
         }
     }
 
@@ -295,6 +318,15 @@ impl Transport {
             // freezing the player's body for everyone.
             let behind = ring_ahead(frame, self.mb_expect);
             if behind == 0 || behind > MB_STALE {
+                // Frames skipped over never came (or come later, as late).
+                // A jump this far is a stall, not loss: not counted.
+                if self.last_mb_in.is_some() {
+                    let skipped = ring_ahead(self.mb_expect, frame);
+                    if skipped <= MB_STALE {
+                        self.stats.mb_lost += u64::from(skipped);
+                    }
+                }
+                self.stats.mb_in += 1;
                 self.decode_into(false, &body, &mut out.mailbox);
                 self.mb_expect = ring_add(frame, 1);
                 let now = Instant::now();
@@ -304,6 +336,8 @@ impl Transport {
                     }
                     self.mb_gaps.push_back(now.duration_since(prev).as_micros() as u32);
                 }
+            } else {
+                self.stats.mb_late += 1;
             }
         }
         Some(out)
@@ -366,6 +400,17 @@ impl Transport {
         let mut g: Vec<u32> = self.mb_gaps.iter().copied().collect();
         g.sort_unstable();
         g[g.len() / 2]
+    }
+
+    /// Arrival jitter (µs): how much later than usual the peer's slower
+    /// frames come (90th percentile gap minus the median gap).
+    pub fn jitter_us(&self) -> u32 {
+        if self.mb_gaps.len() < 8 {
+            return 0;
+        }
+        let mut g: Vec<u32> = self.mb_gaps.iter().copied().collect();
+        g.sort_unstable();
+        g[g.len() * 9 / 10].saturating_sub(g[g.len() / 2])
     }
 
     pub fn raw_rtt_us(&self) -> Option<u32> {
@@ -495,6 +540,7 @@ impl Transport {
             let r = &mut self.retained[i];
             r.plain = plain;
             r.sent = now;
+            self.stats.resends += 1;
         }
 
         // Reliable: one frame per call, up to 256 messages.
