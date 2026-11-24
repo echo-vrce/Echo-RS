@@ -3,6 +3,17 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.2.9 (2026-11-24)
+
+### Changes
+- THREAT SCANNER pings reach teammates
+  - Each THREAT SCANNER ping goes to its user's teammates (the server used to drop them)
+- Every network message named
+  - docs/network-messages.md lists all 146 message types in the native recordings, with names, sizes, and whether this server handles and sends them
+- Release notes keep each change on its own line
+  - A commit message with no blank line after its title is split into its bullets
+  - The 0.2.8 changelog entry is rewritten as separate changes
+
 ## 0.2.8 (2026-11-24)
 
 ### Fixed
