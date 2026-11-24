@@ -1889,6 +1889,10 @@ impl Combat {
             // Rolled back onto a checkpoint it sits just before it (native
             // reports the trackpoint before the checkpoint's).
             let floor = if last_cp > 0.0 { last_cp - 0.002 } else { 0.0 };
+            // Past a checkpoint's autodrive (Fission's lift down), the end of
+            // the drive is the floor: a rollback never takes it back up.
+            let upto = p.track.checkpoints.get(p.next).copied().unwrap_or(f32::MAX);
+            let floor = p.track.autodrive.iter().copied().filter(|&d| d > last_cp && d < upto && p.furthest >= d - 1e-3).fold(floor, f32::max);
             let was = p.sent.map_or(0, |s| s.3);
             let max = speed_max;
             // The inner speed's target; None: stopped at once.
@@ -1947,7 +1951,7 @@ impl Combat {
             }
             if moving > 0.0 {
                 // (From the floor it is on the checkpoint again at once.)
-                p.dist = (p.dist.max(last_cp) + moving * dt).min(p.track.end());
+                p.dist = (p.dist.max(last_cp).max(floor) + moving * dt).min(p.track.end());
             } else if moving < 0.0 {
                 p.dist += moving * dt;
                 if p.dist <= floor {
@@ -2516,6 +2520,24 @@ mod tests {
         assert!((c.payload_dist().expect("d") - 59.305).abs() < 0.01);
         run(&mut c, 1.0, &nobody);
         assert!(c.clock < clock - 0.5, "the clock runs again");
+    }
+
+    /// Fission: once down the lift after checkpoint 1, a rollback stops at
+    /// the bottom of the lift (it went back up to the checkpoint).
+    #[test]
+    fn fission_rollback_stays_down_the_lift() {
+        let mut c = playing(fission());
+        c.payload.as_mut().expect("p").dist = 56.4;
+        for _ in 0..20 {
+            let me = on_payload(&mut c, 1);
+            c.step(0.1, &[me]);
+        }
+        let nobody = [(1u8, true, Some([500.0, 0.0, 0.0]), 0)];
+        run(&mut c, 25.0, &nobody);
+        assert!((c.payload_dist().expect("d") - 59.305).abs() < 0.01, "down the lift");
+        let def = on_payload(&mut c, 0);
+        run(&mut c, 30.0, &[def]);
+        assert!(c.payload_dist().expect("d") >= 59.3, "{:?}", c.payload_dist());
     }
 
     /// Native Fission's checkpoint 1: the payload's checkpoint event, the

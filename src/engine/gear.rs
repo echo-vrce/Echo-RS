@@ -330,6 +330,44 @@ fn pillar_event(handle: u16) -> [u8; 24] {
 fn barrier_event(handle: u16) -> [u8; 24] {
     super::msg::component_event(BARRIER_EVENT, BARRIER_MODULE, handle, super::msg::FILTER_ALL_ALT)
 }
+/// Each player's gun heat meter, a replicated var per player slot (native,
+/// every combat recording and the lobby): 0..1 up a step a shot, down after
+/// the gun's cooldown delay. Keys for slots 0..9: slots 1..9 recorded, slot 0
+/// from them (the slot digit sits 13 characters from the end of the var's
+/// name, so keys differ by the CRC of the digits; slot 0's is the one the
+/// Gauss server recording carries at tag 0). Slots 10 and up: unknown.
+const HEAT_KEYS: [u64; 10] = [
+    0x1ca6_8bb9_941d_b80a,
+    0xf6b7_893b_b825_5e34,
+    0x9bc3_8757_08d1_40a8,
+    0x71d2_85d5_24e9_a696,
+    0xa5b0_8065_11d7_72d4,
+    0x4fa1_82e7_3def_94ea,
+    0x22d5_8c8b_8d1b_8a76,
+    0xc8c4_8e09_a123_6c48,
+    0x379d_9636_3206_10b6,
+    0xdd8c_94b4_1e3e_f688,
+];
+/// How long an overheat shows full before the meter drops to 0.
+const HEAT_OVERHEAT_SHOWN: Duration = Duration::from_millis(400);
+
+#[derive(Clone, Copy)]
+struct GunHeat {
+    level: f32,
+    last_shot: Option<Instant>,
+    last_tick: Instant,
+    delay: Duration,
+    /// Per second, as a fraction of full.
+    cooling: f32,
+    overheated: Option<Instant>,
+}
+
+impl Default for GunHeat {
+    fn default() -> Self {
+        Self { level: 0.0, last_shot: None, last_tick: Instant::now(), delay: Duration::from_secs(1), cooling: 0.5, overheated: None }
+    }
+}
+
 /// OVERCHARGE (the user's spec, 2026-11-16): the user and linked teammates
 /// take 25% less damage; linked teammates cannot die for `cheat_death()` from their first
 /// link, until the link breaks or they leave.
@@ -759,6 +797,8 @@ pub struct Gear {
     /// Safety net: each player's tac mod in use (when its `AbilityCooldown`
     /// is overdue, its `[slot u32]`).
     tac_running: HashMap<SocketAddr, (Instant, [u8; 4])>,
+    /// Each player's gun heat, as native's server sends it (see `HEAT_KEYS`).
+    heat: HashMap<SocketAddr, GunHeat>,
     /// Where it was before its last move, and whether it has stopped since
     /// (stuck to a surface): a DETONATOR's blast does not go through that surface.
     thrown_from: HashMap<SocketAddr, ([f32; 3], bool)>,
@@ -879,6 +919,7 @@ impl Gear {
             spawned_at: HashMap::new(),
             owed_refund: HashMap::new(),
             tac_running: HashMap::new(),
+            heat: HashMap::new(),
             thrown_from: HashMap::new(),
             fields: Vec::new(),
             bubbles: Vec::new(),
@@ -1266,6 +1307,7 @@ impl Gear {
     /// A player is gone: what the others must be told (their stations freed).
     pub fn forget(&mut self, who: SocketAddr) -> Vec<Out> {
         self.checks.forget(who);
+        self.heat.remove(&who);
         let outs = match self.station_slot(&who) {
             // Native (Dyson server recording): a player leaving a match gets
             // the same, from the server, at once.
@@ -1412,6 +1454,58 @@ impl Gear {
     /// A player's slot, from their body physics.
     /// With their generation above it (`gen << 16 | slot`, the player handle
     /// health broadcasts and kills carry: a player who rejoined is generation 1).
+    /// A shot's heat on its shooter's gun (the weapon told by its damage, as
+    /// `multiplier` does; a COMET's charged damage is SCOUT's).
+    fn heat_shot(&mut self, from: SocketAddr, damage: f32, now: Instant) {
+        let w = weapons();
+        let props = w.get("weapon_properties").and_then(Value::as_object);
+        let weapon = props
+            .and_then(|m| m.iter().find(|(_, v)| v.get("projectile_damage").and_then(Value::as_f64).is_some_and(|p| (p as f32 - damage).abs() < 0.01)).map(|(k, _)| k.clone()))
+            .unwrap_or_else(|| "scout".to_owned());
+        let wp = |k: &str, def: f64| w.pointer(&format!("/weapon_properties/{weapon}/{k}")).and_then(Value::as_f64).unwrap_or(def) as f32;
+        let h = self.heat.entry(from).or_default();
+        h.cooling = wp("heat_venting_rate", 50.0) / 100.0;
+        h.delay = Duration::from_secs_f32(wp("heat_cooldown_delay", 1.0).clamp(0.0, 10.0));
+        h.last_shot = Some(now);
+        h.last_tick = now;
+        if h.overheated.is_none() {
+            h.level = (h.level + wp("heat_per_shot", 10.0) / 100.0).min(1.0);
+            if h.level >= 1.0 {
+                h.overheated = Some(now + HEAT_OVERHEAT_SHOWN);
+            }
+        }
+    }
+
+    /// Heat drains after each gun's cooldown delay; an overheat shows full
+    /// for a moment, then 0 (native: 0.998, 0.947, then 0 within 0.45 s).
+    fn cool_guns(&mut self, now: Instant) {
+        for h in self.heat.values_mut() {
+            let dt = now.saturating_duration_since(h.last_tick).as_secs_f32();
+            h.last_tick = now;
+            if let Some(t) = h.overheated {
+                if now >= t {
+                    h.overheated = None;
+                    h.level = 0.0;
+                }
+            } else if h.last_shot.is_none_or(|s| now >= s + h.delay) {
+                h.level = (h.level - h.cooling * dt).max(0.0);
+            }
+        }
+    }
+
+    /// The gun heat vars: `(key, value)` for every player with a slot that
+    /// has a known key, value `[heat f32][0 u16][slot u16]` (native).
+    pub fn heat_vars(&self) -> Vec<(u64, u64)> {
+        self.heat
+            .iter()
+            .filter_map(|(who, h)| {
+                let slot = self.station_slot(who)?;
+                let key = *HEAT_KEYS.get(slot as usize)?;
+                Some((key, u64::from(h.level.to_bits()) | (u64::from(slot as u16) << 48)))
+            })
+            .collect()
+    }
+
     pub fn slot_of(&self, who: &SocketAddr) -> u32 {
         player_handle(&self.bodies, &self.slots, &self.gens, who)
     }
@@ -2019,6 +2113,9 @@ impl Gear {
             }
             FIRE_GUN => {
                 self.using_gear(from, now);
+                if d.len() == 64 && self.in_combat(&from) {
+                    self.heat_shot(from, f32::from_le_bytes(d[48..52].try_into().expect("4")), now);
+                }
                 let checked;
                 let d = if d.len() == 64 && self.in_combat(&from) {
                     match self.check_shot(from, d, now) {
@@ -2793,6 +2890,7 @@ impl Gear {
 
     /// Replies whose time has come, with the client each `To` is relative to.
     pub fn due(&mut self, now: Instant) -> Vec<(SocketAddr, Out)> {
+        self.cool_guns(now);
         let space = self.space;
         let mut ready = Vec::new();
         let gone: Vec<SocketAddr> = self.leaving.iter().filter(|(_, t)| **t <= now).map(|(a, _)| *a).collect();
@@ -3708,6 +3806,41 @@ mod tests {
         assert_eq!(v[0].body, unhex("fcffffff03000000"), "slot 3's, not slot 0's");
         g.slots.clear();
         assert!(g.forget(me).is_empty(), "slot unknown: nothing freed");
+    }
+
+    /// Gun heat (native's per-slot meter): a step a shot, `[heat][0][slot]`
+    /// under the slot's key, full shows briefly then 0, and it drains after
+    /// the gun's cooldown delay.
+    #[test]
+    fn gun_heat_is_sent_per_slot() {
+        let mut g = Gear::new();
+        let t0 = Instant::now();
+        let me = addr();
+        g.slots.insert(me, 3);
+        g.heat_shot(me, 60.0, t0);
+        let v = g.heat_vars();
+        assert_eq!(v.len(), 1);
+        let (k, raw) = v[0];
+        assert_eq!(k, 0x71d2_85d5_24e9_a696, "slot 3's key");
+        assert_eq!(raw >> 48, 3, "slot in the top u16");
+        let one = f32::from_bits(raw as u32);
+        assert!(one > 0.0 && one < 1.0, "{one}");
+        // Many shots: overheat, shown full, then 0.
+        for i in 1..40 {
+            g.heat_shot(me, 60.0, t0 + Duration::from_millis(i));
+        }
+        assert_eq!(f32::from_bits(g.heat_vars()[0].1 as u32), 1.0);
+        g.cool_guns(t0 + Duration::from_secs(1));
+        assert_eq!(f32::from_bits(g.heat_vars()[0].1 as u32), 0.0);
+        // One shot drains back to 0 after its delay.
+        let t1 = t0 + Duration::from_secs(2);
+        g.heat_shot(me, 60.0, t1);
+        g.cool_guns(t1 + Duration::from_millis(50));
+        assert!(f32::from_bits(g.heat_vars()[0].1 as u32) > 0.0, "held during the delay");
+        for i in 1..=100 {
+            g.cool_guns(t1 + Duration::from_millis(100 * i));
+        }
+        assert_eq!(f32::from_bits(g.heat_vars()[0].1 as u32), 0.0);
     }
 
     /// The second native recording: METEOR on yourself (half of 40), then a

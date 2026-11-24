@@ -4877,7 +4877,9 @@ impl Session {
         // The combat mode's vars: those that changed every frame, all of them
         // twice a second (late joiners, lost packets).
         let combat_vars = self.combat.as_ref().map(|c| {
-            let all: Vec<(u64, u64)> = c.vars().into_iter().map(|(h, v)| (h, v.resolve(var_raw(&base[0], h).unwrap_or(0)))).collect();
+            let mut all: Vec<(u64, u64)> = c.vars().into_iter().map(|(h, v)| (h, v.resolve(var_raw(&base[0], h).unwrap_or(0)))).collect();
+            // Each player's gun heat (native sends it with the mode's vars).
+            all.extend(gear.heat_vars());
             let every = server_frame % (frame_hz() / 2).max(1) == 0;
             let changed: Vec<(u64, u64)> = all.iter().copied().filter(|(h, v)| every || self.combat_sent.get(h) != Some(v)).collect();
             (all, changed)
