@@ -67,6 +67,22 @@ const ECHOCOMBAT_EQUIPMENT: &str = include_str!("data/mp_equipment_echocombat.js
 /// The gear list is the same in both (`mp_equipment`).
 const STOCK_WEAPONS: &str = include_str!("data/mp_weapon_settings_stock.json");
 
+/// Gear only EchoCombat games can use: kept out of the loadout terminal of
+/// games without it (`gear_table` list, item `name`).
+pub const ECHOCOMBAT_ONLY_GEAR: [(&str, &str); 4] = [("tacmods", "smoke"), ("tacmods", "buff"), ("tacmods", "point"), ("ordnances", "drone")];
+
+/// The gear list for games without EchoCombat: EchoCombat's without
+/// UMBRAL VEIL, OVERCHARGE, NEUTRON and DRONE.
+fn stock_equipment() -> String {
+    let mut doc: Value = serde_json::from_str(ECHOCOMBAT_EQUIPMENT).expect("mp_equipment_echocombat.json");
+    for (list, name) in ECHOCOMBAT_ONLY_GEAR {
+        if let Some(Value::Array(items)) = doc.pointer_mut(&format!("/gear_table/{list}")) {
+            items.retain(|i| i.get("name").and_then(Value::as_str) != Some(name));
+        }
+    }
+    serde_json::to_string(&doc).expect("json")
+}
+
 /// Which weapon settings the blocks start from.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Base {
@@ -197,9 +213,11 @@ pub fn build(body: &[u8], base: Base, changes: &Map<String, Value>) -> Result<Ve
         None
     };
     if let Some(weapons_doc) = swap {
-        for (id, doc) in [(weapons, weapons_doc), (doc_id("mp_equipment"), ECHOCOMBAT_EQUIPMENT)] {
+        // Games without EchoCombat: its gear left out of the loadout terminal.
+        let equipment = if base.echocombat { ECHOCOMBAT_EQUIPMENT.trim_end().to_owned() } else { stock_equipment() };
+        for (id, doc) in [(weapons, weapons_doc.trim_end()), (doc_id("mp_equipment"), equipment.as_str())] {
             if let Some((_, bytes)) = docs.iter_mut().find(|(d, _)| *d == id) {
-                *bytes = doc.trim_end().as_bytes().to_vec();
+                *bytes = doc.as_bytes().to_vec();
                 changed = true;
             }
         }
@@ -362,8 +380,14 @@ mod tests {
             let Some(w) = document(body, "mp_weapon_settings") else { continue };
             assert_eq!(w.pointer("/grenade_properties/dot/use_remote_trigger"), Some(&Value::Bool(true)), "level {level:#x}");
             assert_eq!(w.pointer("/ability_properties/smoke/duration").and_then(Value::as_f64), Some(240.0), "level {level:#x}");
-            let e = document(body, "mp_equipment").expect("gear list");
-            assert!(e.to_string().contains("NEUTRON"), "level {level:#x}: today's gear list");
+            // EchoCombat's gear list without its own four.
+            let e = document(body, "mp_equipment").expect("gear list").to_string();
+            for name in ["UMBRAL VEIL", "OVERCHARGE", "NEUTRON", "DRONE"] {
+                assert!(!e.contains(name), "level {level:#x}: {name} in a stock gear list");
+            }
+            for name in ["THREAT SCANNER", "PHASE SHIFT", "TRANSLOCATOR", "PROTOSTAR"] {
+                assert!(e.contains(name), "level {level:#x}: {name} missing");
+            }
         }
     }
 
