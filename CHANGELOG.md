@@ -3,6 +3,12 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.2.8 (2026-11-24)
+
+### Changes
+- Fission payload stays down the lift, gun heat meters - Fission: a payload rolling back after checkpoint 1 stops at the bottom of the lift instead of going back up it - Gun heat: each player's heat meter is sent the way native's server sends it (up with each shot, down after the gun's cooldown, empty after an overheat)
+- Automatic builds and releases on GitHub - A version change on main builds Windows and Linux, runs the tests and publishes the release - Release notes come from CHANGELOG.md, or from the commit messages since the last release
+
 ## 0.2.7 (2026-11-24)
 
 ### Fixed
