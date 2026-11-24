@@ -74,6 +74,9 @@ pub const LOADOUT_RESPONSE: u64 = h("SR15NetCurrentLoadoutResponse");
 pub const LOADOUT_NUMBER: u64 = h("SR15NetLoadoutNumberNotification");
 pub const STUN: u64 = h("SR15StunPlayerMsg");
 pub const EMOTE: u64 = h("SR15NetPlayEmote");
+/// THREAT SCANNER's ping `[owner 8][sensor 8]`, every ~6 s while it is out:
+/// passed on to the user's teammates.
+pub const SENSOR_PING: u64 = h("SR15NetSensorPing");
 pub const ACTOR_CREATE: u64 = h("SR15NetPooledActorCreate");
 pub const ACTOR_DESTROY: u64 = h("SR15NetPooledActorDestroy");
 pub const FORCE_PUSH: u64 = h("SR15ForcePushPlayer");

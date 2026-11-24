@@ -1743,6 +1743,20 @@ impl Session {
         }
     }
 
+    /// To the sender's teammates only (THREAT SCANNER's pings: native sent
+    /// them on to some players, never all).
+    fn relay_team(&mut self, from: SocketAddr, ty: u64, data: &[u8]) {
+        let Some(team) = self.peers.get(&from).map(|p| p.team) else { return };
+        if team != TEAM_BLUE && team != TEAM_ORANGE {
+            return;
+        }
+        for (a, p) in self.peers.iter_mut() {
+            if p.stage == Stage::Joined && *a != from && p.team == team {
+                p.t.queue_reliable(ty, data);
+            }
+        }
+    }
+
     fn send_gear(&mut self, from: SocketAddr, o: super::gear::Out) {
         use super::gear::To;
         match o.to {
@@ -1984,6 +1998,7 @@ impl Session {
             // destroy above is the only one anyone receives.
             ACTOR_DESTROY if reliable => debug!(%from, body = %hex_str(d), "client pooled-actor destroy (not relayed)"),
             EMOTE | FORCE_PUSH if reliable => self.relay_reliable(from, ty, d, true),
+            SENSOR_PING if reliable => self.relay_team(from, ty, d),
             _ if reliable && super::gear::handles(ty) => {
                 let outs = self.gear.on_message(from, ty, d, Instant::now());
                 for o in outs {
@@ -5482,6 +5497,17 @@ mod server_mute_tests {
         s.arena.private = true;
         s.on_assign_team(a[2], &ask(u16::from(TEAM_BLUE)));
         assert_eq!(s.peers[&a[2]].team, TEAM_BLUE);
+    }
+
+    /// THREAT SCANNER's pings reach the user's teammates only.
+    #[test]
+    fn threat_scanner_pings_go_to_teammates() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_BLUE), (2, TEAM_ORANGE)]);
+        let ping = |s: &Session, who: SocketAddr| s.peers[&who].t.queued_reliable.iter().any(|(ty, _)| *ty == SENSOR_PING);
+        s.relay_team(a[0], SENSOR_PING, &[1; 16]);
+        assert!(ping(&s, a[1]), "teammate");
+        assert!(!ping(&s, a[0]), "not back to its user");
+        assert!(!ping(&s, a[2]), "not the other team");
     }
 
     /// A player who drops and comes back to the same match gets their stats
