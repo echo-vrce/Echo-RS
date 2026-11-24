@@ -1,0 +1,163 @@
+# Builds and releases echo-rust-server and its launcher when the version in
+# Cargo.toml changes on main (or by hand: Actions > Release > Run workflow).
+#
+# - The server's and the launcher's versions must match.
+# - Nothing is released for a version that already has its tag (`vX.Y.Z`).
+# - Release notes: CHANGELOG.md's `## X.Y.Z` section if you wrote one;
+#   otherwise one is made from the commit messages since the previous
+#   release tag (tools/release_notes.py) and committed to CHANGELOG.md.
+# - Assets: echo-rust-server-windows.zip and echo-rust-server-linux.zip, the
+#   names the launcher's updater looks for (launcher/src/update.rs).
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  LINUX_TARGET: x86_64-unknown-linux-gnu.2.31
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          version=$(python3 tools/release_notes.py version Cargo.toml)
+          launcher=$(python3 tools/release_notes.py version launcher/Cargo.toml)
+          if [ "$version" != "$launcher" ]; then
+            echo "::error::Cargo.toml is $version but launcher/Cargo.toml is $launcher"
+            exit 1
+          fi
+          release=true
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already tagged: nothing to release"
+            release=false
+          elif [ "$EVENT" = push ]; then
+            old=$(git show "$BEFORE:Cargo.toml" 2>/dev/null | python3 tools/release_notes.py version - 2>/dev/null || true)
+            if [ "$old" = "$version" ]; then
+              echo "Cargo.toml changed but the version is still $version: nothing to release"
+              release=false
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "version $version, release $release"
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+
+  windows:
+    needs: [plan, test]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            launcher
+      - name: Build (C runtime built in, .cargo/config.toml)
+        shell: bash
+        run: |
+          cargo build --release
+          cd launcher
+          cargo build --release
+      - name: Launcher tests
+        shell: bash
+        working-directory: launcher
+        run: cargo test --release
+      - name: Package
+        shell: bash
+        run: python tools/package_release.py windows target/release/echo-rust-server.exe launcher/target/release/echo-server-launcher.exe echo-rust-server-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: echo-rust-server-windows.zip
+
+  linux:
+    needs: [plan, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            launcher
+      - name: Zig (glibc 2.31, so older distros run it)
+        run: pip install ziglang cargo-zigbuild
+      - name: Build
+        run: |
+          cargo zigbuild --release --target "$LINUX_TARGET"
+          cd launcher
+          cargo zigbuild --release --target "$LINUX_TARGET"
+      - name: Package
+        run: python3 tools/package_release.py linux target/x86_64-unknown-linux-gnu/release/echo-rust-server launcher/target/x86_64-unknown-linux-gnu/release/echo-server-launcher echo-rust-server-linux.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: echo-rust-server-linux.zip
+
+  release:
+    needs: [plan, windows, linux]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Release notes
+        run: python3 tools/release_notes.py notes "$VERSION" --out notes.md --update
+      - name: Commit CHANGELOG.md (when the notes were made from commits)
+        run: |
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md already had $VERSION"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "CHANGELOG.md: $VERSION [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::could not push CHANGELOG.md (branch protection?); the release still has the notes"
+      - name: Publish
+        run: |
+          gh release create "v$VERSION" assets/echo-rust-server-windows.zip assets/echo-rust-server-linux.zip \
+            --title "v$VERSION" --notes-file notes.md --target "$GITHUB_SHA"

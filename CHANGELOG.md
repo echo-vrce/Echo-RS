@@ -19,7 +19,8 @@ launcher share one version number.
 - **OVERCHARGE:** linked teammates can't die for 6.5 seconds (was 5), and its
   user's hits deal +1.5 on the body and +2.5 on the head (were +1 and +2).
 - Players without EchoCombat no longer see an ENERGY BARRIER where someone
-  used UMBRAL VEIL or NEUTRON. NEUTRON's stun still hits them. For UMBRAL
+  used UMBRAL VEIL or NEUTRON (and their shots no longer stop on it).
+  NEUTRON's stun still hits them. For UMBRAL
   VEIL they get the stock DETONATOR smoke at the veil instead (a puff every
   2 seconds for the veil's 8), since only EchoCombat can draw the veil itself.
 - UMBRAL VEIL no longer counts as a barrier on the server: it stops no blasts
@@ -34,8 +35,8 @@ launcher share one version number.
   gets its refund. Each is logged as a warning.
 - **Rejoins:** the server holds a player's stats for 90 seconds after they
   leave a match. If they come back in that time, they get their stats back
-  on the scoreboard and for the end-of-match awards and XP, and their old
-  team if it has room.
+  on the scoreboard, in the team totals and for the end-of-match awards and
+  XP, and their old team if it has room.
 - **Lag compensation for blasts:** DETONATOR, METEOR and COMET blasts also
   hit a player where the thrower's game showed them (up to 250 ms back, by
   the thrower's ping), not only where they are now. Bullet hits were already
