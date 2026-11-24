@@ -1244,6 +1244,10 @@ impl Arena {
     }
 }
 
+/// How long a game that asked for its gear tables waits for VeilNet's hello
+/// (sent every 2 s) before it gets the stock tables.
+const BALANCE_WAIT: Duration = Duration::from_millis(2500);
+
 // ── Session ────────────────────────────────────────────────────────────────
 
 pub struct SessionInfo {
@@ -1266,6 +1270,12 @@ pub struct Session {
     /// Games given the stock gear tables (no EchoCombat seen yet): they get
     /// EchoCombat's if it shows up later.
     stock_balance: HashSet<SocketAddr>,
+    /// Games that asked for the gear tables before VeilNet showed whether they
+    /// have EchoCombat: answered when it does, or with the stock tables at the
+    /// deadline. (Answering stock at once left EchoCombat games that VeilNet
+    /// showed a moment later on the stock tables: the game kept the first
+    /// ones it loaded, and its EchoCombat guns and gear went missing.)
+    balance_wait: HashMap<SocketAddr, Instant>,
     /// Players who left this match, by platform id (rejoins).
     departed: HashMap<[u64; 2], Departed>,
     /// Seconds since the last combat stat update.
@@ -1591,6 +1601,7 @@ impl Session {
             combat_sent: HashMap::new(),
             ec_clients: HashSet::new(),
             stock_balance: HashSet::new(),
+            balance_wait: HashMap::new(),
             departed: HashMap::new(),
             combat_stat_clock: 0.0,
             cap_owner: None,
@@ -1718,12 +1729,39 @@ impl Session {
     /// VeilNet showed this game has EchoCombat. Given the stock tables
     /// before that: EchoCombat's now.
     pub fn mark_echocombat(&mut self, addr: SocketAddr) {
-        if !self.ec_clients.insert(addr) || !self.stock_balance.remove(&addr) {
+        if !self.ec_clients.insert(addr) {
+            return;
+        }
+        if self.balance_wait.remove(&addr).is_some() {
+            info!(%addr, "EchoCombat seen while its game waited: its gear tables");
+            self.send_balance(addr);
+            return;
+        }
+        if !self.stock_balance.remove(&addr) {
             return;
         }
         if let Some((_, body)) = captured().balance.iter().find(|(l, _)| *l == self.info.level) {
             info!(%addr, "EchoCombat seen: its gear tables");
             self.reliable_to(addr, BALANCE_UPDATE, body);
+        }
+    }
+
+    /// The gear tables for this game: EchoCombat's if VeilNet showed it has
+    /// EchoCombat (or the server has none), else the stock ones.
+    fn send_balance(&mut self, to: SocketAddr) {
+        self.balance_wait.remove(&to);
+        let stock = super::balance::echocombat_base() && !self.ec_clients.contains(&to);
+        let blocks = if stock { &captured().balance_stock } else { &captured().balance };
+        match blocks.iter().find(|(l, _)| *l == self.info.level) {
+            Some((_, body)) => {
+                let body = body.clone();
+                self.reliable_to(to, BALANCE_UPDATE, &body);
+                if stock {
+                    info!(%to, "no EchoCombat seen: stock gear tables");
+                    self.stock_balance.insert(to);
+                }
+            }
+            None => warn!(level = format_args!("{:#018x}", self.info.level), "no balance settings for this level; client will wait"),
         }
     }
 
@@ -1827,18 +1865,12 @@ impl Session {
                 }
             }
             BALANCE_READY => {
-                // Each game gets the gear tables it has the scripts for.
-                let stock = super::balance::echocombat_base() && !self.ec_clients.contains(&from);
-                let blocks = if stock { &captured().balance_stock } else { &captured().balance };
-                match blocks.iter().find(|(l, _)| *l == self.info.level) {
-                    Some((_, body)) => {
-                        self.reliable_to(from, BALANCE_UPDATE, body);
-                        if stock {
-                            info!(%from, "no EchoCombat seen: stock gear tables");
-                            self.stock_balance.insert(from);
-                        }
-                    }
-                    None => warn!(level = format_args!("{:#018x}", self.info.level), "no balance settings for this level; client will wait"),
+                // Each game gets the gear tables it has the scripts for. Not
+                // known to have EchoCombat yet: wait for VeilNet's hello.
+                if super::balance::echocombat_base() && !self.ec_clients.contains(&from) {
+                    self.balance_wait.entry(from).or_insert(Instant::now() + BALANCE_WAIT);
+                } else {
+                    self.send_balance(from);
                 }
             }
             REPLICATED_READY => {
@@ -3080,6 +3112,7 @@ impl Session {
 
     fn drop_peer(&mut self, addr: SocketAddr, code: Option<pb::lobby_entrant_removed_message::Code>) {
         let Some(p) = self.peers.remove(&addr) else { return };
+        self.balance_wait.remove(&addr);
         // Their gear stations are freed for everyone still here.
         for o in self.gear.forget(addr) {
             self.send_gear(addr, o);
@@ -3257,6 +3290,11 @@ impl Session {
         }
         for (from, o) in self.gear.due(Instant::now()) {
             self.send_gear(from, o);
+        }
+        let now = Instant::now();
+        let late: Vec<SocketAddr> = self.balance_wait.iter().filter(|(_, t)| **t <= now).map(|(a, _)| *a).collect();
+        for a in late {
+            self.send_balance(a);
         }
         // UMBRAL VEIL's stand-in: only games without EchoCombat.
         let stock: Vec<SocketAddr> = self.peers.iter().filter(|(a, p)| p.stage == Stage::Joined && !self.ec_clients.contains(*a)).map(|(a, _)| *a).collect();
@@ -5497,6 +5535,24 @@ mod server_mute_tests {
         s.arena.private = true;
         s.on_assign_team(a[2], &ask(u16::from(TEAM_BLUE)));
         assert_eq!(s.peers[&a[2]].team, TEAM_BLUE);
+    }
+
+    /// A game asking for its gear tables before VeilNet showed EchoCombat
+    /// waits for it (then gets EchoCombat's), or gets the stock ones at the
+    /// deadline: never stock first and EchoCombat's after.
+    #[test]
+    fn gear_tables_wait_for_veilnet() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_ORANGE)]);
+        let sent = |s: &Session, who: SocketAddr| s.peers[&who].t.queued_reliable.iter().filter(|(ty, _)| *ty == BALANCE_UPDATE).count();
+        s.balance_wait.insert(a[0], Instant::now() + BALANCE_WAIT);
+        s.mark_echocombat(a[0]);
+        assert!(s.balance_wait.is_empty(), "answered");
+        assert!(!s.stock_balance.contains(&a[0]), "not stock");
+        assert!(sent(&s, a[0]) <= 1, "one table, not two");
+        // No hello: stock at the deadline.
+        s.balance_wait.insert(a[1], Instant::now() - Duration::from_millis(1));
+        s.service();
+        assert!(s.balance_wait.is_empty(), "the deadline answered it");
     }
 
     /// THREAT SCANNER's pings reach the user's teammates only.
