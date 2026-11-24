@@ -80,9 +80,13 @@ def commit_lines(since: str | None) -> list[str]:
         if "[skip ci]" in subject or subject.lower().startswith("chore(release)"):
             continue
         subject = VERSION_PREFIX.sub("", subject)
+        # A message with no blank line after its title: git folds its "- "
+        # lines into the subject.
+        subject, *folded = re.split(r" - (?=\S)", subject)
         if not subject:
             continue
         out.append(f"- {subject[0].upper()}{subject[1:]}")
+        out.extend(f"  - {f}" for f in folded)
         bullet = False
         for line in body.splitlines():
             if TRAILER.match(line.strip()):
