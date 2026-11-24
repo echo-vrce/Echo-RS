@@ -3,6 +3,15 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.0 (2026-11-24)
+
+### Changes
+- EchoCombat-only gear hidden from players without the mod
+  - Players without EchoCombat no longer see UMBRAL VEIL, OVERCHARGE, NEUTRON or DRONE in the loadout terminal
+- EchoCombat players get their own gear tables first
+  - A game that asks for its gear tables before VeilNet has recognised it waits up to 2.5 s; EchoCombat games then get EchoCombat's tables first instead of the stock ones (which left their EchoCombat guns and gear missing)
+  - Games without EchoCombat still get the stock tables, at most 2.5 s later while loading
+
 ## 0.2.9 (2026-11-24)
 
 ### Changes
