@@ -1266,6 +1266,8 @@ pub struct Session {
     /// Games given the stock gear tables (no EchoCombat seen yet): they get
     /// EchoCombat's if it shows up later.
     stock_balance: HashSet<SocketAddr>,
+    /// Players who left this match, by platform id (rejoins).
+    departed: HashMap<[u64; 2], Departed>,
     /// Seconds since the last combat stat update.
     combat_stat_clock: f32,
     /// The capture point's holder last tick (for capture credits).
@@ -1440,6 +1442,18 @@ fn profile_periods(unix: u64) -> (String, String) {
 const LOADOUT_SAVE_DELAY: Duration = Duration::from_millis(1500);
 /// A loadout number this soon after a team change belongs to the change.
 const TEAM_LOADOUT_WINDOW: Duration = Duration::from_secs(2);
+/// A player who comes back to the same match within this gets their team and
+/// their stats back.
+const REJOIN_WINDOW: Duration = Duration::from_secs(90);
+
+/// A player who left a match, kept for `REJOIN_WINDOW`.
+struct Departed {
+    at: Instant,
+    team: u8,
+    stats: Stats,
+    extra: super::stats::ArenaExtra,
+    cstats: CombatStats,
+}
 
 fn swizzle(raw: [u8; 16]) -> Uuid {
     let mut b = raw;
@@ -1577,6 +1591,7 @@ impl Session {
             combat_sent: HashMap::new(),
             ec_clients: HashSet::new(),
             stock_balance: HashSet::new(),
+            departed: HashMap::new(),
             combat_stat_clock: 0.0,
             cap_owner: None,
             recent_hits: HashMap::new(),
@@ -1941,8 +1956,21 @@ impl Session {
             ACTOR_CREATE if reliable && d.len() != 160 => {
                 debug!(%from, len = d.len(), "tac mod effect actor (relayed, not destroyed)");
                 // A NEUTRON's wall: its stun blast is the server's to set off.
+                // UMBRAL VEIL and NEUTRON are walls EchoCombat's scripts
+                // turn into the veil or the field; games without them would
+                // show (and shoot into) an ENERGY BARRIER, so only EchoCombat
+                // games get them. NEUTRON's stun is the server's, for everyone.
+                let ec_only = self.gear.echocombat_wall(from, d);
                 self.gear.wall_placed(from, d, Instant::now());
-                self.relay_reliable(from, ty, d, false);
+                if ec_only {
+                    let to: Vec<SocketAddr> = self.ec_clients.iter().copied().filter(|a| *a != from && self.peers.get(a).is_some_and(|p| p.stage == Stage::Joined)).collect();
+                    debug!(%from, games = to.len(), "EchoCombat wall: only to EchoCombat games");
+                    for a in to {
+                        self.reliable_to(a, ty, d);
+                    }
+                } else {
+                    self.relay_reliable(from, ty, d, false);
+                }
             }
             ACTOR_CREATE if reliable => {
                 // Native (public match + lobby, 2026-11-16): the create goes to
@@ -2223,7 +2251,11 @@ impl Session {
             TEAM_SOCIAL
         } else {
             match p.requested_team {
-                Some(t @ (TEAM_BLUE | TEAM_ORANGE)) if (if t == TEAM_BLUE { b } else { o }) < 8 => t,
+                Some(t @ (TEAM_BLUE | TEAM_ORANGE)) if self.team_ok(addr, t) => t,
+                Some(t @ (TEAM_BLUE | TEAM_ORANGE)) if (if t == TEAM_BLUE { b } else { o }) < 8 => {
+                    info!(%addr, asked = t, blue = b, orange = o, "public match: joiner put on the smaller team");
+                    if b <= o { TEAM_BLUE } else { TEAM_ORANGE }
+                }
                 Some(t @ (TEAM_SPECTATOR | TEAM_MODERATOR)) => t,
                 _ if b <= o => TEAM_BLUE,
                 _ => TEAM_ORANGE,
@@ -2414,10 +2446,12 @@ impl Session {
         if p.entrant_header.is_none() {
             p.entrant_header = Some(d[..ENTRANT_HEADER].to_vec());
         }
+        let mut first_id = false;
         if p.xpid.is_none() && d.len() >= 16 {
             let x = [u64::from_le_bytes(d[..8].try_into().expect("8")), u64::from_le_bytes(d[8..16].try_into().expect("8"))];
             p.xpid = Some(x);
             crate::upstream::note_entrant(p.entrant_id, x);
+            first_id = true;
         }
         p.entrant_latest = Some(d);
         p.entrant_states += 1;
@@ -2434,6 +2468,9 @@ impl Session {
             p.deferred.push((2, REFRESH_PROFILE, captured().refresh_profile.clone()));
             p.join_tail_in = Some(3);
             p.owner_resend_in = Some(3);
+        }
+        if first_id {
+            self.restore_rejoiner(from);
         }
     }
 
@@ -3057,6 +3094,15 @@ impl Session {
                 code: code.unwrap_or(pb::lobby_entrant_removed_message::Code::Disconnected) as i32,
             })));
         }
+        if !self.social
+            && self.close_at.is_none()
+            && matches!(p.team, TEAM_BLUE | TEAM_ORANGE)
+            && let Some(x) = p.xpid
+        {
+            let now = Instant::now();
+            self.departed.retain(|_, d| now.saturating_duration_since(d.at) <= REJOIN_WINDOW);
+            self.departed.insert(x, Departed { at: now, team: p.team, stats: p.stats, extra: p.extra, cstats: p.cstats });
+        }
         let l = p.t.stats;
         info!(%addr, slot = p.slot, players = self.player_count(), ping_ms = ?p.t.rtt_us().map(|u| (u + 500) / 1000), loss_pct = format_args!("{:.1}", l.loss_pct()), late = l.mb_late, resends = l.resends, "player left");
         self.last_activity = Instant::now();
@@ -3190,8 +3236,19 @@ impl Session {
         self.watch_spectators(Instant::now());
         self.watch_map_switch(Instant::now());
         self.save_loadouts();
+        let pings: Vec<(SocketAddr, u32)> = self.peers.iter().filter_map(|(a, p)| p.t.rtt_us().map(|u| (*a, u))).collect();
+        for (a, us) in pings {
+            self.gear.set_ping(a, Duration::from_micros(u64::from(us)));
+        }
         for (from, o) in self.gear.due(Instant::now()) {
             self.send_gear(from, o);
+        }
+        // UMBRAL VEIL's stand-in: only games without EchoCombat.
+        let stock: Vec<SocketAddr> = self.peers.iter().filter(|(a, p)| p.stage == Stage::Joined && !self.ec_clients.contains(*a)).map(|(a, _)| *a).collect();
+        for o in self.gear.due_stock(Instant::now()) {
+            for a in &stock {
+                self.reliable_to(*a, o.ty, &o.body);
+            }
         }
         self.flush_reliable();
     }
@@ -3266,6 +3323,7 @@ impl Session {
         self.recent_hits.clear();
         self.gear = super::gear::Gear::new();
         self.gear.set_match(level);
+        self.departed.clear();
         self.touch.clear();
         self.touch_seq.clear();
         let now = Instant::now();
@@ -5252,27 +5310,15 @@ impl Session {
         let want = u8::try_from(u16_at(d, 4)).unwrap_or(u8::MAX);
         let Some(p) = self.peers.get(&from) else { return };
         let (Some(slot), old) = (p.slot, p.team) else { return };
-        let full = |s: &Self, t: u8| s.peers.values().filter(|q| q.stage == Stage::Joined && q.team == t).count() >= 8;
         let ok = match want {
-            TEAM_BLUE | TEAM_ORANGE => !full(self, want),
+            TEAM_BLUE | TEAM_ORANGE => self.team_ok(from, want),
             TEAM_SPECTATOR | TEAM_MODERATOR => true,
             // The social lobby's combat area: back to no team.
             TEAM_SOCIAL => self.social,
             _ => false,
         };
         let team = if ok && want != old {
-            let used: Vec<u16> = self.peers.values().filter(|q| q.stage == Stage::Joined && q.team == want).map(|q| q.team_slot).collect();
-            let team_slot = (0..).find(|s| !used.contains(s)).unwrap_or(0);
-            let p = self.peers.get_mut(&from).expect("present");
-            p.team = want;
-            p.team_slot = team_slot;
-            p.requested_team = Some(want);
-            p.team_changed_at = Some(Instant::now());
-            let tc = team_changed(slot, want, Some(old));
-            for a in self.joined() {
-                self.reliable_to(a, ENTRANT_TEAM_CHANGED, &tc);
-            }
-            self.roster_dirty = true;
+            self.move_team(from, slot, old, want);
             info!(%from, slot, old, team = want, "team change");
             want
         } else {
@@ -5282,6 +5328,66 @@ impl Session {
         self.reliable_to(from, ASSIGN_TEAM_RESPONSE, &[team, 2]);
         if team != old {
             self.publish_owner_state();
+        }
+    }
+}
+
+impl Session {
+    /// A public match (not the social lobby, not private).
+    fn public_match(&self) -> bool {
+        !self.social && self.combat.as_ref().map_or(!self.arena.private, |c| !c.is_private())
+    }
+
+    /// Whether `who` may be on `team` (blue or orange): it has room, and in a
+    /// public match it would not end up with more players than the other
+    /// team (counting neither with `who`).
+    fn team_ok(&self, who: SocketAddr, team: u8) -> bool {
+        let n = |t: u8| self.peers.iter().filter(|(a, q)| **a != who && q.stage == Stage::Joined && q.team == t).count();
+        let other = if team == TEAM_BLUE { TEAM_ORANGE } else { TEAM_BLUE };
+        n(team) < 8 && (!self.public_match() || n(team) <= n(other))
+    }
+
+    /// `from` (in `slot`) onto `want`, told to everyone.
+    fn move_team(&mut self, from: SocketAddr, slot: usize, old: u8, want: u8) {
+        let used: Vec<u16> = self.peers.values().filter(|q| q.stage == Stage::Joined && q.team == want).map(|q| q.team_slot).collect();
+        let team_slot = (0..).find(|s| !used.contains(s)).unwrap_or(0);
+        let Some(p) = self.peers.get_mut(&from) else { return };
+        p.team = want;
+        p.team_slot = team_slot;
+        p.requested_team = Some(want);
+        p.team_changed_at = Some(Instant::now());
+        let tc = team_changed(slot, want, Some(old));
+        for a in self.joined() {
+            self.reliable_to(a, ENTRANT_TEAM_CHANGED, &tc);
+        }
+        self.roster_dirty = true;
+    }
+
+    /// A player back in the match they left less than `REJOIN_WINDOW` ago
+    /// (known by their platform id once their game sends it): their stats
+    /// back, and their old team if they came back on the other one and it
+    /// has room (and, in a public match, would not outnumber the other).
+    fn restore_rejoiner(&mut self, addr: SocketAddr) {
+        let Some(x) = self.peers.get(&addr).and_then(|p| p.xpid) else { return };
+        let Some(d) = self.departed.remove(&x) else { return };
+        if d.at.elapsed() > REJOIN_WINDOW || self.close_at.is_some() {
+            return;
+        }
+        let Some(p) = self.peers.get_mut(&addr) else { return };
+        p.stats = d.stats;
+        p.extra = d.extra;
+        p.cstats = d.cstats;
+        let (slot, team) = (p.slot, p.team);
+        info!(%addr, away = ?d.at.elapsed(), old_team = d.team, team, "rejoined: stats back");
+        if let Some(slot) = slot
+            && matches!(team, TEAM_BLUE | TEAM_ORANGE)
+            && team != d.team
+            && self.team_ok(addr, d.team)
+        {
+            self.move_team(addr, slot, team, d.team);
+            self.reliable_to(addr, ASSIGN_TEAM_RESPONSE, &[d.team, 2]);
+            self.publish_owner_state();
+            info!(%addr, slot, team = d.team, "rejoined: back on their old team");
         }
     }
 }
@@ -5330,6 +5436,83 @@ mod server_mute_tests {
         p.stage = Stage::Joined;
         p.entrant_id = entrant;
         p
+    }
+
+    fn arena_with(teams: &[(u8, u8)]) -> (Session, Vec<SocketAddr>) {
+        let mut s = Session::new(SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_ARENA }, 1);
+        let mut addrs = Vec::new();
+        for (i, (slot, team)) in teams.iter().enumerate() {
+            let a: SocketAddr = format!("10.0.1.{}:1", i + 1).parse().unwrap();
+            let mut p = joined_peer(Uuid::from_u128(100 + i as u128));
+            p.team = *team;
+            p.slot = Some(usize::from(*slot));
+            p.xpid = Some([1, 100 + i as u64]);
+            s.slot_addr[usize::from(*slot)] = Some(a);
+            s.peers.insert(a, p);
+            addrs.push(a);
+        }
+        (s, addrs)
+    }
+
+    /// Public matches: a joiner asking for the bigger team goes on the
+    /// smaller one, and nobody switches onto a team that would outnumber the
+    /// other. Private matches let both happen.
+    #[test]
+    fn public_matches_keep_teams_even() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_BLUE), (2, TEAM_ORANGE)]);
+        assert!(s.public_match());
+        let new: SocketAddr = "10.0.2.1:1".parse().unwrap();
+        let mut p = joined_peer(Uuid::from_u128(9));
+        p.stage = Stage::AwaitingAccept;
+        p.requested_team = Some(TEAM_BLUE);
+        s.peers.insert(new, p);
+        s.assign_team(new);
+        assert_eq!(s.peers[&new].team, TEAM_ORANGE, "2v1: on orange");
+        // 2v1: orange's player can't switch to blue (3v0).
+        let ask = |team: u16| [&2u32.to_le_bytes()[..], &team.to_le_bytes()].concat();
+        s.on_assign_team(a[2], &ask(u16::from(TEAM_BLUE)));
+        assert_eq!(s.peers[&a[2]].team, TEAM_ORANGE);
+        // A blue player may go to orange (1v2).
+        s.on_assign_team(a[0], &ask(u16::from(TEAM_ORANGE)));
+        assert_eq!(s.peers[&a[0]].team, TEAM_ORANGE);
+        // Private: as asked.
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_BLUE), (2, TEAM_ORANGE)]);
+        s.arena.private = true;
+        s.on_assign_team(a[2], &ask(u16::from(TEAM_BLUE)));
+        assert_eq!(s.peers[&a[2]].team, TEAM_BLUE);
+    }
+
+    /// A player who drops and comes back to the same match gets their stats
+    /// and their old team back.
+    #[test]
+    fn a_rejoiner_gets_their_team_and_stats_back() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_ORANGE), (2, TEAM_ORANGE)]);
+        s.peers.get_mut(&a[1]).unwrap().stats.add(Stat::Goals, 2);
+        let id = s.peers[&a[1]].xpid;
+        s.drop_peer(a[1], None);
+        // Back (1v1), on blue this time.
+        let back: SocketAddr = "10.0.3.1:1".parse().unwrap();
+        let mut p = joined_peer(Uuid::from_u128(77));
+        p.team = TEAM_BLUE;
+        p.slot = Some(5);
+        p.xpid = id;
+        s.slot_addr[5] = Some(back);
+        s.peers.insert(back, p);
+        s.restore_rejoiner(back);
+        assert_eq!(s.peers[&back].stats.get(Stat::Goals), 2);
+        assert_eq!(s.peers[&back].team, TEAM_ORANGE);
+        // Only once.
+        assert!(s.departed.is_empty());
+        // Someone else with no history: nothing changes.
+        let other: SocketAddr = "10.0.3.2:1".parse().unwrap();
+        let mut p = joined_peer(Uuid::from_u128(78));
+        p.team = TEAM_BLUE;
+        p.slot = Some(6);
+        p.xpid = Some([1, 999]);
+        s.peers.insert(other, p);
+        s.restore_rejoiner(other);
+        assert_eq!(s.peers[&other].team, TEAM_BLUE);
+        assert_eq!(s.peers[&other].stats.get(Stat::Goals), 0);
     }
 
     /// Public overtime: the HUD's round counter follows the overtime round

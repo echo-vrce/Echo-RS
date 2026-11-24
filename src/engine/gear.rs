@@ -27,7 +27,7 @@
 //!   (an extra `AbilityCooldown`, a full `DamageableHealthBroadcast` and the
 //!   heal bubbles' last parameters).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -166,6 +166,8 @@ const TAC_WRAITH: u64 = 0x41d2_d02f_1b2a_1316;
 const ITEM_ARC: [u8; 8] = [0xe9, 0xf0, 0x91, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
 /// NEUTRON's tac mod (EchoCombat's `point`; `CSymbol64("point")`).
 const TAC_POINT: u64 = 0xe32d_c7ca_d686_4aa4;
+/// UMBRAL VEIL's tac mod (EchoCombat's `smoke`).
+const TAC_SMOKE: u64 = crate::wire::symbol::symbol("smoke");
 /// INSTANT REPAIR (`grenade_properties.burst`).
 const ITEM_BURST: [u8; 8] = [0xe9, 0xed, 0x9c, 0xa8, 0xb1, 0xd0, 0xe8, 0xc8];
 /// A bullet collision's target (bytes 32..40) is a pool handle when its kind
@@ -335,7 +337,7 @@ const OVERCHARGE_DR: f32 = 0.25;
 /// DOT FIELD's time on the ground (the user's choice, 2026-11-16; stock 8 s).
 const DOT_LIFETIME: Duration = Duration::from_secs(11);
 /// OVERCHARGE's cheat death: `ability_properties.buff.cheat_death_seconds`
-/// (EchoCombat: 5) from a teammate's first link in a use, or none when
+/// (EchoCombat: 6.5) from a teammate's first link in a use, or none when
 /// `do_rez_buff` is 0.
 fn cheat_death() -> Duration {
     let b = |k: &str| weapons().pointer(&format!("/ability_properties/buff/{k}")).and_then(Value::as_f64);
@@ -678,6 +680,11 @@ const STUN_SETTLE: Duration = Duration::from_millis(150);
 /// The fastest a STUN FIELD's grenade is followed (m/s), plus a margin:
 /// a bigger jump is another of its thrower's objects, not this grenade.
 const STUN_FOLLOW_SPEED: f32 = 40.0;
+/// The longest gap the follow allowance grows over (s).
+const STUN_FOLLOW_MAX_DT: f32 = 0.1;
+/// Once on its grenade, each update is the grenade's next step: a field
+/// never moves further than its speed allows plus this (m).
+const STUN_FOLLOW_TRACKED_SLACK: f32 = 0.5;
 const STUN_FOLLOW_SLACK: f32 = 2.0;
 
 /// (victim id, reported position, distance, player, marker hit code)
@@ -727,6 +734,10 @@ pub struct Gear {
     later: Vec<(Instant, SocketAddr, Out)>,
     /// Each player's slot and body position (metres).
     bodies: HashMap<SocketAddr, (u16, [f32; 3])>,
+    /// Lag compensation: each body's recent positions (`HISTORY` of them).
+    history: HashMap<SocketAddr, VecDeque<(Instant, [f32; 3])>>,
+    /// Each player's round trip, from the session (`set_ping`).
+    pings: HashMap<SocketAddr, Duration>,
     /// Each player's team (0 blue, 1 orange, else not playing), kept by the session.
     pub teams: HashMap<SocketAddr, u8>,
     /// Each player's lobby slot, kept by the session: whose gear stations to
@@ -739,6 +750,15 @@ pub struct Gear {
     checks: super::checks::Checks,
     /// Where each player's thrown ordnance is.
     thrown_at: HashMap<SocketAddr, [f32; 3]>,
+    /// When each player last took a new ordnance: from then on their thrown
+    /// position is that one's, not an older STUN FIELD's grenade.
+    spawned_at: HashMap<SocketAddr, Instant>,
+    /// Safety net: each player's ordnance thrown or placed and not yet given
+    /// back (when the refund is overdue, its `CooldownRefund` body).
+    owed_refund: HashMap<SocketAddr, (Instant, Vec<u8>)>,
+    /// Safety net: each player's tac mod in use (when its `AbilityCooldown`
+    /// is overdue, its `[slot u32]`).
+    tac_running: HashMap<SocketAddr, (Instant, [u8; 4])>,
     /// Where it was before its last move, and whether it has stopped since
     /// (stuck to a surface): a DETONATOR's blast does not go through that surface.
     thrown_from: HashMap<SocketAddr, ([f32; 3], bool)>,
@@ -790,6 +810,11 @@ pub struct Gear {
     last_wall: HashMap<SocketAddr, (Instant, Vec<u8>)>,
     /// Each player's last VeilNet `P` token not yet matched to a wall.
     point_tokens: HashMap<SocketAddr, Instant>,
+    /// For games without EchoCombat only (`due_stock`): the stock DETONATOR
+    /// smoke standing in for UMBRAL VEIL, which they can't show.
+    stock_only: Vec<(Instant, Out)>,
+    /// The next stand-in magazine's number.
+    veil_mags: u32,
     /// ARC MINEs out.
     mines: Vec<Mine>,
     /// Running OVERCHARGE heals, and each linked teammate's OVERCHARGE user.
@@ -844,11 +869,16 @@ impl Gear {
             mags: HashMap::new(),
             later: Vec::new(),
             bodies: HashMap::new(),
+            history: HashMap::new(),
+            pings: HashMap::new(),
             teams: HashMap::new(),
             slots: HashMap::new(),
             gens: HashMap::new(),
             checks: super::checks::Checks::default(),
             thrown_at: HashMap::new(),
+            spawned_at: HashMap::new(),
+            owed_refund: HashMap::new(),
+            tac_running: HashMap::new(),
             thrown_from: HashMap::new(),
             fields: Vec::new(),
             bubbles: Vec::new(),
@@ -865,6 +895,8 @@ impl Gear {
             neutrons: Vec::new(),
             last_wall: HashMap::new(),
             point_tokens: HashMap::new(),
+            stock_only: Vec::new(),
+            veil_mags: 0,
             tactical: HashMap::new(),
             phased: HashMap::new(),
             inside: Vec::new(),
@@ -909,6 +941,128 @@ impl Gear {
             self.phased.remove(&who);
         }
         self.tactical.insert(who, tac);
+    }
+
+    /// A placed wall (`PooledActorCreate`, 96 bytes) from this player is
+    /// EchoCombat's UMBRAL VEIL or NEUTRON: only EchoCombat's scripts turn it
+    /// into that, so a game without them would show an ENERGY BARRIER.
+    pub fn echocombat_wall(&self, from: SocketAddr, d: &[u8]) -> bool {
+        d.len() == 96
+            && d[32..40] == WALL_TEMPLATE
+            && (matches!(self.tactical.get(&from), Some(&TAC_SMOKE | &TAC_POINT))
+                || self.point_tokens.get(&from).is_some_and(|t| t.elapsed() <= POINT_TOKEN_WINDOW))
+    }
+
+    /// UMBRAL VEIL for games without EchoCombat: a stock game has no veil
+    /// (EchoCombat's script spawns DETONATOR smoke, scaled), so it gets real
+    /// DETONATOR smoke where the veil is, a puff every `VEIL_PUFF_EVERY` for
+    /// `veil_cloud_lifetime`. Each puff is a magazine as another player's
+    /// DETONATOR reaches a game (client recording 2026-11-16: spawned with
+    /// its position at bytes 12..24, detonated, used, destroyed 2.5 s later),
+    /// with nothing hit: it hurts nobody.
+    fn veil_stand_in(&mut self, from: SocketAddr, at: [f32; 3], now: Instant) {
+        let space = self.space;
+        let slot = self.slot_of(&from) as u16;
+        let owner = self.id_of(&from, slot);
+        let life = weapons().pointer("/ability_properties/smoke/veil_cloud_lifetime").and_then(Value::as_f64).unwrap_or(8.0).clamp(0.5, 60.0);
+        let puffs = (life / VEIL_PUFF_EVERY.as_secs_f64()).ceil().max(1.0) as u32;
+        for k in 0..puffs {
+            self.veil_mags = self.veil_mags.wrapping_add(1);
+            let mut mag = VEIL_MAG;
+            mag[4..8].copy_from_slice(&self.veil_mags.to_le_bytes());
+            let t = now + VEIL_PUFF_EVERY * k;
+            let mut spawn = owner.to_vec();
+            spawn.extend_from_slice(&1u32.to_le_bytes());
+            for c in at {
+                spawn.extend_from_slice(&c.to_le_bytes());
+            }
+            spawn.extend_from_slice(&ITEM_DET);
+            spawn.extend_from_slice(&mag);
+            self.stock_only.push((t, out(To::All, SPAWN_MAGAZINE, &spawn)));
+            let t = t + Duration::from_millis(50);
+            self.stock_only.push((t, out(To::All, MAGAZINE_STATE, &[space.as_slice(), &mag, &MAG_THROWN].concat())));
+            self.stock_only.push((t, out(To::All, EXPLOSION_NOTHING_HIT, &[space.as_slice(), &EX_DET, &mag].concat())));
+            self.stock_only.push((t + Duration::from_millis(100), out(To::All, MAGAZINE_STATE, &[space.as_slice(), &mag, &MAG_USED].concat())));
+            self.stock_only.push((t + DESTROY_AFTER, out(To::All, DESTROY_MAGAZINE, &mag)));
+        }
+    }
+
+    /// What only games without EchoCombat get, now.
+    pub fn due_stock(&mut self, now: Instant) -> Vec<Out> {
+        let mut v = Vec::new();
+        self.stock_only.retain(|(t, o)| {
+            if *t <= now {
+                v.push(o.clone());
+                false
+            } else {
+                true
+            }
+        });
+        v
+    }
+
+    /// The safety net's view of a player's gear: what was used and not yet
+    /// recharged. Cleared by the recharge itself (or proof of it: a new
+    /// ordnance in hand), set by a throw or a tac mod switched on.
+    fn watch_recharge(&mut self, from: SocketAddr, ty: u64, d: &[u8], now: Instant) {
+        match ty {
+            ABILITY_ACTIVATE if d.len() == 8 && d[4..8] != [0; 4] => {
+                let tac = self.tactical.get(&from).copied().unwrap_or(0);
+                let mut slot = [0; 4];
+                slot.copy_from_slice(&d[..4]);
+                self.tac_running.insert(from, (now + tac_overdue(tac), slot));
+            }
+            // A respawn gives the tac mod back on the client's own.
+            ABILITY_COOLDOWN | PLAYER_RESPAWN => {
+                self.tac_running.remove(&from);
+            }
+            SPAWN_MAGAZINE | DEPOSIT_MAGAZINE => {
+                self.owed_refund.remove(&from);
+            }
+            MAGAZINE_STATE if d.len() == 24 => {
+                let state = arr8(d, 16);
+                let Some(m) = self.mags.get(&arr8(d, 8)).copied() else { return };
+                if state == MAG_THROWN || state == MAG_RELEASED {
+                    let due = now + lifetime(m.item) + cooldown(m.item) + REFUND_OVERDUE_SLACK;
+                    // A later state of the same throw keeps the first deadline.
+                    self.owed_refund.entry(m.thrower).or_insert((due, [m.owner, COOLDOWN_TAIL].concat()));
+                } else if state == MAG_HELD {
+                    self.owed_refund.remove(&m.thrower);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Recharges the server owes and never sent: an ordnance whose
+    /// `CooldownRefund` is overdue gets it, a tac mod whose `AbilityCooldown`
+    /// never came gets one (as native answers it: two to the user, one to
+    /// everyone else, then the tac mod off).
+    fn overdue_recharges(&mut self, now: Instant, sent: &[(SocketAddr, Out)], ready: &mut Vec<(SocketAddr, Out)>) {
+        for (who, o) in sent {
+            if o.ty == COOLDOWN_REFUND {
+                self.owed_refund.remove(who);
+            }
+        }
+        // An ARC MINE waits where it was placed for as long as it takes.
+        let placed: HashSet<SocketAddr> = self.mines.iter().map(|m| m.thrower).collect();
+        let late: Vec<SocketAddr> = self.owed_refund.iter().filter(|(a, (t, _))| *t <= now && !placed.contains(a)).map(|(a, _)| *a).collect();
+        for who in late {
+            if let Some((_, cool)) = self.owed_refund.remove(&who) {
+                tracing::warn!(%who, "ordnance never recharged: refund overdue, sent by the safety net");
+                ready.push((who, out(To::Sender, COOLDOWN_REFUND, &cool)));
+            }
+        }
+        let late: Vec<SocketAddr> = self.tac_running.iter().filter(|(_, (t, _))| *t <= now).map(|(a, _)| *a).collect();
+        for who in late {
+            let Some((_, slot)) = self.tac_running.remove(&who) else { continue };
+            tracing::warn!(%who, "tac mod never recharged: cooldown overdue, sent by the safety net");
+            self.phased.remove(&who);
+            let b = [slot.as_slice(), &[0; 4]].concat();
+            ready.push((who, out(To::All, ABILITY_COOLDOWN, &b)));
+            ready.push((who, out(To::Sender, ABILITY_COOLDOWN, &b)));
+            ready.push((who, out(To::All, ABILITY_ACTIVATE, &b)));
+        }
     }
 
     /// A shot (`GameFireGun`: origin at 20, velocity at 36, damage at 48) at
@@ -1091,6 +1245,11 @@ impl Gear {
         if d[4..8] == BODY_OBJECT {
             if self.in_combat(&from) {
                 self.checks.moved(from, pos, now);
+                let h = self.history.entry(from).or_default();
+                h.push_back((now, pos));
+                while h.front().is_some_and(|(t, _)| now.saturating_duration_since(*t) > HISTORY) {
+                    h.pop_front();
+                }
             }
             self.bodies.insert(from, (u16::from_le_bytes([d[0], d[1]]), pos));
         } else if d[4..8] == self.space[..4] {
@@ -1108,12 +1267,19 @@ impl Gear {
     pub fn forget(&mut self, who: SocketAddr) -> Vec<Out> {
         self.checks.forget(who);
         let outs = match self.station_slot(&who) {
-            Some(slot) if self.inside.contains(&who) => self.free_stations(slot),
+            // Native (Dyson server recording): a player leaving a match gets
+            // the same, from the server, at once.
+            Some(slot) if self.in_match || self.inside.contains(&who) => self.free_stations(slot),
             _ => Vec::new(),
         };
         self.slots.remove(&who);
         self.bodies.remove(&who);
+        self.history.remove(&who);
+        self.pings.remove(&who);
         self.thrown_at.remove(&who);
+        self.spawned_at.remove(&who);
+        self.owed_refund.remove(&who);
+        self.tac_running.remove(&who);
         self.thrown_from.remove(&who);
         self.bubble_owner.remove(&who);
         self.lives.remove(&who);
@@ -1170,13 +1336,37 @@ impl Gear {
     }
 
     /// Everything an explosion at `at` from `by` reaches: (victim id, reported position, distance, player).
+    /// Lag compensated: each player where they are now or where the thrower's
+    /// game showed them, whichever the blast reaches nearer.
     fn victims(&self, at: [f32; 3], radius: f32, by: Option<SocketAddr>) -> Vec<Hit> {
-        self.victims_in(at, radius, by, false)
+        self.victims_lagged(at, radius, by, false, true)
+    }
+
+    /// A player's round trip as the session measured it.
+    pub fn set_ping(&mut self, who: SocketAddr, rtt: Duration) {
+        self.pings.insert(who, rtt);
+    }
+
+    /// Where `victim` was on `by`'s screen: their position one round trip of
+    /// `by`'s (at most `REWIND_MAX`) before their latest. A blast reported by
+    /// a player was set off against what that player saw, which the victim's
+    /// game sent here a round trip earlier.
+    fn seen_by(&self, victim: SocketAddr, by: SocketAddr) -> Option<[f32; 3]> {
+        let back = self.pings.get(&by)?.min(&REWIND_MAX);
+        let h = self.history.get(&victim)?;
+        let (last, _) = h.back()?;
+        let when = last.checked_sub(*back)?;
+        h.iter().rev().find(|(t, _)| *t <= when).or(h.front()).map(|(_, p)| *p)
     }
 
     /// `victims`; with `through_walls` (the DOT FIELD, the one effect that
     /// reaches through walls) only a standing ENERGY BARRIER shields.
     fn victims_in(&self, at: [f32; 3], radius: f32, by: Option<SocketAddr>, through_walls: bool) -> Vec<Hit> {
+        self.victims_lagged(at, radius, by, through_walls, false)
+    }
+
+    /// `victims_in`; with `rewind`, each player is also tried where `by` saw them.
+    fn victims_lagged(&self, at: [f32; 3], radius: f32, by: Option<SocketAddr>, through_walls: bool, rewind: bool) -> Vec<Hit> {
         let mut v = Vec::new();
         for (a, (slot, p)) in &self.bodies {
             // Only players in the combat area can be hit (no stun or damage in the lobby).
@@ -1185,10 +1375,20 @@ impl Gear {
             }
             // The tracked position is the head: a blast at the feet is measured
             // to the body below it, not to the head 1.5 m up.
-            let d = body_dist(at, *p);
-            if d <= radius + BODY_RADIUS && self.reaches_in(at, *p, through_walls) {
+            let then = if rewind { by.and_then(|b| self.seen_by(*a, b)) } else { None };
+            let mut best: Option<([f32; 3], f32)> = None;
+            for q in std::iter::once(*p).chain(then) {
+                let d = body_dist(at, q);
+                if d <= radius + BODY_RADIUS && best.is_none_or(|(_, bd)| d < bd) && self.reaches_in(at, q, through_walls) {
+                    best = Some((q, d));
+                }
+            }
+            if let Some((q, d)) = best {
+                if q != *p && body_dist(at, *p) > radius + BODY_RADIUS {
+                    info!(victim = %a, by = ?by, now_m = body_dist(at, *p), then_m = d, "blast hit where the thrower saw the victim (lag compensation)");
+                }
                 let id = self.id_of(a, *slot);
-                v.push((id, [p[0], p[1] - BODY_DROP, p[2]], d, Some(*a), PLAYER_CODE));
+                v.push((id, [q[0], q[1] - BODY_DROP, q[2]], d, Some(*a), PLAYER_CODE));
             }
         }
         // The lobby's training dummies (none in a match).
@@ -1689,6 +1889,7 @@ impl Gear {
             self.inside.push(from);
         }
         info!(%from, "combat area entered: tac mod and health reset");
+        self.tac_running.remove(&from);
         let slot = self.slot_of(&from);
         if let Some(owner) = self.bubble_owner.get(&from) {
             v.push(out(To::Sender, HEALTH_BROADCAST, &health_body(*owner, slot, &life, true)));
@@ -1761,8 +1962,14 @@ impl Gear {
         (0..STATIONS)
             .map(|k| {
                 let i = k * STATION_SLOTS + slot % STATION_SLOTS;
-                let v = [0xfc, 0xff, 0xff, 0xff];
+                // In a match native clears only the low two bits of what is
+                // there: fe goes to fc, ee to ec (Dyson, a leaver and the match
+                // end). The lobby's recordings always say fc.
+                let mut v = [0xfc, 0xff, 0xff, 0xff];
                 if let Some(b) = self.bits.get_mut(i as usize) {
+                    if self.in_match {
+                        v[0] = b[0] & 0xfc;
+                    }
                     *b = v;
                 }
                 let mut d = v.to_vec();
@@ -1775,6 +1982,7 @@ impl Gear {
     /// Replies to one client message.
     pub fn on_message(&mut self, from: SocketAddr, ty: u64, d: &[u8], now: Instant) -> Vec<Out> {
         let space = self.space;
+        self.watch_recharge(from, ty, d, now);
         match ty {
             TELEPORT_REQUEST => vec![out(To::Sender, TELEPORT, d)],
             BITFIELD_REQUEST if d.len() == 8 && d == self.space => vec![out(To::Sender, BITFIELD_RESPONSE, &self.bitfield())],
@@ -2050,6 +2258,7 @@ impl Gear {
             SPAWN_MAGAZINE if d.len() == 40 => {
                 info!(%from, item = %hex8(arr8(d, 24)), mag = %hex8(arr8(d, 32)), "ordnance spawned");
                 let at_spawn = self.thrown_at.get(&from).copied();
+                self.spawned_at.insert(from, now);
                 self.mags.insert(arr8(d, 32), Mag { owner: arr8(d, 0), item: arr8(d, 24), thrower: from, ending: false, at_spawn });
                 vec![out(To::Others, ty, d)]
             }
@@ -2236,6 +2445,13 @@ impl Gear {
     /// server's alone (the clients' copy is switched off), so it is done here.
     pub fn wall_placed(&mut self, from: SocketAddr, d: &[u8], now: Instant) {
         if d.len() != 96 {
+            return;
+        }
+        // UMBRAL VEIL's wall is the veil: no collision, nothing to break.
+        if self.tactical.get(&from) == Some(&TAC_SMOKE) {
+            info!(%from, "UMBRAL VEIL placed");
+            self.veil_stand_in(from, f3(d, 16), now);
+            self.later.push((now + WALL_LIFETIME, from, out(To::All, ACTOR_DESTROY, &d[40..56])));
             return;
         }
         self.add_wall(from, d, now);
@@ -2668,12 +2884,18 @@ impl Gear {
             // A STUN FIELD rolls with its grenade for its whole life. Kept
             // where it opened, it stunned players at that spot (often the
             // thrower's hand) seconds after the field had rolled away.
+            // Only while the thrower has taken no newer ordnance (their thrown
+            // position is then that one's), and never more than a grenade can
+            // roll in a tick or two: a field left still for seconds used to
+            // jump to wherever the thrower's next item was and stun there.
             if f.kind == EX_STUN
+                && self.spawned_at.get(&f.thrower).is_none_or(|t| *t <= f.start)
                 && let Some(&p) = self.thrown_at.get(&f.thrower)
                 && p != f.at
             {
-                let dt = now.saturating_duration_since(f.moved).as_secs_f32();
-                if dist(p, f.at) <= STUN_FOLLOW_SLACK + STUN_FOLLOW_SPEED * dt {
+                let dt = now.saturating_duration_since(f.moved).as_secs_f32().min(STUN_FOLLOW_MAX_DT);
+                let slack = if f.tracked { STUN_FOLLOW_TRACKED_SLACK } else { STUN_FOLLOW_SLACK };
+                if dist(p, f.at) <= slack + STUN_FOLLOW_SPEED * dt {
                     f.at = p;
                     f.moved = now;
                     f.tracked = true;
@@ -2719,6 +2941,7 @@ impl Gear {
                 }
                 for (victim, pos, _, who, _) in fresh {
                     f.hit.push(victim);
+                    info!(thrower = %f.thrower, victim = ?who, dist = format!("{:.1}", dist(pos, f.at)), age_ms = f.next.saturating_duration_since(f.start).as_millis() as u64, tracked = f.tracked, "stun field hit");
                     if who.is_some_and(|a| a != f.thrower) {
                         self.credits.push(Credit::Stun { by: f.thrower });
                     }
@@ -2762,6 +2985,9 @@ impl Gear {
                 true
             }
         });
+        let sent = std::mem::take(&mut ready);
+        self.overdue_recharges(now, &sent, &mut ready);
+        ready.splice(0..0, sent);
         for (_, o) in &ready {
             if o.ty == ACTOR_DESTROY && o.body.len() == 16 {
                 let actor = arr8(&o.body, 8);
@@ -2885,6 +3111,40 @@ fn stun_reach(t: Duration) -> f32 {
     let (start, rate, grow, exp) = (g("target_aoe_radius", 1.0), g("aoe_radius_growth_rate", 6.0), g("growth_time", 0.5).max(0.0), g("growth_exponent", 3.0).max(0.01));
     let p = if grow <= 0.0 { 1.0 } else { (t.as_secs_f32() / grow).clamp(0.0, 1.0) };
     start + rate * grow * (1.0 - (1.0 - p).powf(exp))
+}
+
+/// Lag compensation: a blast is measured against the victim as the thrower
+/// saw them, at most this far back (beyond it, the thrower's view is too old
+/// to trust).
+const REWIND_MAX: Duration = Duration::from_millis(250);
+/// How much of each body's movement is kept for it.
+const HISTORY: Duration = Duration::from_millis(400);
+
+/// UMBRAL VEIL's stand-in for games without EchoCombat: a DETONATOR puff this often.
+const VEIL_PUFF_EVERY: Duration = Duration::from_secs(2);
+/// Its magazines' ids: this, with a counter in the last four bytes.
+const VEIL_MAG: [u8; 8] = [0x5e, 0x11, 0x7e, 0x11, 0, 0, 0, 0];
+
+/// The safety net's slack: an ordnance's refund is overdue this long after
+/// its lifetime and cooldown have run out.
+const REFUND_OVERDUE_SLACK: Duration = Duration::from_secs(5);
+/// A tac mod's `AbilityCooldown` is overdue this long after its duration
+/// (a held ENERGY BARRIER hologram can wait a while before it is placed).
+const TAC_OVERDUE_SLACK: Duration = Duration::from_secs(30);
+/// The tac mods (`mp_equipment` names) whose `ability_properties` say how long they run.
+const TAC_NAMES: [&str; 8] = ["heal", "sensor", "shield", "wraith", "smoke", "buff", "point", "medigun"];
+
+/// When a tac mod switched on is overdue for its `AbilityCooldown`: its
+/// `duration` (or `effect_time`, NEUTRON's), 15 s when it has none, plus the slack.
+fn tac_overdue(tac: u64) -> Duration {
+    let name = TAC_NAMES.iter().find(|n| crate::wire::symbol::symbol(n) == tac);
+    let secs = name
+        .and_then(|n| {
+            let w = weapons();
+            ["duration", "effect_time"].iter().find_map(|k| w.pointer(&format!("/ability_properties/{n}/{k}")).and_then(Value::as_f64))
+        })
+        .unwrap_or(15.0);
+    Duration::from_secs_f64(secs.clamp(1.0, 600.0)) + TAC_OVERDUE_SLACK
 }
 
 /// `ability_properties.point.<k>` (NEUTRON).
@@ -3525,6 +3785,104 @@ mod tests {
         (g, me, them, t0)
     }
 
+    /// Lag compensation: a DETONATOR thrown by a player with a 200 ms round
+    /// trip hits a victim who was in its reach 200 ms ago and has moved out;
+    /// without that ping it misses.
+    #[test]
+    fn blasts_hit_where_the_thrower_saw_the_victim() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.set_match(super::super::combat::LEVEL_GAUSS);
+        let at = |x: i32| body(1, [43_800 + x, 1_870, -25_300]);
+        for k in 0..=20 {
+            // Walking 7 m/s away along x, one update every 10 ms.
+            g.observe_physics_at(them, &at(300 + 70 * k), t0 + Duration::from_millis(10 * k as u64));
+        }
+        let blast = [43.8 + 0.3, 1.87, -25.3];
+        let near = |g: &Gear| g.victims(blast, 0.6, Some(me)).iter().any(|h| h.3 == Some(them));
+        assert!(!near(&g), "1.4 m away now");
+        g.set_ping(me, Duration::from_millis(200));
+        assert!(near(&g), "there 200 ms ago, on the thrower's screen");
+        g.set_ping(me, Duration::from_secs(2));
+        assert!(near(&g), "capped, still a hit within 250 ms");
+    }
+
+    #[test]
+    fn tac_mod_symbols_are_their_names() {
+        assert_eq!(crate::wire::symbol::symbol("point"), TAC_POINT);
+        assert_eq!(crate::wire::symbol::symbol("wraith"), TAC_WRAITH);
+    }
+
+    /// The safety net: a tac mod switched on with no `AbilityCooldown` after
+    /// its duration and slack gets one from the server (two to its user, one
+    /// to everyone, then off); one that cooled normally gets nothing.
+    #[test]
+    fn overdue_tac_mod_is_recharged() {
+        let (mut g, me, _, t0) = two_in_the_area();
+        g.on_message(me, ABILITY_ACTIVATE, &unhex("0300000001000000"), t0);
+        let late = tac_overdue(0);
+        assert!(g.due(t0 + late - Duration::from_secs(1)).iter().all(|(_, o)| o.ty != ABILITY_COOLDOWN));
+        let v = g.due(t0 + late);
+        let cools: Vec<_> = v.iter().filter(|(a, o)| *a == me && o.ty == ABILITY_COOLDOWN).collect();
+        assert_eq!(cools.len(), 2);
+        assert!(cools.iter().all(|(_, o)| o.body == unhex("0300000000000000")));
+        assert!(v.iter().any(|(_, o)| o.ty == ABILITY_ACTIVATE && o.to == To::All && o.body == unhex("0300000000000000")));
+        assert!(g.due(t0 + late * 3).iter().all(|(_, o)| o.ty != ABILITY_COOLDOWN), "once");
+        // Cooled by the client itself, or respawned: nothing.
+        g.on_message(me, ABILITY_ACTIVATE, &unhex("0300000001000000"), t0);
+        g.on_message(me, ABILITY_COOLDOWN, &unhex("0300000000000000"), t0 + Duration::from_secs(12));
+        assert!(g.due(t0 + late * 2).iter().all(|(_, o)| o.ty != ABILITY_COOLDOWN));
+    }
+
+    /// The safety net: a thrown ordnance whose refund never came gets one
+    /// (here its magazine was put away by nothing and never used); a new
+    /// ordnance in hand clears the debt.
+    #[test]
+    fn overdue_ordnance_is_refunded() {
+        let (mut g, me, _, t0) = two_in_the_area();
+        let mag = [7u8; 8];
+        let owner = [9u8; 8];
+        g.mags.insert(mag, Mag { owner, item: ITEM_DET, thrower: me, ending: true, at_spawn: None });
+        let state = [g.space.as_slice(), &mag, &MAG_THROWN].concat();
+        g.on_message(me, MAGAZINE_STATE, &state, t0);
+        let late = lifetime(ITEM_DET) + cooldown(ITEM_DET) + REFUND_OVERDUE_SLACK;
+        assert!(g.due(t0 + late - Duration::from_secs(1)).iter().all(|(_, o)| o.ty != COOLDOWN_REFUND));
+        let v = g.due(t0 + late);
+        assert!(v.iter().any(|(a, o)| *a == me && o.ty == COOLDOWN_REFUND && o.to == To::Sender && o.body == [owner, COOLDOWN_TAIL].concat()));
+        assert!(g.due(t0 + late * 2).iter().all(|(_, o)| o.ty != COOLDOWN_REFUND), "once");
+        // A refund on time clears it.
+        g.on_message(me, MAGAZINE_STATE, &state, t0);
+        g.later.push((t0 + Duration::from_secs(1), me, out(To::Sender, COOLDOWN_REFUND, &[owner, COOLDOWN_TAIL].concat())));
+        assert_eq!(g.due(t0 + Duration::from_secs(1)).iter().filter(|(_, o)| o.ty == COOLDOWN_REFUND).count(), 1);
+        assert!(g.due(t0 + late * 3).iter().all(|(_, o)| o.ty != COOLDOWN_REFUND));
+    }
+
+    /// UMBRAL VEIL and NEUTRON walls are EchoCombat's; a veil is no barrier.
+    #[test]
+    fn veil_and_neutron_walls_are_echocombat_only() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        let wall = unhex("0e9d8bbe68f0ce3e8b710b3e81c65c3f0c98004252b41841f6fdde400000803f262929d5a48c8b3d193a620c7adae243d263e3b2e176fbcdf034d5099874113f8652624a9681de2f3c881a3f0a8cb73d37a60d3f6f0000000100000000000000");
+        assert!(!g.echocombat_wall(them, &wall), "ENERGY BARRIER");
+        g.tactical.insert(them, TAC_SMOKE);
+        assert!(g.echocombat_wall(them, &wall));
+        g.wall_placed(them, &wall, t0);
+        assert!(g.walls.is_empty() && !g.area_health.contains_key(&arr8(&wall, 48)), "the veil blocks nothing");
+        g.tactical.insert(me, TAC_POINT);
+        assert!(g.echocombat_wall(me, &wall));
+        // Games without EchoCombat get DETONATOR smoke there instead, hurting nobody.
+        let first = g.due_stock(t0);
+        let spawn = first.iter().find(|o| o.ty == SPAWN_MAGAZINE).expect("a puff");
+        assert_eq!(spawn.body.len(), 40);
+        assert_eq!(&spawn.body[12..24], &wall[16..28], "at the veil");
+        assert_eq!(&spawn.body[24..32], &ITEM_DET);
+        let rest = g.due_stock(t0 + Duration::from_secs(60));
+        let all: Vec<_> = first.iter().chain(&rest).collect();
+        let puffs = all.iter().filter(|o| o.ty == SPAWN_MAGAZINE).count();
+        assert_eq!(puffs, 4, "8 s of veil, one every 2 s");
+        assert_eq!(all.iter().filter(|o| o.ty == DESTROY_MAGAZINE).count(), puffs);
+        assert!(all.iter().all(|o| o.ty != EXPLOSION_PLAYER_DAMAGE && o.ty != HEALTH_BROADCAST));
+        assert!(g.due(t0 + Duration::from_secs(60)).iter().all(|(_, o)| o.ty != SPAWN_MAGAZINE), "not for EchoCombat games");
+    }
+
     /// ENERGY BARRIER walls (native Gauss, t 546.58: this create): 415
     /// health, bullets take it down for everyone, native's removal 18.04 s
     /// after placing, or right away when broken; a standing one stops blasts.
@@ -3919,9 +4277,54 @@ mod tests {
         g.thrown_at.insert(me, opened);
         g.fields.push(Field { kind: EX_STUN, mag: [0; 8], at: opened, thrower: me, until: t0 + Duration::from_secs(6), next: t0, every: Duration::from_millis(8), radius: 4.0, start: t0, hit: Vec::new(), moved: t0, tracked: false });
         // The grenade rolls 10 m away over 0.5 s, before the field stuns anyone there.
-        g.thrown_at.insert(me, [opened[0] + 10.0, opened[1], opened[2]]);
-        g.due(t0 + Duration::from_millis(500));
+        // Native (Gauss recording): updates every ~22 ms, the field on the grenade.
+        for i in 1..=10 {
+            g.thrown_at.insert(me, [opened[0] + 2.0 + i as f32, opened[1], opened[2]]);
+            g.due(t0 + Duration::from_millis(25 * i));
+        }
+        assert_eq!(g.fields[0].at[0], opened[0] + 12.0, "followed");
         assert!(!g.fields[0].hit.contains(&g.id_of(&them, p)), "not stunned where it opened");
+    }
+
+    /// A player leaving a match: the server clears their gear bits (native
+    /// Dyson: fe to fc, ee to ec), on every station set.
+    #[test]
+    fn a_match_leaver_gets_their_bits_cleared() {
+        let mut g = Gear::new();
+        g.set_match(super::super::combat::LEVEL_DYSON);
+        let me = addr();
+        g.slots.insert(me, 0);
+        g.on_message(me, SET_BITS, &[0xee, 0xff, 0xff, 0xff, 15, 0, 0, 0], Instant::now());
+        let v = g.forget(me);
+        assert_eq!(v.len(), STATIONS as usize);
+        assert_eq!(v[0], out(To::Others, SET_BITS, &[0xe0, 0xff, 0xff, 0xff, 0, 0, 0, 0]));
+        assert_eq!(v[1], out(To::Others, SET_BITS, &[0xec, 0xff, 0xff, 0xff, 15, 0, 0, 0]));
+    }
+
+    /// A STUN FIELD that has lain still does not jump to the thrower's next
+    /// ordnance far away and stun there.
+    #[test]
+    fn stun_field_does_not_jump_to_the_next_ordnance() {
+        let (mut g, me, them, t0) = two_in_the_area();
+        g.teams.insert(me, 0);
+        g.teams.insert(them, 1);
+        let p = g.bodies[&them].0;
+        let spot = g.bodies[&them].1;
+        let opened = [spot[0] + 30.0, spot[1], spot[2]];
+        g.thrown_at.insert(me, opened);
+        g.fields.push(Field { kind: EX_STUN, mag: [0; 8], at: opened, thrower: me, until: t0 + Duration::from_secs(6), next: t0, every: Duration::from_millis(8), radius: 4.0, start: t0, hit: Vec::new(), moved: t0, tracked: true });
+        g.due(t0 + Duration::from_secs(2));
+        // 3 s in, the thrower's next item shows up 30 m away, next to `them`.
+        g.thrown_at.insert(me, [spot[0], spot[1] - 1.0, spot[2]]);
+        g.due(t0 + Duration::from_secs(3));
+        assert!(!g.fields[0].hit.contains(&g.id_of(&them, p)), "not stunned 30 m from the field");
+        assert_eq!(g.fields[0].at, opened);
+        // Nor once a newer ordnance spawned, even close by.
+        let near = [opened[0] + 1.0, opened[1], opened[2]];
+        g.spawned_at.insert(me, t0 + Duration::from_secs(3));
+        g.thrown_at.insert(me, near);
+        g.due(t0 + Duration::from_millis(3010));
+        assert_eq!(g.fields[0].at, opened);
     }
 
     /// PHASE SHIFT: while it is on (its user's AbilityActivate on, with the
@@ -4335,8 +4738,8 @@ mod tests {
         assert!(g.oc_heals.is_empty());
     }
 
-    /// OVERCHARGE: the user's hits deal +1 (+2 on the head) and they take 25%
-    /// less; a linked teammate takes 25% less and cannot die for 5 s (`cheat_death_seconds`).
+    /// OVERCHARGE: the user's hits deal +1.5 (+2.5 on the head) and they take 25%
+    /// less; a linked teammate takes 25% less and cannot die for 6.5 s (`cheat_death_seconds`).
     #[test]
     fn overcharge_boosts_cuts_and_saves() {
         let (mut g, me, them, t0) = two_in_the_area();
@@ -4344,7 +4747,8 @@ mod tests {
         g.on_message(me, HEAL_BUBBLE_ACTIVATE, &oc, t0);
         let v = g.on_message(me, BULLET_COLLISION, &head_shot_on_slot_1(), t0);
         let hb = v.iter().find(|o| o.ty == HEALTH_BROADCAST).expect("hurt");
-        assert_eq!(&hb.body[12..16], &(112.0f32 - 15.5).to_le_bytes(), "13.5 + 2 on the head");
+        let head = weapons().pointer("/ability_properties/buff/damage_bonus_head").and_then(Value::as_f64).unwrap_or(2.0) as f32;
+        assert_eq!(&hb.body[12..16], &(112.0f32 - (13.5 + head)).to_le_bytes(), "13.5 + the head bonus");
         // Slot 1 shoots back at the boosted user: 25% off.
         let mut back = head_shot_on_slot_1();
         back[32] = 0xf2;
@@ -4364,8 +4768,8 @@ mod tests {
         }
         assert_eq!(g.lives.get(&them).map(|l| (l.health, l.core)), Some((0.0, 1.0)), "no shield, 1 health");
         // The same use linking them again and again: one cheat death only.
-        let five = t0 + Duration::from_secs(5);
-        assert!(g.cheats_death(them, t0 + Duration::from_secs(4)));
+        let five = t0 + cheat_death();
+        assert!(g.cheats_death(them, five - Duration::from_millis(500)));
         for k in 5..10 {
             g.on_message(me, DAMAGE_DEALT, &link, t0 + Duration::from_secs(k));
         }

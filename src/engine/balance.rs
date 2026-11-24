@@ -367,6 +367,17 @@ mod tests {
         }
     }
 
+    /// OVERCHARGE (the user's tuning, 2026-11-24): +1.5 body, +2.5 head,
+    /// linked teammates can't die for 6.5 s, in both tables.
+    #[test]
+    fn overcharge_tuning() {
+        for doc in [ECHOCOMBAT_WEAPONS, STOCK_WEAPONS] {
+            let w: Value = serde_json::from_str(doc).expect("json");
+            let b = |k: &str| w.pointer(&format!("/ability_properties/buff/{k}")).and_then(Value::as_f64);
+            assert_eq!((b("damage_bonus_body"), b("damage_bonus_head"), b("cheat_death_seconds")), (Some(1.5), Some(2.5), Some(6.5)));
+        }
+    }
+
     #[test]
     fn ids_are_the_file_names_symbols() {
         assert_eq!(doc_id("mp_equipment"), 0xf8d4_0525_c888_85d8);

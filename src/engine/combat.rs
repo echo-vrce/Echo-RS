@@ -2315,6 +2315,15 @@ impl Combat {
     /// The match area's object set with the payload where it is now, stamped
     /// `now_us` (the server frame's time), for the physics mailbox.
     pub fn payload_physics(&self, now_us: u64) -> Option<Vec<u8>> {
+        if matches!(self.level, LEVEL_DYSON | LEVEL_COMBUSTION) {
+            // No payload, but the same object set: three records off the map
+            // that never change (native Dyson and Combustion: every frame
+            // pair, byte for byte but the area id and the time).
+            let mut d: Vec<u8> = (0..CAPTURE_PHYS.len() / 2).map(|i| u8::from_str_radix(&CAPTURE_PHYS[2 * i..2 * i + 2], 16).unwrap_or(0)).collect();
+            d[4..8].copy_from_slice(&self.level.to_le_bytes()[..4]);
+            d[8..16].copy_from_slice(&(now_us & 0xffff_ffff).to_le_bytes());
+            return Some(d);
+        }
         let p = self.payload.as_ref()?;
         let (template, index) = match self.level {
             LEVEL_GAUSS => (PAYLOAD_PHYS_GAUSS, 0),
@@ -2351,6 +2360,9 @@ impl Combat {
 // changes (Gauss record 0, Fission record 3): position 0.651 m above the track,
 // its own +Z along the track and +Y up, velocity along it. Without it the
 // clients' payload never moved, whatever the trackpoints said.
+/// The capture maps' match-area object set (native Dyson; Combustion's
+/// differs only in the area id at 4..8 and the time at 8..16).
+const CAPTURE_PHYS: &str = "ffffffff042664146f85b60300000000f00000000000000000490300000800000070c19d04ecf4a0d77fff01006000066090204112c19d04ecf4a0071035000080000000806f3eea9cae127afdf71f000006600006091224693eea9cae127a00590300000800000008c9aad3ee16a1d77fff010060000660902041a2c8aad3ee16a1070000000000";
 const PAYLOAD_PHYS_GAUSS: &str = "ffffffff193a620cce0cd104000000004001000000000000004903000008000000f0e618b8f4d247d87fff510c600006609020416ae518c9f3fe4808103500008000000000d90b42ab6efc75ff47f17f000660000609122448e841420f127a005903000008000000a8b8a445f2c25ed87fff510c6000066090204182841e24f420a1071036000080000000800adac23b0f867ffdf7dfff000660000609122448e841420f127a0000";
 const PAYLOAD_PHYS_FISSION: &str = "ffffffffd483a3dff8b1d20400000000400100000000000000490300000800000070c19d98fdf4a0d77fff01006000066090204182841e24f420a1071035000080000000806f3e8a29af127afdf71f00000660000609122448e841420f127a00590300000800000008c9aa9df716a1d77fff01006000066090204182841e24f420a1071036000080000000802e7489048f1d78fd07e0ff00066000060912a406745dfa4e1e780000";
 const PHYS_HEAD_BITS: usize = 192;
@@ -2870,6 +2882,18 @@ mod tests {
 
     /// A public payload match sends the announcer's unused lines in order:
     /// match starting, round one, round starting, ten .. one, match started.
+    /// Native Dyson and Combustion: the area's object set every frame pair,
+    /// as recorded but for the area id and the time.
+    #[test]
+    fn capture_maps_send_the_area_object_set() {
+        let combustion = "ffffffff3c7045ed43d39e0400000000f00000000000000000490300000800000070c19d04ecf4a0d77fff01006000066090204112c19d04ecf4a0071035000080000000806f3eea9cae127afdf71f000006600006091224693eea9cae127a00590300000800000008c9aad3ee16a1d77fff010060000660902041a2c8aad3ee16a1070000000000";
+        for (level, rec, t) in [(LEVEL_DYSON, CAPTURE_PHYS, 0x03b6_856fu64), (LEVEL_COMBUSTION, combustion, 0x049e_d343)] {
+            let c = capture_map(level);
+            let want: Vec<u8> = (0..rec.len() / 2).map(|i| u8::from_str_radix(&rec[2 * i..2 * i + 2], 16).unwrap()).collect();
+            assert_eq!(c.payload_physics(t).as_deref(), Some(want.as_slice()));
+        }
+    }
+
     #[test]
     fn gear_active_shows_the_guns_now_and_next_step() {
         // Native Gauss (2026-11-16): a client's 3747ffc2... on 0x159, then the
