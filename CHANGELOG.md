@@ -3,6 +3,15 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.2 (2026-11-25)
+
+### Changes
+- Guns and overheat show for everyone, OVERCHARGE works in full lobbies
+  - Every player's gun heat is sent from the moment they join, in matches and in the lobby, as native does; it was only sent after a player's first shot and never in the lobby, so other players' guns stayed hidden or stuck on PULSAR and no overheat showed
+  - OVERCHARGE: each player gets their own heal bubble settings back on entering the combat area; the server kept only the last sender's, so in a full lobby OVERCHARGE never started and its tac mod stayed stuck
+  - DETONATOR blasts are logged with where they went off, how fresh that position was and how far the nearest dummy was
+  - Heal bubbles the server does not know are logged
+
 ## 0.3.1 (2026-11-25)
 
 ### Changes
