@@ -1124,6 +1124,8 @@ impl App {
         self.hidden = true;
         self.shared.hidden.store(true, Ordering::Relaxed);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        #[cfg(windows)]
+        self.bridge.settle_while_hidden(self.shared.hidden.clone());
         // Where a window can't be hidden (Wayland), at least minimise it.
         #[cfg(target_os = "linux")]
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));

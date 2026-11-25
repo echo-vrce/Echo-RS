@@ -7,7 +7,7 @@
 //! tray shows it again directly.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 
 use eframe::egui;
 
@@ -19,11 +19,14 @@ pub struct Bridge {
     /// Windows: the launcher's HWND.
     #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: AtomicIsize,
+    /// Counts hides: a settling thread from an earlier hide stops.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    hides: AtomicU64,
 }
 
 impl Bridge {
     pub fn new(ctx: egui::Context) -> Arc<Self> {
-        Arc::new(Self { ctx, show: AtomicBool::new(false), quit: AtomicBool::new(false), hwnd: AtomicIsize::new(0) })
+        Arc::new(Self { ctx, show: AtomicBool::new(false), quit: AtomicBool::new(false), hwnd: AtomicIsize::new(0), hides: AtomicU64::new(0) })
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -45,6 +48,39 @@ impl Bridge {
             }
         }
         self.ctx.request_repaint();
+    }
+
+    /// Windows: keeps eframe idle while the window is hidden. eframe asks for
+    /// a frame through `RedrawWindow`, and Windows paints only visible
+    /// windows, so a redraw pending as the window hid (hiding asks for one
+    /// itself) never came: eframe's event loop stayed in poll mode, a whole
+    /// core, until the window was shown again. A paint message posted to the
+    /// window does arrive: the frame runs (nothing new is asked for while
+    /// hidden) and eframe goes back to waiting. Often at first, while the
+    /// hide's own redraws come due, then every few seconds in case something
+    /// else asks.
+    #[cfg(windows)]
+    pub fn settle_while_hidden(self: &Arc<Self>, hidden: Arc<AtomicBool>) {
+        use std::time::Duration;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_PAINT};
+        let me = self.clone();
+        let hide = self.hides.fetch_add(1, Ordering::Relaxed) + 1;
+        let spawned = std::thread::Builder::new().name("tray-settle".into()).spawn(move || {
+            for i in 0u32.. {
+                std::thread::sleep(Duration::from_millis(if i < 20 { 100 } else { 5000 }));
+                if !hidden.load(Ordering::Relaxed) || me.hides.load(Ordering::Relaxed) != hide {
+                    return;
+                }
+                let h = me.hwnd.load(Ordering::Relaxed);
+                if h != 0 {
+                    // SAFETY: the handle is the launcher's own top-level window, alive while the app runs.
+                    unsafe {
+                        PostMessageW(h as _, WM_PAINT, 0, 0);
+                    }
+                }
+            }
+        });
+        drop(spawned);
     }
 
     pub fn request_show(&self) {
