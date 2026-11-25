@@ -3,6 +3,27 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.1 (2026-11-25)
+
+### Changes
+- Security hardening, faster player updates (experimental), even server frames
+  - Accounts: salted PBKDF2 password hashes (old SHA-256 ones upgraded at login), lockout after 5 wrong passwords (1 min, doubling to 1 h), 20 new accounts an hour per address, --require-password
+  - Admin endpoints: POST only, from this machine, Host localhost and an X-ERS-Admin header; /status hides private lobbies from other machines
+  - /fleet: remote game servers need --fleet-token; a game server only changes its own lobbies and its own players' stats
+  - Moderator team and -moderateuser into private or locked lobbies only for --moderators
+  - Limits: 32 service connections per address, 8 MiB of unread replies, resource names, stat sizes, fragment buffers; VeilNet answers strangers once
+  - Profile updates can no longer abort the process with a non-object value
+  - Per-link packet rates and relay waits in the 30 s link log
+  - Event drive: no 10 ms service pass; timed work wakes at its own deadline, state checks ride on the server frames
+  - Relayed player state goes out --relay-hold-us (500) after it arrives, paced to one early packet per client frame
+  - No server frames while nobody is connected
+  - Launcher: "Faster player updates (experimental)", off by default
+  - Ticks land just after each wire frame boundary: drifting against the wire clock, up to 11% of frames were skipped then sent two at once
+  - Pings and the link log run on wall time, so a skipped frame no longer drops them
+  - 30 s frame cadence log (gaps, repeats, bursts)
+  - --probe-udp joins over UDP, plays and reports state age, arrival gaps, hitches and bandwidth
+  - --probe-delay-ms, --probe-jitter-ms, --probe-loss-pct simulate a bad network
+
 ## 0.3.0 (2026-11-24)
 
 ### Changes
