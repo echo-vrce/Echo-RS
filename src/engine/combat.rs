@@ -68,7 +68,7 @@ use crate::wire::symbol::mat_sym;
 use serde_json::Value;
 
 use super::msg::{
-    ST_MAIN_LOOP_ENTER, ST_MATCH_END, ST_PLAYING, ST_PRE_MATCH, ST_PRE_MATCH_DONE, ST_ROUND_START, Val, VAR_BLUE_READY,
+    COMPONENT_EVENT, component_event_from, ST_MAIN_LOOP_ENTER, ST_MATCH_END, ST_PLAYING, ST_PRE_MATCH, ST_PRE_MATCH_DONE, ST_ROUND_START, Val, VAR_BLUE_READY,
     VAR_BLUE_SCORE, VAR_CELEBRATION, VAR_COUNTDOWN, VAR_GAME_CLOCK, VAR_GAME_STATE, VAR_ORANGE_READY, VAR_RED_SCORE,
 };
 
@@ -274,6 +274,51 @@ fn gear_handles(level: u64) -> &'static [u16] {
 /// - An all-ones symbol on handle 0xeb (58) and 0xec (64), filter 5.
 const FISSION_PAYLOAD_EVENTS: [(u16, u64); 3] = [(58, 0x08c9_92f5_e37f_6056), (64, 0x7522_f800_0ac7_d5e8), (95, 0x4ea8_7836_8609_da77)];
 const FISSION_TOGGLE: u64 = 0x8099_0d12_aec2_bcda;
+/// The payload's checkpoint events (Fission sends them with its trackpoint
+/// events; every other payload map when the checkpoint is reached).
+const PAYLOAD_CHECKPOINT_EVENTS: [u64; 2] = [0x08c9_92f5_e37f_6056, 0x7522_f800_0ac7_d5e8];
+
+/// Native's payload feedback events (netrec Gauss and Fission, 2026-11-16),
+/// on the payload (its handle, filter 5). `veh_payload_core` plays the
+/// announcer's payload lines and sounds on them; without them none played.
+/// - `nevt_peers_feedback_sfx_mobilized` (origin: a claiming attacker's slot):
+///   attackers alone take it (from nobody, or from contested);
+/// - `..._contested` (the same origin): defenders join attackers on it;
+/// - `..._reversing`: it starts rolling back;
+/// - `..._accelerated`: more attackers on it (two or more), no defenders;
+/// - `..._returned`: rolled back onto its last checkpoint (floored).
+const EV_PAYLOAD_MOBILIZED: u64 = 0xd555_9aa6_b4a3_0144;
+const EV_PAYLOAD_CONTESTED: u64 = 0x7446_60de_b960_f168;
+const EV_PAYLOAD_REVERSING: u64 = 0xe095_32af_6893_5fa1;
+const EV_PAYLOAD_ACCELERATED: u64 = 0xa501_c1e7_9e02_e73a;
+const EV_PAYLOAD_RETURNED: u64 = 0x4fbc_9877_5b1f_21ec;
+
+/// The feedback events for the payload's misc state going `old` -> `new`
+/// (`state, attackers, defenders, direction`); `origin`: a claiming attacker.
+fn payload_feedback(old: (u16, u8, u8, i8), new: (u16, u8, u8, i8), handle: u16, origin: u32) -> Vec<Out> {
+    let (os, oa, od, odir) = old;
+    let (s, a, d, dir) = new;
+    let ev = |sym| Out::Event(sym, OBJECT_MODULE, handle, FILTER_ALL);
+    let from = |sym| Out::Reliable(COMPONENT_EVENT, component_event_from(sym, OBJECT_MODULE, handle, FILTER_ALL, origin).to_vec());
+    let mut v = Vec::new();
+    if s == PAYLOAD_FLOORED && os != PAYLOAD_FLOORED {
+        v.push(ev(EV_PAYLOAD_RETURNED));
+    }
+    if dir == -1 && odir != -1 {
+        v.push(ev(EV_PAYLOAD_REVERSING));
+    }
+    if a > 0 && d == 0 {
+        if !(oa > 0 && od == 0) {
+            v.push(from(EV_PAYLOAD_MOBILIZED));
+        } else if a > oa && a >= 2 {
+            v.push(ev(EV_PAYLOAD_ACCELERATED));
+        }
+    }
+    if a > 0 && d > 0 && !(oa > 0 && od > 0) {
+        v.push(from(EV_PAYLOAD_CONTESTED));
+    }
+    v
+}
 
 /// `FISSION_PAYLOAD_EVENTS` and the rest for trackpoints `from` (exclusive)
 /// to `to`, in native's order.
@@ -436,42 +481,20 @@ const MAX_UNLOCK: u32 = 99;
 const MAX_CAPTURE: u32 = 59;
 /// 75 points win: a team can start one short of it.
 const MAX_START_SCORE: u32 = 74;
-/// The combat announcer's own lines (`mp_combat_voice_announcer` listens for
-/// them; no stock script raises them): "Round one" .. "Round six", "Match
-/// started".
-const VO_ROUND: [u64; 6] = [
-    0x6035_f8e1_7937_6a77,
-    0x6035_f8e1_7937_6a74,
-    0x6035_f8e1_7937_6a75,
-    0x6035_f8e1_7937_6a72,
-    0x6035_f8e1_7937_6a73,
-    0x6035_f8e1_7937_6a70,
-];
-const VO_MATCH_STARTED: u64 = 0x3e59_d6d5_915a_0546;
-/// The rest of the lines the announcer listens for and nothing raises
-/// (docs/combat_announcer_lines.md). Sent as a test (2026-11-22): whether a
-/// line plays when the server sends its event is not known yet.
-const VO_MATCH_STARTING: u64 = crate::wire::symbol::symbol("evt_vo_anc_match_starting");
-const VO_ROUND_STARTING: u64 = crate::wire::symbol::symbol("evt_vo_anc_round_starting");
-const VO_TIME_EXTENDED: u64 = crate::wire::symbol::symbol("evt_vo_anc_match_time_extended");
-const VO_MATCH_COMPLETE: u64 = crate::wire::symbol::symbol("evt_vo_anc_match_complete");
-/// "Ten" .. "One" (index 0 is "one"). All ten are sent: the capture maps'
-/// script was thought to say one to five itself, but in game (2026-11-23)
-/// the count stopped at six.
-const VO_COUNTDOWN: [u64; 10] = [
+/// "Five" .. "One" (index 0 is "one"): the capture maps' countdown into the
+/// round, the only combat announcer lines native's matches play that this
+/// server has to send (the level script that raises them in native did not
+/// say them here, 2026-11-23). Native's server sends no other announcer line,
+/// and neither does this one (removed 2026-11-25: "round N", "match
+/// starting/started", "round starting", "time extended", "match complete"
+/// and six to ten, which native never plays).
+const VO_COUNTDOWN: [u64; 5] = [
     crate::wire::symbol::symbol("evt_vo_anc_countdown_01"),
     crate::wire::symbol::symbol("evt_vo_anc_countdown_02"),
     crate::wire::symbol::symbol("evt_vo_anc_countdown_03"),
     crate::wire::symbol::symbol("evt_vo_anc_countdown_04"),
     crate::wire::symbol::symbol("evt_vo_anc_countdown_05"),
-    crate::wire::symbol::symbol("evt_vo_anc_countdown_06"),
-    crate::wire::symbol::symbol("evt_vo_anc_countdown_07"),
-    crate::wire::symbol::symbol("evt_vo_anc_countdown_08"),
-    crate::wire::symbol::symbol("evt_vo_anc_countdown_09"),
-    crate::wire::symbol::symbol("evt_vo_anc_countdown_10"),
 ];
-/// A capture map's team room: "round starting" this many seconds before it opens onto the round.
-const ROUND_STARTING_AT: f32 = 12.0;
 
 /// Players needed before the pre-match count starts (public: one is enough to
 /// test; native waits for its matchmaker's teams).
@@ -1268,8 +1291,7 @@ impl Combat {
 
     /// EchoCombat's rules (from VeilNet). A PAUSE puts the cease fire on, the
     /// capture point back to neutral (its points kept) and stops every clock,
-    /// the payload and the points until the unpause countdown is over; then
-    /// the announcer says the match has started again.
+    /// the payload and the points until the unpause countdown is over.
     pub fn set_echocombat(&mut self, ec: EchoRules) -> Vec<Out> {
         let was = self.paused();
         self.ec = ec;
@@ -1289,9 +1311,6 @@ impl Combat {
             }
         } else if was && !now {
             tracing::info!(phase = ?self.phase, "EchoCombat PAUSE over: the match goes on");
-            if matches!(self.phase, Phase::TeamRoom | Phase::RoundStart | Phase::Playing) {
-                out.push(Self::announcer(VO_MATCH_STARTED));
-            }
         }
         out
     }
@@ -1303,16 +1322,9 @@ impl Combat {
         Out::Event(sym, u64::MAX, 0x0fff, FILTER_ALL)
     }
 
-    /// "Round N" as its team room opens (a private payload match's second
-    /// half is round 2, after the teams swap).
-    fn announce_round(&self) -> Option<Out> {
-        (1..=VO_ROUND.len() as u8).contains(&self.round).then(|| Self::announcer(VO_ROUND[usize::from(self.round - 1)]))
-    }
-
-    /// The count down from ten as `before` .. `after` seconds pass (`least`:
-    /// the lowest number sent).
-    fn announce_count(before: f32, after: f32, least: usize) -> Vec<Out> {
-        (least..=VO_COUNTDOWN.len()).rev().filter(|&n| before > n as f32 && after <= n as f32).map(|n| Self::announcer(VO_COUNTDOWN[n - 1])).collect()
+    /// The count down from five as `before` .. `after` seconds pass.
+    fn announce_count(before: f32, after: f32) -> Vec<Out> {
+        (1..=VO_COUNTDOWN.len()).rev().filter(|&n| before > n as f32 && after <= n as f32).map(|n| Self::announcer(VO_COUNTDOWN[n - 1])).collect()
     }
 
     /// A private match's team (0 blue, 1 orange) pressed ready: native flips
@@ -1622,7 +1634,6 @@ impl Combat {
                     tracing::info!("private combat match: all teams ready");
                     self.starting = Some(0.0);
                     out.push(self.event(EV_NEXT_ROUND));
-                    out.push(Self::announcer(VO_MATCH_STARTING));
                 }
                 let Some(t) = self.starting.as_mut() else { return out };
                 let was = *t;
@@ -1639,7 +1650,6 @@ impl Combat {
                     self.to_states(&ST_TEAM_ROOM);
                     self.subphase = Some(SUB_TEAM_ROOM);
                     out.push(self.event(EV_TEAM_ROOM));
-                    out.extend(self.announce_round());
                     self.countdown = f(&self.rules, "/round_rules/team_room_wait_time", 15.0);
                 }
             }
@@ -1649,7 +1659,6 @@ impl Combat {
                     self.state = ST_PRE_MATCH;
                     out.push(self.event(EV_LOAD_A));
                     out.push(self.event(EV_LOAD_B));
-                    out.push(Self::announcer(VO_MATCH_STARTING));
                 }
             }
             Phase::PreMatch | Phase::TeamRoom | Phase::RoundStart | Phase::RoundOver if players.is_empty() => {
@@ -1664,7 +1673,6 @@ impl Combat {
                     self.to_states(&ST_TEAM_ROOM);
                     self.subphase = Some(SUB_TEAM_ROOM);
                     out.push(self.event(EV_TEAM_ROOM));
-                    out.extend(self.announce_round());
                     self.countdown = f(&self.rules, "/round_rules/team_room_wait_time", 15.0);
                 }
             }
@@ -1672,10 +1680,7 @@ impl Combat {
                 let before = self.countdown;
                 self.countdown -= dt;
                 if self.capture.is_some() {
-                    if before > ROUND_STARTING_AT && self.countdown <= ROUND_STARTING_AT {
-                        out.push(Self::announcer(VO_ROUND_STARTING));
-                    }
-                    out.extend(Self::announce_count(before, self.countdown, 1));
+                    out.extend(Self::announce_count(before, self.countdown));
                 }
                 self.team_room_for += dt;
                 while self.cues_left > 0 && self.team_room_for >= TEAM_ROOM_CUES[TEAM_ROOM_CUES.len() - self.cues_left] {
@@ -1707,14 +1712,11 @@ impl Combat {
                     self.to_states(&[ST_BEFORE_ROUND_START, ST_ROUND_START]);
                     self.subphase = Some(SUB_ROUND_START);
                     out.push(self.event(EV_ROUND_START));
-                    out.push(Self::announcer(VO_ROUND_STARTING));
                     self.countdown = f(&self.settings, "/round_timers/pre_launch", 45.0).min(99.0);
                 }
             }
             Phase::RoundStart => {
-                let before = self.countdown;
                 self.countdown -= dt;
-                out.extend(Self::announce_count(before, self.countdown, 1));
                 if self.countdown <= 0.0 {
                     self.countdown = 0.0;
                     out.extend(self.begin_round());
@@ -1753,11 +1755,7 @@ impl Combat {
         self.subphase = Some(SUB_PLAYING);
         self.team_room = false;
         self.round_over = false;
-        let mut v = vec![self.event(EV_ROUND_BEGIN)];
-        if self.round == 1 {
-            v.push(Self::announcer(VO_MATCH_STARTED));
-        }
-        v
+        vec![self.event(EV_ROUND_BEGIN)]
     }
 
     /// A capture map's round is won but not the match (native Dyson, from the
@@ -1835,7 +1833,6 @@ impl Combat {
                 c.points = start;
             }
             out.extend([self.event(EV_NEXT_ROUND), Out::Unlock, self.event(EV_TEAM_ROOM), Out::RestoreBarriers]);
-            out.extend(self.announce_round());
             if self.payload.is_some() {
                 // A private payload match's second half: sides swap, the
                 // payload goes back to the start.
@@ -1998,6 +1995,8 @@ impl Combat {
             // [direction i8][0]` (1 attacker + 1 defender: `0101`, stopped).
             let state = (p.state, att, def, dir);
             if p.sent != Some(state) {
+                let origin = players.iter().find(|(t, alive, _, slot)| *t == 1 && *alive && holders.contains(slot)).map_or(u32::MAX, |pl| u32::from(pl.3));
+                out.extend(payload_feedback(p.sent.unwrap_or((0, 0, 0, 0)), state, p.handle, origin));
                 p.sent = Some(state);
                 out.push(Out::Reliable(PAYLOAD_MISC, misc(p.handle, state)));
             }
@@ -2044,7 +2043,6 @@ impl Combat {
                         p.state = PAYLOAD_CELEBRATING;
                     }
                     tracing::info!(checkpoint = p.next + 1, clock = self.clock, "payload checkpoint");
-                    out.push(Self::announcer(VO_TIME_EXTENDED));
                     reached = Some(p.next);
                 }
                 p.next += 1;
@@ -2059,6 +2057,11 @@ impl Combat {
             }
         }
         if let Some(i) = reached {
+            if self.level != LEVEL_FISSION
+                && let Some(p) = self.payload.as_ref()
+            {
+                out.push(Out::Event(PAYLOAD_CHECKPOINT_EVENTS[i.min(1)], OBJECT_MODULE, p.handle, FILTER_ALL));
+            }
             out.extend(self.announce(MOD_GAME_STATE, &GS_CHECKPOINT[i.min(1)..=i.min(1)]));
             if self.level == LEVEL_GAUSS && i == 0 {
                 out.extend(self.announce(MOD_GAUSS_CHECKPOINT, &GAUSS_CHECKPOINT));
@@ -2278,8 +2281,6 @@ impl Combat {
                     self.to_states(&ST_MATCH_END[2..4]);
                     self.celebrating = true;
                     out.push(self.event(EV_CELEBRATION));
-                    // Here, not at the win: the level's own victory line plays then.
-                    out.push(Self::announcer(VO_MATCH_COMPLETE));
                     self.countdown = celebration;
                 }
                 2 => {
@@ -2928,21 +2929,25 @@ mod tests {
         assert!(!c.step(0.01, &[]).iter().any(|o| matches!(o, Out::Event(EV_GEAR_SHOW, ..))));
     }
 
+    /// Native's announcer lines only: a payload match sends none, a capture
+    /// map the count from five into its round.
     #[test]
-    fn public_match_sends_the_unused_announcer_lines() {
+    fn only_native_announcer_lines_are_sent() {
+        fn lines(v: Vec<Out>) -> Vec<u64> {
+            v.into_iter()
+                .filter_map(|o| match o {
+                    Out::Event(s, u64::MAX, 0x0fff, FILTER_ALL) if s != EV_TEAM_ROOM_CUE => Some(s),
+                    _ => None,
+                })
+                .collect()
+        }
         let mut c = gauss();
         let on = [(1u8, true, Some(Track::gauss().pos(0.0)), 0)];
-        let lines: Vec<u64> = run(&mut c, 91.0, &on)
-            .into_iter()
-            .filter_map(|o| match o {
-                Out::Event(s, u64::MAX, 0x0fff, FILTER_ALL) if s != EV_TEAM_ROOM_CUE => Some(s),
-                _ => None,
-            })
-            .collect();
-        let mut want = vec![VO_MATCH_STARTING, VO_ROUND[0], VO_ROUND_STARTING];
-        want.extend(VO_COUNTDOWN.iter().rev());
-        want.push(VO_MATCH_STARTED);
-        assert_eq!(lines, want);
+        assert_eq!(lines(run(&mut c, 91.0, &on)), Vec::<u64>::new());
+        let mut c = capture_map(LEVEL_DYSON);
+        let on = [(1u8, true, Some([0.0, 0.0, 0.0]), 0)];
+        let want: Vec<u64> = VO_COUNTDOWN.iter().rev().copied().collect();
+        assert_eq!(lines(run(&mut c, 60.0, &on)), want);
     }
 
     #[test]
@@ -3156,6 +3161,53 @@ mod tests {
         assert_eq!(c.winner, Some(Winner::Blue));
     }
 
+    /// Native's payload feedback events (netrec Gauss 2026-11-16) for each
+    /// misc state change.
+    #[test]
+    fn payload_feedback_follows_native() {
+        let ev = |s| Out::Event(s, OBJECT_MODULE, 0xd0, FILTER_ALL);
+        let from = |s, o| Out::Reliable(COMPONENT_EVENT, component_event_from(s, OBJECT_MODULE, 0xd0, FILTER_ALL, o).to_vec());
+        let f = |a, b| payload_feedback(a, b, 0xd0, 4);
+        assert_eq!(f((0, 0, 0, 0), (0, 1, 0, 1)), vec![from(EV_PAYLOAD_MOBILIZED, 4)]);
+        // Held at a checkpoint: still mobilized.
+        assert_eq!(f((1, 0, 0, 0), (1, 1, 0, 0)), vec![from(EV_PAYLOAD_MOBILIZED, 4)]);
+        assert_eq!(f((0, 1, 0, 1), (0, 2, 0, 1)), vec![ev(EV_PAYLOAD_ACCELERATED)]);
+        assert_eq!(f((0, 2, 0, 1), (0, 1, 0, 1)), vec![]);
+        assert_eq!(f((0, 1, 0, 1), (0, 1, 1, 0)), vec![from(EV_PAYLOAD_CONTESTED, 4)]);
+        assert_eq!(f((0, 1, 1, 0), (0, 2, 1, 0)), vec![]);
+        // Contested back to attackers alone: mobilized again.
+        assert_eq!(f((0, 2, 1, 0), (0, 2, 0, 1)), vec![from(EV_PAYLOAD_MOBILIZED, 4)]);
+        assert_eq!(f((0, 0, 0, 0), (0, 0, 0, -1)), vec![ev(EV_PAYLOAD_REVERSING)]);
+        assert_eq!(f((0, 0, 0, -1), (0, 0, 1, -1)), vec![]);
+        assert_eq!(f((0, 0, 0, -1), (PAYLOAD_FLOORED, 0, 0, 0)), vec![ev(EV_PAYLOAD_RETURNED)]);
+        assert_eq!(EV_PAYLOAD_MOBILIZED, crate::wire::symbol::symbol("nevt_peers_feedback_sfx_mobilized"));
+        assert_eq!(EV_PAYLOAD_CONTESTED, crate::wire::symbol::symbol("nevt_peers_feedback_sfx_contested"));
+        assert_eq!(EV_PAYLOAD_REVERSING, crate::wire::symbol::symbol("nevt_peers_feedback_sfx_reversing"));
+        assert_eq!(EV_PAYLOAD_ACCELERATED, crate::wire::symbol::symbol("nevt_peers_feedback_sfx_accelerated"));
+        assert_eq!(EV_PAYLOAD_RETURNED, crate::wire::symbol::symbol("nevt_peers_feedback_sfx_returned"));
+        assert_eq!(PAYLOAD_CHECKPOINT_EVENTS[0], crate::wire::symbol::symbol("nevt_peers_checkpoint_1_reached"));
+        assert_eq!(PAYLOAD_CHECKPOINT_EVENTS[1], crate::wire::symbol::symbol("nevt_peers_checkpoint_2_reached"));
+    }
+
+    /// A Gauss match sends them: an attacker takes the payload, a defender
+    /// joins, it reaches checkpoint 1.
+    #[test]
+    fn gauss_sends_payload_feedback_and_checkpoint() {
+        let mut c = playing(gauss());
+        let me = on_payload(&mut c, 1);
+        let v = run(&mut c, 0.3, &[me]);
+        let mobilized = Out::Reliable(COMPONENT_EVENT, component_event_from(EV_PAYLOAD_MOBILIZED, OBJECT_MODULE, 0xd0, FILTER_ALL, 0).to_vec());
+        assert!(v.contains(&mobilized), "{v:?}");
+        c.holders = vec![0, 1];
+        let v = run(&mut c, 0.3, &[me, (0u8, true, me.2, 1)]);
+        assert!(v.iter().any(|o| matches!(o, Out::Reliable(COMPONENT_EVENT, b) if b[..8] == EV_PAYLOAD_CONTESTED.to_le_bytes())), "{v:?}");
+        let cp = c.payload.as_ref().expect("p").track.checkpoints[0];
+        c.payload.as_mut().expect("p").dist = cp - 0.5;
+        let me = on_payload(&mut c, 1);
+        let v = run(&mut c, 3.0, &[me]);
+        assert!(v.contains(&Out::Event(PAYLOAD_CHECKPOINT_EVENTS[0], OBJECT_MODULE, 0xd0, FILTER_ALL)), "{v:?}");
+    }
+
     /// Native Gauss: the claim state, motion and claims follow who holds it.
     #[test]
     fn payload_hud_follows_the_claims() {
@@ -3266,16 +3318,8 @@ mod tests {
         assert_eq!(VAR_MS_RED, symbol("net_match_settings_red_score"));
         assert_eq!(VAR_MS_TIME, symbol("net_match_settings_round_time_in_seconds"));
         assert_eq!(VAR_ROUND_OVER, symbol("combat_cease_fire"));
-        assert_eq!(VO_MATCH_STARTED, symbol("evt_vo_anc_match_started"));
-        assert_eq!(VO_MATCH_STARTING, symbol("evt_vo_anc_match_starting"));
-        assert_eq!(VO_ROUND_STARTING, symbol("evt_vo_anc_round_starting"));
-        assert_eq!(VO_TIME_EXTENDED, symbol("evt_vo_anc_match_time_extended"));
-        assert_eq!(VO_MATCH_COMPLETE, symbol("evt_vo_anc_match_complete"));
         for (k, v) in VO_COUNTDOWN.iter().enumerate() {
             assert_eq!(*v, symbol(&format!("evt_vo_anc_countdown_{:02}", k + 1)));
-        }
-        for (k, v) in VO_ROUND.iter().enumerate() {
-            assert_eq!(*v, symbol(&format!("evt_vo_anc_round_{:02}", k + 1)));
         }
     }
 
@@ -3330,7 +3374,7 @@ mod tests {
     }
 
     /// EchoCombat PAUSE: the cease fire on, the point neutral (its points
-    /// kept), every clock still; the unpause ends with "match started".
+    /// kept), every clock still.
     /// POINT RATE scales the points.
     #[test]
     fn echocombat_pause_and_point_rate() {
@@ -3338,8 +3382,7 @@ mod tests {
         c.set_private();
         let orange = (1u8, true, Some([0.0, 0.0, 0.0]), 3);
         c.team_ready(1);
-        let v = run(&mut c, 3.5, &[orange]);
-        assert!(v.iter().any(|o| *o == Combat::announcer(VO_ROUND[0])), "round one");
+        run(&mut c, 3.5, &[orange]);
         run(&mut c, 16.0, &[orange]);
         run(&mut c, 50.0, &[orange]);
         assert_eq!(c.capture.as_ref().map(|p| p.possession), Some(1));
@@ -3356,8 +3399,7 @@ mod tests {
         run(&mut c, 30.0, &[orange]);
         assert_eq!(c.clock, clock);
         assert_eq!(c.capture.as_ref().map(|p| p.points[1]), Some(after));
-        let v = c.set_echocombat(EchoRules { rate: 8, payload_speed: 4, paused: false });
-        assert!(v.contains(&Combat::announcer(VO_MATCH_STARTED)));
+        c.set_echocombat(EchoRules { rate: 8, payload_speed: 4, paused: false });
         assert_eq!(var(&c, VAR_ROUND_OVER), Some(Val::Lo32(0)));
         run(&mut c, 1.0, &[orange]);
         assert!(c.clock < clock);

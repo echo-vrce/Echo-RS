@@ -374,12 +374,18 @@ impl Handles {
 
 /// `SR15NetComponentEvent`: symbol, module, handle, filter, origin.
 pub fn component_event(symbol: u64, module: u64, handle: u16, filter: u16) -> [u8; 24] {
+    component_event_from(symbol, module, handle, filter, u32::MAX)
+}
+
+/// A component event with its origin set (native's payload "mobilized" and
+/// "contested" carry a player's slot there, the rest all ones).
+pub fn component_event_from(symbol: u64, module: u64, handle: u16, filter: u16, origin: u32) -> [u8; 24] {
     let mut b = [0u8; 24];
     b[0..8].copy_from_slice(&symbol.to_le_bytes());
     b[8..16].copy_from_slice(&module.to_le_bytes());
     b[16..18].copy_from_slice(&handle.to_le_bytes());
     b[18..20].copy_from_slice(&filter.to_le_bytes());
-    b[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+    b[20..24].copy_from_slice(&origin.to_le_bytes());
     b
 }
 
