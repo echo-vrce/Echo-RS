@@ -35,6 +35,8 @@ const RTT_SAMPLES: usize = 32;
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Inbound IVs remembered for reordered packets.
 const IV_MEMORY: usize = 512;
+/// Fragmented frames being put together at once, per peer.
+const MAX_PARTIAL_FRAMES: usize = 64;
 /// Largest forward sequence jump accepted (bounds PRNG work per packet).
 const MAX_SEQ_JUMP: u64 = 8192;
 
@@ -153,11 +155,38 @@ pub struct Transport {
     srtt: Duration,
     pub packets_out: u64,
     pub packets_in: u64,
+    /// Mailbox (state) packets sent.
+    pub mb_packets_out: u64,
+    /// When the oldest relayed record now waiting in the mailbox queue was
+    /// queued (`queue_relay`); `None` while none waits.
+    relay_queued: Option<Instant>,
+    /// How long relayed records waited before going out (µs), since the
+    /// last `window`: the relay latency the drive mode decides.
+    relay_waits: Vec<u32>,
+    /// Counters at the last `window`, and when it was.
+    window_from: (Instant, u64, u64),
     /// Link quality, for the logs: the peer's mailbox frames taken, the
     /// ones that never arrived (skipped over), late or repeated ones
     /// dropped, and our reliable frames sent again (lost on the way out or
     /// their ack lost on the way back).
     pub stats: LinkStats,
+}
+
+/// Relay wait samples kept per window (the rest are not recorded).
+const MAX_RELAY_SAMPLES: usize = 16_384;
+
+/// One peer's traffic since the last `Transport::window`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LinkWindow {
+    pub secs: f32,
+    /// Packets per second to this peer, all of them and mailbox (state) ones.
+    pub packets_per_s: f32,
+    pub mb_packets_per_s: f32,
+    /// How long relayed records waited before going out (µs).
+    pub relay_samples: usize,
+    pub relay_p50_us: u32,
+    pub relay_p95_us: u32,
+    pub relay_max_us: u32,
 }
 
 /// Counters for one peer's link since it joined.
@@ -236,6 +265,10 @@ impl Transport {
             srtt: Duration::from_millis(30),
             packets_out: 0,
             packets_in: 0,
+            mb_packets_out: 0,
+            relay_queued: None,
+            relay_waits: Vec::new(),
+            window_from: (Instant::now(), 0, 0),
             stats: LinkStats::default(),
         }
     }
@@ -273,6 +306,11 @@ impl Transport {
             if last > 64 || idx > last {
                 return Some(out);
             }
+            // Frames left half-sent are never finished: keep only a few in
+            // progress, or a peer could make this grow without end.
+            if self.fragments.len() >= MAX_PARTIAL_FRAMES && !self.fragments.contains_key(&(reliable, frame)) {
+                self.fragments.clear();
+            }
             let entry = self.fragments.entry((reliable, frame)).or_insert_with(|| (last, vec![None; usize::from(last) + 1]));
             if entry.0 != last {
                 *entry = (last, vec![None; usize::from(last) + 1]);
@@ -288,9 +326,6 @@ impl Transport {
             let mut whole = plain[..8].to_vec();
             for p in parts.into_iter().flatten() {
                 whole.extend_from_slice(&p);
-            }
-            if self.fragments.len() > 64 {
-                self.fragments.clear();
             }
             whole
         } else {
@@ -465,9 +500,69 @@ impl Transport {
         self.queued_mailbox.push((ty, key, data.to_vec()));
     }
 
+    /// A record another player sent, relayed to this one: queued like any
+    /// mailbox record, and timed from now until it goes out.
+    pub fn queue_relay(&mut self, ty: u64, key: u64, data: &[u8]) {
+        self.relay_queued.get_or_insert_with(Instant::now);
+        self.queue_mailbox(ty, key, data);
+    }
+
+    /// Whether a relayed record is waiting to go out.
+    pub fn relay_waiting(&self) -> bool {
+        self.relay_queued.is_some()
+    }
+
+    /// Event drive's early send: the queued mailbox records (relayed player
+    /// state) in a frame of their own now, ahead of the next server frame.
+    /// Its header carries the acks.
+    pub fn flush_relayed(&mut self, out: &mut Vec<Vec<u8>>) {
+        if self.queued_mailbox.is_empty() {
+            self.relay_queued = None;
+            return;
+        }
+        self.flush_mailbox(Instant::now(), out);
+        self.ack_owed = false;
+    }
+
+    /// This peer's traffic and relay waits since the last call.
+    pub fn window(&mut self) -> LinkWindow {
+        let now = Instant::now();
+        let (from, out0, mb0) = std::mem::replace(&mut self.window_from, (now, self.packets_out, self.mb_packets_out));
+        let secs = now.duration_since(from).as_secs_f32().max(1e-3);
+        let mut w = std::mem::take(&mut self.relay_waits);
+        w.sort_unstable();
+        let at = |q: usize| w.get((w.len().saturating_sub(1)) * q / 100).copied().unwrap_or(0);
+        LinkWindow {
+            secs,
+            packets_per_s: (self.packets_out - out0) as f32 / secs,
+            mb_packets_per_s: (self.mb_packets_out - mb0) as f32 / secs,
+            relay_samples: w.len(),
+            relay_p50_us: at(50),
+            relay_p95_us: at(95),
+            relay_max_us: w.last().copied().unwrap_or(0),
+        }
+    }
+
     /// Seconds the oldest unacked reliable frame has been waiting.
     pub fn stalled(&self) -> bool {
         self.retained.front().is_some_and(|r| r.first.elapsed() > ACK_TIMEOUT)
+    }
+
+    /// The reliable resend timeout: 1.5 round trips plus 10 ms, within
+    /// 40..500 ms. The round trip is the larger of the reliable channel's own
+    /// (only never-resent frames are timed) and the mailbox acks'. A 60 ms
+    /// ceiling here resent every frame two or three times to anyone with a
+    /// ping over 60 ms, which was most players.
+    fn rto(&self) -> Duration {
+        let measured = self.rtt_samples.iter().copied().min().map_or(Duration::ZERO, |us| Duration::from_micros(u64::from(us)));
+        let rtt = self.srtt.max(measured);
+        (rtt * 3 / 2 + Duration::from_millis(10)).clamp(Duration::from_millis(40), Duration::from_millis(500))
+    }
+
+    /// When the next reliable resend is due, if anything waits for an ack.
+    pub fn next_resend_at(&self) -> Option<Instant> {
+        let oldest = self.retained.iter().map(|r| r.sent).min()?;
+        Some(oldest + self.rto())
     }
 
     fn header(&self, reliable: bool, fragmented: bool, frame: u16, encoded: bool) -> PacketHeader {
@@ -514,13 +609,7 @@ impl Transport {
         let start = out.len();
         let now = Instant::now();
         // Resends first, restamped with current acks.
-        // Resend after 1.5 round trips. The round trip is the larger of the
-        // reliable channel's own (only never-resent frames are timed) and the
-        // mailbox acks'. A 60 ms ceiling here resent every frame two or three
-        // times to anyone with a ping over 60 ms, which was most players.
-        let measured = self.rtt_samples.iter().copied().min().map_or(Duration::ZERO, |us| Duration::from_micros(u64::from(us)));
-        let rtt = self.srtt.max(measured);
-        let rto = (rtt * 3 / 2 + Duration::from_millis(10)).clamp(Duration::from_millis(40), Duration::from_millis(500));
+        let rto = self.rto();
         let mut resend = Vec::new();
         for (i, r) in self.retained.iter().enumerate() {
             if now.duration_since(r.sent) >= rto {
@@ -593,7 +682,10 @@ impl Transport {
     /// keeps its place and its timing).
     pub fn mailbox_now(&mut self, ty: u64, key: u64, data: &[u8], out: &mut Vec<Vec<u8>>) {
         let held = std::mem::replace(&mut self.queued_mailbox, vec![(ty, key, data.to_vec())]);
+        // The held records keep waiting: their wait is not over.
+        let relay = self.relay_queued.take();
         self.flush_mailbox(Instant::now(), out);
+        self.relay_queued = relay;
         self.queued_mailbox = held;
         // Its header carries the acks.
         self.ack_owed = false;
@@ -601,6 +693,17 @@ impl Transport {
 
     /// Mailbox: unreliable, latest state wins on the receiver.
     fn flush_mailbox(&mut self, now: Instant, out: &mut Vec<Vec<u8>>) {
+        if let Some(t) = self.relay_queued.take()
+            && self.relay_waits.len() < MAX_RELAY_SAMPLES
+        {
+            self.relay_waits.push(now.saturating_duration_since(t).as_micros().min(u128::from(u32::MAX)) as u32);
+        }
+        let before = out.len();
+        self.flush_mailbox_frames(now, out);
+        self.mb_packets_out += (out.len() - before) as u64;
+    }
+
+    fn flush_mailbox_frames(&mut self, now: Instant, out: &mut Vec<Vec<u8>>) {
         while !self.queued_mailbox.is_empty() {
             if self.mb_ece_pending {
                 self.mb_encoded = true;
@@ -730,5 +833,45 @@ mod tests {
         tx.mb_next = 701;
         assert_eq!(send(&mut tx, &mut rx, 5), 0, "repeated");
         assert_eq!(send(&mut tx, &mut rx, 6), 1);
+    }
+
+    /// Event drive: a reliable frame waiting for its ack sets a resend
+    /// deadline one RTO out; once acked there is none.
+    #[test]
+    fn resend_deadline_follows_the_unacked_frame() {
+        let (mut tx, mut rx) = pair();
+        assert!(tx.next_resend_at().is_none());
+        tx.queue_reliable(0x55, &[1; 8]);
+        let before = Instant::now();
+        let mut out = Vec::new();
+        tx.flush_reliable(&mut out);
+        assert!(!out.is_empty());
+        let at = tx.next_resend_at().expect("waits for an ack");
+        assert!(at >= before + tx.rto(), "one RTO after it went out");
+        for p in &out {
+            rx.receive(p);
+        }
+        let mut back = Vec::new();
+        rx.flush(&mut back);
+        for p in &back {
+            tx.receive(p);
+        }
+        assert!(tx.next_resend_at().is_none(), "acked");
+    }
+
+    /// Phase 0 metrics: relayed records' waits and the packet rates.
+    #[test]
+    fn window_counts_relay_waits_and_packets() {
+        let (mut tx, _) = pair();
+        tx.queue_relay(0x1234, 7, &[2; 16]);
+        tx.queue_relay(0x1234, 8, &[3; 16]);
+        let mut out = Vec::new();
+        tx.flush(&mut out);
+        assert!(!out.is_empty());
+        let w = tx.window();
+        assert_eq!(w.relay_samples, 1, "one sample per flush, from the first queued");
+        assert!(w.packets_per_s > 0.0 && w.mb_packets_per_s > 0.0);
+        let w = tx.window();
+        assert_eq!(w.relay_samples, 0, "the window starts over");
     }
 }

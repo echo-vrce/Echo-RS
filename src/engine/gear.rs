@@ -50,6 +50,9 @@ pub const AREA_ENTER_EVENT: u64 = 0x635d_09de_ff71_64c0;
 pub const AREA_LEAVE_EVENT: u64 = 0x635d_09de_ff71_64c1;
 /// Native freed a leaver's stations 3.3, 3.6 and 4.7 s after its leave event.
 const LEAVE_DELAY: Duration = Duration::from_millis(3500);
+/// How often `due` runs while something it steps on wall time is going
+/// (the tick drive's service rate).
+pub const GEAR_POLL: Duration = Duration::from_millis(10);
 pub const SET_OWNER: u64 = h("SR15NetSetOwner");
 pub const FIRE_GUN: u64 = h("SR15NetGameFireGun");
 pub const BULLET_COLLISION: u64 = h("SR15NetDamageableBulletCollision");
@@ -2888,6 +2891,32 @@ impl Gear {
         self.matrices = ms;
     }
 
+    /// When `due` (or `due_stock`) next has work: the exact time where the
+    /// work is a timer, `now + GEAR_POLL` while something runs that `due`
+    /// steps on wall time (regeneration, fields, mines, heat cooling...),
+    /// `None` when nothing is pending.
+    pub fn next_due(&self, now: Instant) -> Option<Instant> {
+        let stepping = !self.drains.is_empty()
+            || !self.fields.is_empty()
+            || !self.mines.is_empty()
+            || !self.neutrons.is_empty()
+            || !self.oc_heals.is_empty()
+            || !self.matrices.is_empty()
+            || self.lives.values().any(|l| l.dead || l.lost_at.is_some())
+            || self.heat.values().any(|h| h.level > 0.0 || h.overheated.is_some());
+        let timers = [
+            self.later.iter().map(|(t, _, _)| *t).min(),
+            self.stock_only.iter().map(|(t, _)| *t).min(),
+            self.respawns.iter().map(|(t, _, _)| *t).min(),
+            self.pillars_up.iter().map(|(t, _, _)| *t).min(),
+            self.leaving.values().copied().min(),
+            self.owed_refund.values().map(|(t, _)| *t).min(),
+            self.tac_running.values().map(|(t, _)| *t).min(),
+            stepping.then(|| now + GEAR_POLL),
+        ];
+        timers.into_iter().flatten().min()
+    }
+
     /// Replies whose time has come, with the client each `To` is relative to.
     pub fn due(&mut self, now: Instant) -> Vec<(SocketAddr, Out)> {
         self.cool_guns(now);
@@ -3381,6 +3410,17 @@ mod tests {
 
     fn addr() -> SocketAddr {
         "127.0.0.1:6794".parse().expect("addr")
+    }
+
+    /// Event drive: a fresh gear state has nothing due; a timer is due at
+    /// its own time.
+    #[test]
+    fn next_due_is_the_earliest_timer() {
+        let mut g = Gear::new();
+        let now = Instant::now();
+        assert_eq!(g.next_due(now), None);
+        g.leaving.insert(addr(), now + LEAVE_DELAY);
+        assert_eq!(g.next_due(now), Some(now + LEAVE_DELAY));
     }
 
     #[test]

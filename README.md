@@ -56,25 +56,43 @@ Firewall: open TCP 7777 and UDP 6792 to 6792+max-instances.
 | `--idle-retire-secs` | `0` | `0` keeps every started server registered as a blank idle server; a positive value stops spare idle ones after that many seconds |
 | `--arena-min-per-team` | `0` | arena: players needed on each team before the 45 s pre-match countdown starts; `0` starts it on the first join, as native public servers do |
 | `--no-unlock-all` | off | only default cosmetics instead of all |
+| `--require-password` / `ERS_REQUIRE_PASSWORD` | off | refuse logins without a real `auth=` (empty or `CHANGE_ME` is refused) |
+| `--moderators` / `ERS_MODERATORS` | none | comma-separated player ids allowed the moderator team and `-moderateuser` into private or locked lobbies |
+| `--fleet-token` / `ERS_FLEET_TOKEN` | none | secret that game servers on other machines need to register at `/fleet`; without it only this machine can |
+| `--drive` / `ERS_DRIVE` | `tick` | what runs a game server's timed work: `tick` is a 10 ms service pass; `event` drops it, runs the state checks with each server frame and wakes resends, gear timers, map switches and the match end at their own deadlines |
+| `--relay-hold-us` / `ERS_RELAY_HOLD_US` | `500` | with `--drive event`: how long relayed player state is held to gather more before it goes out ahead of the next server frame; `0` keeps it for the frame |
 | `--log` / `ERS_LOG` | `info` | tracing filter (`info,echo_rust_server::engine=debug` for engine detail) |
 
 ### Accounts and resources
 
-- **Accounts.** An account is created on first login and saved to `server-data/accounts/<XPID>.json`. The first `auth=` value used locks the account to that password.
-- **Resources.** To override any embedded resource, drop a JSON file in `server-data/resources/`. The names are `game_settings`, `channel_info`, `eula`, `config_main_menu`, `config_active_battle_pass_season`, `config_active_store_entry` and `config_active_store_featured_entry`.
+- **Accounts.** An account is created on first login and saved to `server-data/accounts/<XPID>.json`. The first `auth=` value used locks the account to that password (stored as a salted PBKDF2 hash; older plain SHA-256 hashes are upgraded at the next login). Five wrong passwords lock the account for a minute, doubling up to an hour. An account with no password yet belongs to whoever logs in with its id first, so on a public server use `--require-password`. One address can create 20 accounts an hour (none of these limits apply on this machine).
+- **Resources.** To override any embedded resource, drop a JSON file in `server-data/resources/`. The names are `game_settings`, `channel_info`, `eula`, `config_main_menu`, `config_active_battle_pass_season`, `config_active_store_entry` and `config_active_store_featured_entry`. Clients can ask only for names made of letters, digits, `_` and `-`.
 
 ### Admin
 
-The admin endpoints are loopback-only:
+`GET /status` lists servers, lobbies and players. Private lobbies' ids and endpoints show only to callers on this machine (a lobby id is enough to join it).
 
-- `GET /status`: servers, lobbies and players.
-- `GET /admin/kick?xpid=OVR_ORG-123`
-- `GET /admin/ban?xpid=OVR_ORG-123&minutes=60` (`minutes=0` unbans).
+The admin endpoints answer only `POST` from this machine, addressed to `localhost`, `127.0.0.1` or `[::1]`, with the header `X-ERS-Admin: 1` (so a web page open in a browser here can't call them):
+
+```
+curl -X POST -H "X-ERS-Admin: 1" "http://127.0.0.1:7777/admin/kick?xpid=OVR_ORG-123"
+curl -X POST -H "X-ERS-Admin: 1" "http://127.0.0.1:7777/admin/ban?xpid=OVR_ORG-123&minutes=60"
+```
+
+`minutes=0` unbans.
+
+### Game servers on other machines
+
+External game servers register at `/fleet`. They need `--fleet-token` set on this server and the same value as `?token=` (or `Authorization: Bearer`). A game server only ever changes its own lobbies, and only the stats of players it hosted.
+
+### Limits
+
+Each address may hold 32 service connections. A client that stops reading its replies is disconnected once 8 MiB are waiting. EchoCombat's VeilNet packets are taken only from players in the match; anyone else's hello gets a single answer.
 
 ### Matchmaking
 
 - **Find.** A find request fills the fullest public lobby of the same mode in the same social channel. Party members follow their leader.
-- **Join and create.** Join-by-id, `-moderateuser` and private create are supported.
+- **Join and create.** Join-by-id, `-moderateuser` and private create are supported. `-moderateuser` follows a player into a public lobby; into a private or locked one only for `--moderators`. Asking for the moderator team without being listed gives a spectator seat.
 - **Lobby sizes.** Social lobbies hold 12. Arena is 4v4 and combat is 5v5, plus spectators and moderators.
 - **Empty lobbies.** A lobby that stays empty for 30 s is ended, and its game server returns to the pool.
 
@@ -106,6 +124,14 @@ echo-rust-server --probe ws://127.0.0.1:777  # through EchoRelay
 ```
 
 It prints where each client was placed, with the session keys each one was issued, for an external UDP test client to run the encrypted handshake and join request with. Use `--probe-hold-secs` to keep the seats while that runs.
+
+With `--probe-udp` the clients also join their game server over UDP, as the game does: connect, join request, entrant state and an equipment update (so they spawn). They then send player state 72 times a second and ask for a loadout save every 2 s, for `--probe-hold-secs` (at least 5 s). Each client reports whether it was accepted and its join completed, the packets per second it got, and how many of the other clients' player states reached it:
+
+```
+echo-rust-server --probe ws://127.0.0.1:7777 --probe-clients 2 --probe-mode arena --probe-udp --probe-hold-secs 40
+```
+
+With `--probe-udp` the probe also reports what the players saw: how old the other players' states were when they arrived (each state carries when and by whom it was sent), the time between two states from the same player, hitches (a gap over 25 ms) and the bandwidth each client got. `--probe-delay-ms`, `--probe-jitter-ms` and `--probe-loss-pct` play over a simulated bad network: a delay plus random jitter on what the clients send, and loss both ways.
 
 ## Wire formats (`src/wire`)
 
@@ -167,6 +193,33 @@ It prints where each client was placed, with the session keys each one was issue
 - **Combat explosions** follow native's query and falloff. A victim not on blue or orange is never hit, and the owner's teammates are skipped, but the owner is hit by their own blast. A STUN FIELD is the exception: it never stuns its own thrower, because it opens where the grenade was last seen, which on a short throw is still the thrower's hand. Damage is scored per body part (fixed offsets below the tracked head) with the damage table, and the best part counts.
 - **Component events are addressed to real handles.** The arena IdsResponse we send (native's own) assigns the match graph handle `0xa02d` and the disc-FX handle `0xa01b`, so round-start, scoring and announcer events go to those handles, as native does. The handles come from whatever IdsResponse the server sends: a different native session used `0x002f`/`0x001b`.
 - **Arena baseline.** The replicated-variable baseline is native's own pre-match set from a fresh public match. An older baseline taken mid-match carried flag values that made the client run pre-match like a private match, with the tunnels open.
+- **Drive.** Packets are handled as they arrive and server frames run at `--frame-hz` in both drives. With `--drive tick` (the default) a 10 ms pass also checks the session and runs whatever is due. With `--drive event` there is no such pass: the checks ride on each server frame, and the loop sleeps until the earliest of a reliable resend, a gear timer, a late balance table, a map switch, a loadout save, the spectators-only grace, the end of a finished match or an empty session's timeout. In event drive, relayed player state also goes out on its own: `--relay-hold-us` after the first record arrives, everything queued for each player leaves in one packet, unless the next server frame is under 1 ms away. Each player gets at most one such early packet per frame of their own client (its measured send interval, 72 Hz until measured), and the server frame carries the rest, so 12 players don't each get ~800 packets a second. Every 30 s the engine logs each link's packet rates, how long relayed player state waited before it went out (`relay_p50_ms`, `relay_p95_ms`, `relay_max_ms`), and how many early packets went out and were held for the frame (`early`, `paced`); at debug level, event drive also logs its deadline wakes per second.
+
+**What players get.** Measured on one machine with the probe (`--probe-udp`, 72 Hz clients, 120 Hz frames, 40 s per run). State age is how old another player's movement is when it reaches a client, from their client through the server; the gap is the time between two of one player's states arriving, which the game smooths their movement over (their client sends every 13.9 ms).
+
+| Clean network | Tick | Event |
+|---|---|---|
+| State age p50 / p95 (2, 8, 10 and 12 players) | 4.3–4.9 / 8.4–8.7 ms | 2.3–2.4 / 3.6–4.3 ms |
+| Gap p50, mean distance from 13.9 ms (12 players) | 16.4 ms, 3.7 ms | 14.0 ms, 1.2 ms |
+| Gap p99 / max (12 players) | 17.4 / 17.8 ms | 18.9 / 20.1 ms |
+| Hitches (a gap over 25 ms) | 0% | 0% |
+| Per player: packets/s, kbit/s (12 players) | 127, 772 | 167, 805 |
+| Server CPU in 40 s of a 12-player match | 0.34 s | 0.38 s |
+
+In tick drive a 72 Hz player's states leave on 120 Hz frames, so they reach the others alternately 8.3 and 16.7 ms apart. In event drive they arrive at the player's own rhythm. The tail is a little wider (p99 18.9 against 17.4 ms) because a held-back state waits for the frame.
+
+| Simulated bad network (`--probe-delay-ms`, `--probe-jitter-ms`, `--probe-loss-pct`) | Tick | Event |
+|---|---|---|
+| 30 ± 10 ms, 2% loss, 12 players: state age p50 / p95, hitches | 41.1 / 47.3 ms, 6.2% | 40.4 / 45.9 ms, 5.0% |
+| 80 ± 30 ms, 5% loss, 8 players: state age p50 / p95, hitches | 98.7 / 113.7 ms, 27.0% | 98.1 / 112.6 ms, 26.1% |
+
+On a bad network the few milliseconds saved are small next to the network's own jitter. Both drives show the same ping to players. Event drive is still off by default (the launcher has it as "Faster player updates (experimental)") until it has been played with full lobbies of real headsets.
+
+The hold's timer has 1 ms resolution, so the wait doesn't go much below 2 ms.
+
+In event drive a session runs no server frames while nobody is connected: an empty match waiting for its first player, or the seconds after the last one leaves. Its deadlines still wake it, and the first packet from a connecting player starts the frames again at the current frame number. In one test, an empty session ran 4,065 frames in tick drive and none in event drive.
+
+**Frame clock.** Server frames come from one shared thread with a high-resolution sleep: a tokio timer lands on whole milliseconds, so 120 Hz frames would come 8, 8 and 9 ms apart. Each tick lands just after a wire frame boundary, so it always finds exactly the next frame. Before that, the thread ticked on its own schedule and drifted against the wire clock. Around each crossing, for about half a minute, one tick found no new frame and the next sent two at once: in one 30 s window that was 391 of ~3,600 frames, and the frame gap p95 went from 8.9 to 16.5 ms. Every 30 s the engine logs the frame cadence: `frames` (the gap p5/p50/p95/max between frames, `repeats` for ticks with no new frame, `bursts` for frames that carried several), both drives.
 - **Session end.** A session ends 3 s after its last player leaves (90 s if nobody joined), and the server is reported free to its backend (EchoRelay gets `EndSession`). EchoRelay itself marks a server Locked when its player count reaches 0, so ending quickly keeps that window short. Servers then stay registered, blank and idle.
 - **Joins after the match.** A player or spectator joining a match that has just ended is let in, and the match stays open up to 20 s while they load. Once loaded they get the same "return to lobby" event everyone else got: a player's game goes to the lobby, a spectator's looks for another match. A match left with only spectators (every player left, or nobody joined a team in time) sends them the same event and closes 5 s later.
 - **Captured data.** The level object ids, balance settings and replicated-variable baselines (`src/engine/data`) are captured protocol data the client needs byte for byte. They exist for `mpl_lobby_b2` (social), `mpl_arena_a` (arena) and the four combat maps (Combustion, Dyson, Fission, Gauss), with each combat map's barriers, reflexes and payload track vars.

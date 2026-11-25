@@ -52,6 +52,11 @@ fn hmac512(key: &[u8; 32], data: &[u8]) -> [u8; 64] {
     m.finalize().into_bytes().into()
 }
 
+/// Equal bytes, in time that depends only on the lengths.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// A packet whose MAC checked out (or that carries none).
 #[derive(Clone, Copy)]
 pub struct Authenticated<'a> {

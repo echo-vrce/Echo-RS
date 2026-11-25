@@ -265,8 +265,15 @@ impl VeilNet {
         self.relay(None, b'G', self.rules_word(), now, out)
     }
 
-    /// A VeilNet packet from `from`; what to send goes to `out`. True for an
-    /// event seen for the first time (not a resend).
+    /// The answer to a hello from an address not (yet) in the match: just
+    /// `A`, so the client keeps the mod's gear; the rules follow its next
+    /// hello (every 2 s) once its game has joined.
+    pub fn stranger_answer(&self) -> Option<[u8; PACKET_LEN]> {
+        self.enabled.then(|| packet(b'A', if self.medigun { ANSWER_MEDIGUN } else { 0 }))
+    }
+
+    /// A VeilNet packet from `from`, a player in the match; what to send
+    /// goes to `out`. True for an event seen for the first time (not a resend).
     pub fn handle(&mut self, from: SocketAddr, kind: u8, id: u32, now: Instant, out: &mut Out) -> bool {
         if !self.enabled {
             return false;
@@ -399,6 +406,11 @@ impl VeilNet {
         }
     }
 
+    /// When `tick` next has work: the end of an UNPAUSE countdown.
+    pub fn next_due(&self) -> Option<Instant> {
+        if self.paused == PAUSE_RESUMING { self.resume_at } else { None }
+    }
+
     /// Ends the UNPAUSE countdown when it is due.
     pub fn tick(&mut self, now: Instant, out: &mut Out) {
         if self.paused == PAUSE_RESUMING && self.resume_at.is_some_and(|t| now >= t) {
@@ -417,6 +429,12 @@ mod tests {
 
     fn a(port: u16) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn nothing_due_without_an_unpause() {
+        let v = VeilNet::new(true, false);
+        assert_eq!(v.next_due(), None);
     }
 
     #[test]

@@ -92,6 +92,11 @@ struct Setup {
     /// Off by default: on a busy server they are most of its work and log.
     #[serde(default)]
     debug_log: bool,
+    /// Event drive (`--drive event`): other players' movement goes out as it
+    /// arrives instead of with the next server frame. Off until it has been
+    /// played with full lobbies.
+    #[serde(default)]
+    event_drive: bool,
 }
 
 impl Default for Setup {
@@ -114,6 +119,7 @@ impl Default for Setup {
             balance: serde_json::Map::new(),
             auto_update: true,
             debug_log: false,
+            event_drive: false,
         }
     }
 }
@@ -197,6 +203,9 @@ impl Setup {
             CheatChecks::Enforce => "enforce",
         };
         a.extend(["--cheat-checks".into(), checks.into()]);
+        if self.event_drive {
+            a.extend(["--drive".into(), "event".into()]);
+        }
         a
     }
 
@@ -1008,6 +1017,9 @@ impl App {
                 ui.add_space(8.0);
                 ui.checkbox(&mut s.debug_log, RichText::new("Debug logging").strong());
                 hint(ui, "Logs every grab, ping and packet summary. Only for tracking down a problem: it is the heaviest work the server does and fills the log fast. Takes effect at the next start.");
+                ui.add_space(8.0);
+                ui.checkbox(&mut s.event_drive, RichText::new("Faster player updates (experimental)").strong());
+                hint(ui, "Sends other players' movement as it arrives instead of waiting for the next game frame: about half the delay (2.4 ms instead of 4.5 ms on this server), and it arrives more evenly. Each player gets about 40% more packets. Not yet tried with full lobbies of real players. Takes effect at the next start.");
             });
         });
         ui.add_space(12.0);

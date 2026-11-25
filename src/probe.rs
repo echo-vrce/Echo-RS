@@ -36,6 +36,10 @@ pub struct ProbeArgs {
     pub auth: String,
     /// Keep the sockets (and so the lobby seats) open this long afterwards.
     pub hold: Duration,
+    /// Join the game server over UDP and play while holding.
+    pub udp: bool,
+    /// The simulated network the UDP clients play over.
+    pub net: NetSim,
 }
 
 pub struct Joined {
@@ -118,7 +122,52 @@ pub async fn run(args: ProbeArgs) -> Result<()> {
             s.team.max(0)
         );
     }
-    if !args.hold.is_zero() && !ok.is_empty() {
+    if args.udp && !ok.is_empty() {
+        println!("\njoining over UDP and playing for {} s ...", args.hold.as_secs());
+        let plays: Vec<_> = ok
+            .iter()
+            .map(|j| {
+                let (client, s, hold, xpid, net) = (j.client, j.success.clone(), args.hold, j.xpid, args.net);
+                tokio::spawn(async move { (client, udp_play(&s, xpid, client as u16, hold, net).await) })
+            })
+            .collect();
+        let mut all = UdpReport::default();
+        let mut played = 0;
+        for p in plays {
+            match p.await? {
+                (i, Ok(r)) => {
+                    println!(
+                        "client {i:>3} udp: accepted {}  complete {}  rx {:.0} pkt/s  reliable {}  mailbox {} ({} relayed player states)  resends {}",
+                        r.accepted,
+                        r.complete,
+                        r.packets as f64 / r.secs,
+                        r.reliable,
+                        r.mailbox,
+                        r.relayed,
+                        r.resends
+                    );
+                    if !r.complete {
+                        failed += 1;
+                    }
+                    played += 1;
+                    all.secs += r.secs;
+                    all.packets += r.packets;
+                    all.bytes += r.bytes;
+                    all.lost_tx += r.lost_tx;
+                    all.lost_rx += r.lost_rx;
+                    all.ages.extend(r.ages);
+                    all.gaps.extend(r.gaps);
+                }
+                (i, Err(e)) => {
+                    failed += 1;
+                    println!("client {i:>3} udp FAILED: {e:#}");
+                }
+            }
+        }
+        if played > 0 {
+            udp_summary(played, all);
+        }
+    } else if !args.hold.is_zero() && !ok.is_empty() {
         println!("\nholding {} sockets for {} s ...", ok.len(), args.hold.as_secs());
         tokio::time::sleep(args.hold).await;
     }
@@ -304,4 +353,211 @@ async fn client(args: &ProbeArgs, i: usize, xpid: XpId) -> Result<Joined> {
     let entrants_reply = expect(&mut matching, &[sym::ENTRANTS_V3], 5, "entrants").await.is_ok();
 
     Ok(Joined { client: i, xpid, elapsed, success, entrants_reply, sockets: vec![login, config, matching] })
+}
+
+/// Simulated network for `--probe-udp`: packets lost each way, and a delay
+/// with random jitter on what the clients send (stands for the whole round
+/// trip, so the server's ping shows it).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetSim {
+    pub loss_pct: f64,
+    pub delay: Duration,
+    pub jitter: Duration,
+}
+
+/// What one probe client saw while playing over UDP.
+#[derive(Default)]
+struct UdpReport {
+    accepted: bool,
+    complete: bool,
+    secs: f64,
+    packets: u64,
+    /// UDP payload bytes received (IP and UDP add 28 per packet).
+    bytes: u64,
+    reliable: u64,
+    mailbox: u64,
+    relayed: u64,
+    resends: u64,
+    /// The simulated network's losses: sent, received.
+    lost_tx: u64,
+    lost_rx: u64,
+    /// How old the other players' states were when they got here (µs since
+    /// their client sent them).
+    ages: Vec<u32>,
+    /// Time between two states from the same player arriving (µs): what
+    /// the game smooths their movement over.
+    gaps: Vec<u32>,
+}
+
+/// Another player's state this long after the last one is a visible hitch:
+/// one of their 72 Hz frames (13.9 ms) went missing or came late.
+const HITCH_US: u32 = 25_000;
+
+/// One clock for every probe client (they run in this process), so a
+/// state's age is exact: client to server to client.
+fn stamp_us() -> u64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+fn pct(v: &[u32], q: usize) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    f64::from(v[(v.len() - 1) * q / 100]) / 1000.0
+}
+
+/// Every client's view together: what the players would see.
+fn udp_summary(clients: usize, mut all: UdpReport) {
+    all.ages.sort_unstable();
+    all.gaps.sort_unstable();
+    let hitches = all.gaps.iter().filter(|g| **g > HITCH_US).count();
+    println!(
+        "\nplayers' view ({clients} clients): rx {:.0} pkt/s, {:.1} kbit/s each (with IP and UDP headers), {} states from others",
+        all.packets as f64 / all.secs.max(1e-3),
+        (all.bytes + 28 * all.packets) as f64 * 8.0 / 1000.0 / all.secs.max(1e-3),
+        all.ages.len()
+    );
+    println!(
+        "  state age (sent by a player -> here)  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2} ms",
+        pct(&all.ages, 50),
+        pct(&all.ages, 95),
+        pct(&all.ages, 99),
+        pct(&all.ages, 100)
+    );
+    println!(
+        "  gap between one player's states       p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2} ms  hitches (> {} ms) {:.2}%",
+        pct(&all.gaps, 50),
+        pct(&all.gaps, 95),
+        pct(&all.gaps, 99),
+        pct(&all.gaps, 100),
+        HITCH_US / 1000,
+        100.0 * hitches as f64 / all.gaps.len().max(1) as f64
+    );
+    // How unevenly they arrive: the mean distance from the senders' own
+    // frame time (13.9 ms at 72 Hz), and from the median gap.
+    let mean_off = |c: f64| all.gaps.iter().map(|g| (f64::from(*g) - c).abs()).sum::<f64>() / all.gaps.len().max(1) as f64 / 1000.0;
+    println!(
+        "  arrival spread: p5 gap {:.2} ms, mean distance from 13.89 ms {:.2} ms",
+        pct(&all.gaps, 5),
+        mean_off(13_889.0)
+    );
+    if all.lost_tx + all.lost_rx > 0 {
+        println!("  simulated loss: {} sent and {} received packets dropped", all.lost_tx, all.lost_rx);
+    }
+}
+
+/// Sends through the simulated network: some packets lost, the rest after
+/// the delay and jitter.
+fn net_send(sock: &std::sync::Arc<tokio::net::UdpSocket>, to: std::net::SocketAddr, pkts: &mut Vec<Vec<u8>>, net: NetSim, r: &mut UdpReport) {
+    for p in pkts.drain(..) {
+        if net.loss_pct > 0.0 && rand::random::<f64>() * 100.0 < net.loss_pct {
+            r.lost_tx += 1;
+            continue;
+        }
+        if net.delay.is_zero() && net.jitter.is_zero() {
+            let _ = sock.try_send_to(&p, to);
+            continue;
+        }
+        let d = net.delay + net.jitter.mul_f64(rand::random::<f64>());
+        let sock = sock.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(d).await;
+            let _ = sock.send_to(&p, to).await;
+        });
+    }
+}
+
+/// Joins the game server as the game does (connect, `SNSLobbyJoinRequestv4`)
+/// and plays for `hold` (at least 5 s): once accepted, its entrant state
+/// twice and an equipment update (which spawn it, so the others get its
+/// body), then player state every client frame (72 Hz), acks for whatever
+/// the server sends, and a disconnect at the end. Each state carries when
+/// it was sent and by whom, so the others can tell how old it is.
+async fn udp_play(s: &SessionSuccess, xpid: XpId, id: u16, hold: Duration, net: NetSim) -> Result<UdpReport> {
+    use crate::engine::msg::{CONNECT, DISCONNECT, ENTRANT_STATE, EQUIPMENT, JOIN_ACCEPTED, JOIN_COMPLETE, JOIN_REQUEST, PLAYER_STATE, SAVE_LOADOUT_REQUEST};
+    let (_, mut t) = crate::decap::transports(&s.to_proto());
+    let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+    let server = std::net::SocketAddr::from((s.internal_ip, s.port));
+    let mut r = UdpReport::default();
+    let mut out = Vec::new();
+    t.queue_reliable(CONNECT, &[0; 16]);
+    let mut join = [0u8; 64];
+    join[17..33].copy_from_slice(Uuid::new_v4().as_bytes());
+    join[37..41].copy_from_slice(&(s.team.max(0) as u32).to_le_bytes());
+    t.queue_reliable(JOIN_REQUEST, &join);
+    t.flush(&mut out);
+    net_send(&sock, server, &mut out, net, &mut r);
+    let start = Instant::now();
+    let mut frame = tokio::time::interval(Duration::from_micros(13_889));
+    let mut buf = vec![0u8; 2048];
+    let mut seq: u32 = 0;
+    let mut last_from: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    while start.elapsed() < hold.max(Duration::from_secs(5)) {
+        tokio::select! {
+            got = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = got else { continue };
+                if net.loss_pct > 0.0 && rand::random::<f64>() * 100.0 < net.loss_pct {
+                    r.lost_rx += 1;
+                    continue;
+                }
+                r.packets += 1;
+                r.bytes += n as u64;
+                let Some(rx) = t.receive(&buf[..n]) else { continue };
+                let now = stamp_us();
+                for m in &rx.reliable {
+                    r.reliable += 1;
+                    if m.type_ == JOIN_ACCEPTED && !r.accepted {
+                        r.accepted = true;
+                        let mut entrant = [0u8; 0x80];
+                        entrant[..8].copy_from_slice(&xpid.platform.to_le_bytes());
+                        entrant[8..16].copy_from_slice(&xpid.account.to_le_bytes());
+                        t.queue_reliable(ENTRANT_STATE, &entrant);
+                        t.queue_reliable(ENTRANT_STATE, &entrant);
+                        t.queue_reliable(EQUIPMENT, &[1; 56]);
+                    }
+                    r.complete |= m.type_ == JOIN_COMPLETE;
+                }
+                for m in &rx.mailbox {
+                    r.mailbox += 1;
+                    if m.type_ != PLAYER_STATE || m.data.len() < 14 {
+                        continue;
+                    }
+                    r.relayed += 1;
+                    let from = u16::from_le_bytes([m.data[12], m.data[13]]);
+                    let sent = u64::from_le_bytes(m.data[4..12].try_into().expect("8 bytes"));
+                    if from == id {
+                        continue;
+                    }
+                    r.ages.push(now.saturating_sub(sent).min(u64::from(u32::MAX)) as u32);
+                    if let Some(prev) = last_from.insert(from, now) {
+                        r.gaps.push(now.saturating_sub(prev).min(u64::from(u32::MAX)) as u32);
+                    }
+                }
+            }
+            _ = frame.tick() => {
+                if r.accepted {
+                    seq = seq.wrapping_add(1);
+                    let mut state = [0u8; 64];
+                    state[..4].copy_from_slice(&seq.to_le_bytes());
+                    state[4..12].copy_from_slice(&stamp_us().to_le_bytes());
+                    state[12..14].copy_from_slice(&id.to_le_bytes());
+                    t.queue_mailbox(PLAYER_STATE, u64::from(id) + 1, &state);
+                    // A loadout save now and then: the server's save waits
+                    // on a timer of its own (its event drive's deadline wake).
+                    if seq.is_multiple_of(144) {
+                        t.queue_reliable(SAVE_LOADOUT_REQUEST, &[0; 8]);
+                    }
+                }
+                t.flush(&mut out);
+                net_send(&sock, server, &mut out, net, &mut r);
+            }
+        }
+    }
+    r.secs = start.elapsed().as_secs_f64();
+    r.resends = t.stats.resends;
+    t.queue_reliable(DISCONNECT, &[]);
+    t.flush(&mut out);
+    net_send(&sock, server, &mut out, NetSim::default(), &mut r);
+    Ok(r)
 }

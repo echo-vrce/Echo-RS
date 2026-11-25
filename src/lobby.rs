@@ -145,7 +145,13 @@ pub struct GameServer {
     pub lobby: Option<Uuid>,
     pub embedded: bool,
     pub idle_since: Instant,
+    /// Players this server was given lately: the only accounts its stat
+    /// updates may change.
+    pub recent: HashMap<XpId, Instant>,
 }
+
+/// How long a game server may still report stats for a player it hosted.
+const RECENT_PLAYER: Duration = Duration::from_secs(2 * 60 * 60);
 
 struct Player {
     entrant_id: Uuid,
@@ -227,6 +233,9 @@ pub struct Hub {
     server_freed: Notify,
     /// Asks the embedded pool to start another instance.
     pub scale_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    /// Accounts allowed the moderator team and `-moderateuser` into private
+    /// or locked lobbies (`--moderators`).
+    pub moderators: std::collections::HashSet<XpId>,
 }
 
 #[derive(serde::Serialize)]
@@ -241,7 +250,8 @@ pub struct Stats {
 
 #[derive(serde::Serialize)]
 pub struct LobbyInfo {
-    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
     pub mode: &'static str,
     pub level: String,
     pub private: bool,
@@ -251,7 +261,7 @@ pub struct LobbyInfo {
 }
 
 impl Hub {
-    pub fn new(store: Arc<Store>, advertise: Advertise) -> Arc<Self> {
+    pub fn new(store: Arc<Store>, advertise: Advertise, moderators: std::collections::HashSet<XpId>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State { next_server_id: 1, ..Default::default() }),
             modes: Modes::new(),
@@ -259,10 +269,13 @@ impl Hub {
             advertise,
             server_freed: Notify::new(),
             scale_tx: Mutex::new(None),
+            moderators,
         })
     }
 
-    pub fn stats(&self) -> Stats {
+    /// `/status`. A private lobby's id is what lets anyone join it, so only
+    /// `full` (a caller on this machine) sees private lobbies' ids and endpoints.
+    pub fn stats(&self, full: bool) -> Stats {
         let s = self.state.lock();
         Stats {
             servers: s.servers.len(),
@@ -274,12 +287,17 @@ impl Hub {
                 .lobbies
                 .values()
                 .map(|l| LobbyInfo {
-                    id: l.id,
+                    id: (full || !l.private).then_some(l.id),
                     mode: self.modes.name(l.mode),
                     level: format!("{:#018x}", l.level),
                     private: l.private,
                     players: l.players.len(),
-                    endpoint: s.servers.get(&l.server).map(|g| format!("{}:{}", g.external_ip, g.port)).unwrap_or_default(),
+                    endpoint: s
+                        .servers
+                        .get(&l.server)
+                        .filter(|_| full || !l.private)
+                        .map(|g| format!("{}:{}", g.external_ip, g.port))
+                        .unwrap_or_default(),
                     age_secs: l.created.elapsed().as_secs(),
                 })
                 .collect(),
@@ -328,7 +346,17 @@ impl Hub {
         drop(tx.send(ack));
         s.servers.insert(
             id,
-            GameServer { id, tx, internal_ip, external_ip, port: reg.port as u16, lobby: None, embedded: local, idle_since: Instant::now() },
+            GameServer {
+                id,
+                tx,
+                internal_ip,
+                external_ip,
+                port: reg.port as u16,
+                lobby: None,
+                embedded: local,
+                idle_since: Instant::now(),
+                recent: HashMap::new(),
+            },
         );
         drop(s);
         info!(server = id, endpoint = %format!("{internal_ip}:{external_ip}:{}", reg.port), "game server registered");
@@ -346,14 +374,15 @@ impl Hub {
         }
     }
 
-    /// Handle one envelope from a game server.
+    /// Handle one envelope from a game server. A server only ever acts on
+    /// its own lobbies and the players it was given.
     pub fn on_server_message(&self, server: u64, env: pb::Envelope) {
         match env.message {
             Some(Em::LobbySessionEvent(ev)) => {
                 let Ok(lid) = ev.lobby_session_id.parse::<Uuid>() else { return };
                 let locked = ev.code == pb::lobby_session_event_message::Code::Locked as i32;
                 if locked || ev.code == pb::lobby_session_event_message::Code::Unlocked as i32 {
-                    if let Some(l) = self.state.lock().lobbies.get_mut(&lid) {
+                    if let Some(l) = self.state.lock().lobbies.get_mut(&lid).filter(|l| l.server == server) {
                         l.locked = locked;
                     }
                     debug!(server, lobby = %lid, locked, "lobby join lock");
@@ -361,7 +390,9 @@ impl Hub {
                 }
                 if ev.code == pb::lobby_session_event_message::Code::Ended as i32 {
                     let mut s = self.state.lock();
-                    close_lobby(&mut s, lid);
+                    if s.lobbies.get(&lid).is_some_and(|l| l.server == server) {
+                        close_lobby(&mut s, lid);
+                    }
                     if let Some(g) = s.servers.get_mut(&server) {
                         if g.lobby == Some(lid) {
                             g.lobby = None;
@@ -379,6 +410,18 @@ impl Hub {
                 let mut reject = Vec::new();
                 {
                     let mut s = self.state.lock();
+                    // Another server's lobby: none of these entrants are this one's.
+                    if lid.and_then(|l| s.lobbies.get(&l)).is_some_and(|l| l.server != server) {
+                        warn!(server, lobby = ?lid, "entrants reported for another server's lobby");
+                        reject.extend(m.entrant_ids);
+                        if let Some(g) = s.servers.get(&server) {
+                            drop(g.tx.send(env_msg(Em::LobbyEntrantReject(pb::LobbyEntrantsRejectMessage {
+                                entrant_ids: reject,
+                                code: pb::lobby_entrants_reject_message::Code::BadRequest as i32,
+                            }))));
+                        }
+                        return;
+                    }
                     let mut lobby = lid.and_then(|l| s.lobbies.get_mut(&l));
                     for eid in m.entrant_ids {
                         let Ok(e) = eid.parse::<Uuid>() else {
@@ -426,7 +469,7 @@ impl Hub {
                 let (Ok(lid), Ok(eid)) = (m.lobby_session_id.parse::<Uuid>(), m.entrant_id.parse::<Uuid>()) else { return };
                 let mut s = self.state.lock();
                 let mut gone = None;
-                if let Some(l) = s.lobbies.get_mut(&lid) {
+                if let Some(l) = s.lobbies.get_mut(&lid).filter(|l| l.server == server) {
                     if let Some(x) = l.players.iter().find(|(_, p)| p.entrant_id == eid).map(|(x, _)| *x) {
                         l.players.remove(&x);
                         gone = Some(x);
@@ -445,6 +488,17 @@ impl Hub {
             Some(Em::UserServerProfileUpdateRequest(m)) => {
                 // A game server's stat changes (a combat match's XP and stats).
                 let Some(x) = m.user_id.as_ref().and_then(|u| XpId::parse(&u.id)) else { return };
+                let hosted = self
+                    .state
+                    .lock()
+                    .servers
+                    .get(&server)
+                    .and_then(|g| g.recent.get(&x))
+                    .is_some_and(|t| t.elapsed() < RECENT_PLAYER);
+                if !hosted {
+                    warn!(server, player = %x, "stats for a player this game server did not host: dropped");
+                    return;
+                }
                 let Ok(body) = serde_json::from_str::<serde_json::Value>(&m.payload) else { return };
                 if let Some(update) = body.get("update") {
                     debug!(player = %x, "profile stats from a game server");
@@ -456,7 +510,10 @@ impl Hub {
                 let Ok(eid) = m.entrant_id.parse::<Uuid>() else { return };
                 let who = {
                     let s = self.state.lock();
-                    s.lobbies.get(&lid).and_then(|l| l.players.iter().find(|(_, p)| p.entrant_id == eid).map(|(x, _)| *x))
+                    s.lobbies
+                        .get(&lid)
+                        .filter(|l| l.server == server)
+                        .and_then(|l| l.players.iter().find(|(_, p)| p.entrant_id == eid).map(|(x, _)| *x))
                 };
                 if let (Some(x), Some(entry)) = (who, m.loadout_entry) {
                     if let Some(l) = entry.loadout {
@@ -527,7 +584,11 @@ impl Hub {
         if req.version_lock != 0 && req.version_lock != VERSION_LOCK {
             debug!(version_lock = format_args!("{:#x}", req.version_lock), "client version lock differs from final build");
         }
-        let wanted = req.entrants.iter().find(|e| e.xpid == xpid).map(|e| i16::from(e.role)).unwrap_or(TEAM_ANY);
+        let mut wanted = req.entrants.iter().find(|e| e.xpid == xpid).map(|e| i16::from(e.role)).unwrap_or(TEAM_ANY);
+        if wanted == TEAM_MODERATOR && !self.moderators.contains(&xpid) {
+            debug!(player = %xpid, "moderator team asked by a non-moderator: spectator instead");
+            wanted = TEAM_SPECTATOR;
+        }
         let party: Vec<XpId> = req.entrants.iter().map(|e| e.xpid).filter(|x| *x != xpid).collect();
 
         let deadline = Instant::now() + ALLOCATION_WAIT;
@@ -567,12 +628,15 @@ impl Hub {
 
     fn place(&self, s: &mut State, req: &LobbyRequest, mode: u64, xpid: XpId, wanted: i16) -> Placement {
         let kind = self.modes.kind(mode);
+        let is_mod = self.moderators.contains(&xpid);
         let target: Option<Uuid> = match &req.kind {
             LobbyRequestKind::Join { lobby_id, moderate } => {
                 let id = match moderate {
                     Some(target) => match s.player_lobby.get(target) {
-                        Some(id) => *id,
-                        None => return Placement::Fail(fail::SERVER_DOES_NOT_EXIST, "User is not in a lobby"),
+                        // Following someone by their id never reveals or opens
+                        // a private lobby, except to a moderator.
+                        Some(id) if is_mod || s.lobbies.get(id).is_some_and(|l| !l.private) => *id,
+                        _ => return Placement::Fail(fail::SERVER_DOES_NOT_EXIST, "User is not in a lobby"),
                     },
                     None => *lobby_id,
                 };
@@ -580,7 +644,7 @@ impl Hub {
                     return Placement::Fail(fail::SERVER_DOES_NOT_EXIST, "Lobby does not exist");
                 };
                 // A locked lobby takes back its own players and moderators only.
-                if l.locked && moderate.is_none() && !l.players.contains_key(&xpid) {
+                if l.locked && !is_mod && !l.players.contains_key(&xpid) {
                     return Placement::Fail(fail::SERVER_IS_LOCKED, "Lobby is locked");
                 }
                 Some(id)
@@ -682,13 +746,18 @@ impl Hub {
                 None => return Placement::Fail(fail::SERVER_IS_FULL, "Lobby is full"),
             },
         };
-        let Some(g) = s.servers.get(&lobby.server) else {
+        let Some(g) = s.servers.get_mut(&lobby.server) else {
             return Placement::Fail(fail::INTERNAL_ERROR, "Game server went away");
         };
         let success = SessionSuccess::generate(lobby.mode, lobby_id, lobby.group_id, g.internal_ip, g.external_ip, g.port, team);
         let entrant_id = Uuid::new_v4();
         lobby.players.insert(xpid, Player { entrant_id, team, connected: false });
         lobby.empty_since = None;
+        let now = Instant::now();
+        if g.recent.len() > 1024 {
+            g.recent.retain(|_, t| now.duration_since(*t) < RECENT_PLAYER);
+        }
+        g.recent.insert(xpid, now);
         let tx = g.tx.clone();
         s.player_lobby.insert(xpid, lobby_id);
         Placement::Joined(success, tx)

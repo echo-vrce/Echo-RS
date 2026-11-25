@@ -82,6 +82,21 @@ fn wire_time(n: u64) -> u64 {
     if n >= f0 { t0 + (n - f0) * tick } else { t0.saturating_sub((f0 - n) * tick) }
 }
 
+/// Server µs now (the wire clock's time base).
+pub fn clock_now_us() -> u64 {
+    clock_us()
+}
+
+/// Server µs of the first wire frame boundary at or after `t`: the frame
+/// clock wakes just after one, so each tick finds the next wire frame.
+pub fn wire_boundary_at_or_after(t: u64) -> u64 {
+    let (_, t0, tick) = wire_state();
+    if t <= t0 {
+        return t0 - (t0 - t) / tick * tick;
+    }
+    t0 + (t - t0).div_ceil(tick) * tick
+}
+
 /// µs per wire frame now.
 pub fn wire_tick_us() -> u64 {
     wire_state().2
@@ -132,6 +147,12 @@ struct Peer {
     jersey: Option<u32>,
     /// When to report a changed loadout to the backend (changes come in bursts).
     loadout_save_at: Option<Instant>,
+    /// Event drive: when relayed state last went to this player ahead of a
+    /// server frame (the pacing cap), and how many such sends and held-back
+    /// ones since the last link log.
+    relay_sent_at: Option<Instant>,
+    relay_early: u32,
+    relay_paced: u32,
     /// The player changed their loadout here: it is saved once more as they leave.
     loadout_changed: bool,
     /// When the player last changed team (the team orbs in the lobby's combat
@@ -219,6 +240,9 @@ impl Peer {
             xpid: None,
             jersey: None,
             loadout_save_at: None,
+            relay_sent_at: None,
+            relay_early: 0,
+            relay_paced: 0,
             loadout_changed: false,
             team_changed_at: None,
             generation: None,
@@ -1346,7 +1370,45 @@ pub struct Session {
     map_switch: Option<(u64, Instant)>,
     /// When the server last reloaded on a new map (the replication wait).
     reloaded_at: Option<Instant>,
+    /// Event drive: how long relayed state is held to gather what else
+    /// arrives before it goes out ahead of the next server frame (`None`:
+    /// it waits for the frame, the tick drive's way).
+    relay_hold: Option<Duration>,
+    /// When the held relayed state goes out.
+    relay_flush_at: Option<Instant>,
+    /// When the last server frame went out.
+    last_frame_at: Option<Instant>,
+    /// When everyone's pings next go out, and the link log next runs.
+    pings_at: Instant,
+    links_at: Instant,
+    /// Frame cadence since the last link log: ticks that found no new wire
+    /// frame, publishes that carried more than one, and the gaps between
+    /// publishes (µs).
+    frame_repeats: u32,
+    frame_bursts: u32,
+    frame_gaps: Vec<u32>,
 }
+
+const MAX_FRAME_GAPS: usize = 16_384;
+/// Frames this far apart are a pause, not a late frame: no catch-up.
+const FRAME_PAUSE: Duration = Duration::from_secs(1);
+
+const PINGS_EVERY: Duration = Duration::from_secs(2);
+const LINKS_EVERY: Duration = Duration::from_secs(30);
+
+/// Relayed state is not sent early when the next server frame is this close:
+/// the frame carries it.
+const RELAY_FRAME_MARGIN: Duration = Duration::from_millis(1);
+/// The pacing cap: at most one early packet per frame of the player's own
+/// client (its measured send interval, within these bounds; 72 Hz until
+/// measured).
+const RELAY_PACE_MIN: Duration = Duration::from_millis(4);
+const RELAY_PACE_MAX: Duration = Duration::from_millis(20);
+const RELAY_PACE_DEFAULT: Duration = Duration::from_micros(13_889);
+/// A client's frames are not exactly evenly spaced: one arriving this much
+/// early still counts as its next frame (else a steady 72 Hz sender had about
+/// half its state held back by microseconds).
+const RELAY_PACE_SLACK: Duration = Duration::from_millis(1);
 
 /// A map switch: the clients leave the game this long before the server
 /// reloads (EchoCombat's `MAP_LEAVE_MS`: the client's VeilNet unloads its
@@ -1638,6 +1700,23 @@ impl Session {
             muted: HashSet::new(),
             map_switch: None,
             reloaded_at: None,
+            relay_hold: None,
+            relay_flush_at: None,
+            last_frame_at: None,
+            pings_at: Instant::now() + PINGS_EVERY,
+            links_at: Instant::now() + LINKS_EVERY,
+            frame_repeats: 0,
+            frame_bursts: 0,
+            frame_gaps: Vec::new(),
+        }
+    }
+
+    /// Event drive: relayed state goes out `hold` after it arrives instead
+    /// of with the next server frame.
+    pub fn set_relay_hold(&mut self, hold: Option<Duration>) {
+        self.relay_hold = hold;
+        if hold.is_none() {
+            self.relay_flush_at = None;
         }
     }
 
@@ -1657,6 +1736,11 @@ impl Session {
 
     pub fn player_count(&self) -> usize {
         self.peers.values().filter(|p| p.slot.is_some()).count()
+    }
+
+    /// Server frames this session has run (for the end-of-session log).
+    pub fn frames_run(&self) -> u64 {
+        self.frame
     }
 
     pub fn peer_count(&self) -> usize {
@@ -1691,6 +1775,11 @@ impl Session {
     /// EchoCombat said this player used NEUTRON (VeilNet `P`).
     pub fn point_token(&mut self, from: SocketAddr) {
         self.gear.point_token(from, Instant::now());
+    }
+
+    /// Whether `from` is a player whose packets proved its session keys.
+    pub fn has_peer(&self, from: SocketAddr) -> bool {
+        self.peers.contains_key(&from)
     }
 
     pub fn on_packet(&mut self, from: SocketAddr, data: &[u8]) {
@@ -1806,10 +1895,53 @@ impl Session {
 
     fn relay_mailbox(&mut self, from: SocketAddr, ty: u64, key: u64, data: &[u8]) {
         let body_state = is_body_state(ty);
+        let mut queued = false;
         for (a, p) in self.peers.iter_mut() {
             if *a != from && p.stage == Stage::Joined && (!body_state || p.spawned()) {
-                p.t.queue_mailbox(ty, key, data);
+                p.t.queue_relay(ty, key, data);
+                queued = true;
             }
+        }
+        if queued
+            && let Some(hold) = self.relay_hold
+            && self.relay_flush_at.is_none()
+        {
+            self.relay_flush_at = Some(Instant::now() + hold);
+        }
+    }
+
+    /// Event drive: the held relayed state goes out to whoever has some
+    /// queued, unless the next server frame is about to carry it, or the
+    /// player already got an early packet within a frame of their own client
+    /// (then the server frame carries it). Without that cap, 12 players
+    /// would each get ~800 packets a second.
+    fn flush_relays(&mut self, now: Instant) {
+        let Some(at) = self.relay_flush_at else { return };
+        if at > now {
+            return;
+        }
+        self.relay_flush_at = None;
+        let period = Duration::from_nanos(1_000_000_000 / frame_hz().max(1));
+        if self.last_frame_at.is_some_and(|f| f + period <= now + RELAY_FRAME_MARGIN) {
+            return;
+        }
+        let mut pkts = Vec::new();
+        for (a, p) in self.peers.iter_mut() {
+            if !p.t.relay_waiting() {
+                continue;
+            }
+            let own = match p.t.client_frame_us() {
+                0 => RELAY_PACE_DEFAULT,
+                us => Duration::from_micros(u64::from(us)).clamp(RELAY_PACE_MIN, RELAY_PACE_MAX),
+            };
+            if p.relay_sent_at.is_some_and(|t| now + RELAY_PACE_SLACK < t + own) {
+                p.relay_paced += 1;
+                continue;
+            }
+            p.t.flush_relayed(&mut pkts);
+            p.relay_sent_at = Some(now);
+            p.relay_early += 1;
+            self.udp_out.extend(pkts.drain(..).map(|d| (*a, d)));
         }
     }
 
@@ -3278,16 +3410,51 @@ impl Session {
         }
     }
 
-    /// Resend timers only (cheap; runs between frames).
+    /// The tick drive's service pass (every 10 ms): the state checks and the
+    /// timed work.
     pub fn service(&mut self) {
+        self.poll();
+        self.timed();
+    }
+
+    /// State checks with no timer of their own (the event drive runs them
+    /// every server frame): the update drain, a match left to spectators,
+    /// the players' pings for lag compensation.
+    pub fn poll(&mut self) {
         self.drain_lock(super::draining());
         self.watch_spectators(Instant::now());
-        self.watch_map_switch(Instant::now());
-        self.save_loadouts();
         let pings: Vec<(SocketAddr, u32)> = self.peers.iter().filter_map(|(a, p)| p.t.rtt_us().map(|u| (*a, u))).collect();
         for (a, us) in pings {
             self.gear.set_ping(a, Duration::from_micros(u64::from(us)));
         }
+    }
+
+    /// The earliest moment `timed` has work, if any (the event drive sleeps
+    /// until then): reliable resends, gear timers, a late balance table, a
+    /// map switch and the replication wait after it, loadout saves, the
+    /// spectators-only grace and a finished match's end.
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let peers = self.peers.values().flat_map(|p| [p.t.next_resend_at(), p.loadout_save_at]).flatten().min();
+        let times = [
+            peers,
+            self.relay_flush_at,
+            self.gear.next_due(now),
+            self.balance_wait.values().copied().min(),
+            self.map_switch.map(|(_, at)| at),
+            self.reloaded_at.map(|t| t + RELOAD_REPLICATION_WAIT + Duration::from_millis(1)),
+            self.spectators_since.filter(|_| !self.social && self.close_at.is_none()).map(|t| t + SPECTATORS_ONLY_GRACE),
+            self.close_at,
+        ];
+        times.into_iter().flatten().min()
+    }
+
+    /// Work whose time has come: map switches, loadout saves, gear timers,
+    /// late balance tables, and reliable resends.
+    pub fn timed(&mut self) {
+        self.flush_relays(Instant::now());
+        self.watch_spectators(Instant::now());
+        self.watch_map_switch(Instant::now());
+        self.save_loadouts();
         for (from, o) in self.gear.due(Instant::now()) {
             self.send_gear(from, o);
         }
@@ -3421,6 +3588,28 @@ impl Session {
         }
     }
 
+    /// How evenly the server frames went out since the last call (with the
+    /// link log): a frame published late, or two in one packet, reaches
+    /// every client unevenly.
+    fn log_frames(&mut self) {
+        let mut g = std::mem::take(&mut self.frame_gaps);
+        if g.is_empty() {
+            return;
+        }
+        g.sort_unstable();
+        let at = |q: usize| f64::from(g[(g.len() - 1) * q / 100]) / 1000.0;
+        info!(
+            frames = g.len() + 1,
+            gap_p50_ms = format_args!("{:.2}", at(50)),
+            gap_p5_ms = format_args!("{:.2}", at(5)),
+            gap_p95_ms = format_args!("{:.2}", at(95)),
+            gap_max_ms = format_args!("{:.2}", at(100)),
+            repeats = std::mem::take(&mut self.frame_repeats),
+            bursts = std::mem::take(&mut self.frame_bursts),
+            "frames"
+        );
+    }
+
     /// Every server frame (`frame_hz()`): server frame message, ping estimates, replication, rules.
     pub fn server_frame(&mut self) {
         self.frame += 1;
@@ -3428,13 +3617,26 @@ impl Session {
         // as native keys by it); `self.frame` stays the rules frame counter.
         let (frame, now_us) = wire_clock();
         if frame <= self.wire_frame {
+            self.frame_repeats += 1;
             return; // two server frames inside one tick: nothing new to publish
+        }
+        // After a pause (event drive: nobody was connected) nobody is owed
+        // the frames in between.
+        let resumed = self.last_frame_at.is_some_and(|t| t.elapsed() > FRAME_PAUSE);
+        if self.wire_frame != 0 && !resumed && frame > self.wire_frame + 1 {
+            self.frame_bursts += 1;
+        }
+        if let Some(t) = self.last_frame_at
+            && self.frame_gaps.len() < MAX_FRAME_GAPS
+            && t.elapsed() <= FRAME_PAUSE
+        {
+            self.frame_gaps.push(t.elapsed().as_micros().min(u128::from(u32::MAX)) as u32);
         }
         // Native sends a server frame message for every 120 Hz frame; the
         // client counts a gap in the numbers as lost packets (it showed 83%
         // loss when only every 6th went out). Send each one since the last
         // tick (capped, after a stall).
-        let first = if self.wire_frame == 0 { frame } else { (self.wire_frame + 1).max(frame.saturating_sub(23)) };
+        let first = if self.wire_frame == 0 || resumed { frame } else { (self.wire_frame + 1).max(frame.saturating_sub(23)) };
         self.wire_frame = frame;
 
         // Peers that went silent or stopped acking.
@@ -3479,7 +3681,19 @@ impl Session {
             }
             p.ping_dirty = false;
         }
-        let pings = (self.frame % (2 * frame_hz()) == 0).then(|| {
+        // On wall time: a frame number could be one of those skipped above
+        // (two frames inside one tick), and that update was then lost.
+        let now_wall = Instant::now();
+        let pings_due = now_wall >= self.pings_at;
+        let log_links = pings_due && now_wall >= self.links_at;
+        if pings_due {
+            self.pings_at = now_wall + PINGS_EVERY;
+        }
+        if log_links {
+            self.links_at = now_wall + LINKS_EVERY;
+            self.log_frames();
+        }
+        let pings = pings_due.then(|| {
             let mut b = [0u8; 33];
             b[0] = 1;
             for p in self.peers.values_mut() {
@@ -3492,9 +3706,28 @@ impl Session {
                     debug!(slot = s, rtt_us = rtt, raw_rtt_us = ?p.t.raw_rtt_us(), client_frame_us = p.t.client_frame_us(), samples = p.t.rtt_sample_count(), "measured ping");
                     // Link quality every 30 s, for tuning: what the player's
                     // packets to us lose and how unevenly they arrive.
-                    if self.frame % (30 * frame_hz()) == 0 {
+                    if log_links {
                         let l = p.t.stats;
-                        info!(slot = s, ping_ms = ms, jitter_ms = p.t.jitter_us() / 1000, loss_pct = format_args!("{:.1}", l.loss_pct()), late = l.mb_late, resends = l.resends, "link");
+                        // Packets this player got per second, and how long
+                        // others' state waited here before going to them.
+                        let w = p.t.window();
+                        info!(
+                            slot = s,
+                            ping_ms = ms,
+                            jitter_ms = p.t.jitter_us() / 1000,
+                            loss_pct = format_args!("{:.1}", l.loss_pct()),
+                            late = l.mb_late,
+                            resends = l.resends,
+                            pkts_per_s = format_args!("{:.0}", w.packets_per_s),
+                            state_pkts_per_s = format_args!("{:.0}", w.mb_packets_per_s),
+                            relay_p50_ms = format_args!("{:.2}", f64::from(w.relay_p50_us) / 1000.0),
+                            relay_p95_ms = format_args!("{:.2}", f64::from(w.relay_p95_us) / 1000.0),
+                            relay_max_ms = format_args!("{:.2}", f64::from(w.relay_max_us) / 1000.0),
+                            relays = w.relay_samples,
+                            early = std::mem::take(&mut p.relay_early),
+                            paced = std::mem::take(&mut p.relay_paced),
+                            "link"
+                        );
                     }
                     if !p.seen_types.is_empty() {
                         let mut v: Vec<_> = p.seen_types.drain().collect();
@@ -3621,6 +3854,9 @@ impl Session {
                 }
             }
         }
+        // The frame carries whatever relayed state was held.
+        self.relay_flush_at = None;
+        self.last_frame_at = Some(Instant::now());
         self.flush();
     }
 
@@ -5954,6 +6190,132 @@ mod server_mute_tests {
         assert_eq!(p.slot, Some(0), "the player stays");
         s.watch_map_switch(t + MAP_LEAVE + RELOAD_REPLICATION_WAIT + Duration::from_secs(1));
         assert!(s.peers[&a].rep_ready, "replication anyway");
+    }
+
+    /// Event drive: a quiet session has nothing timed; a map switch, the
+    /// replication wait after it and the spectators-only grace each set a
+    /// deadline, and the grace stops counting once the match is closing.
+    #[test]
+    fn next_deadline_covers_the_timers() {
+        let (mut s, _) = arena_with(&[(0, TEAM_BLUE)]);
+        let now = Instant::now();
+        s.balance_wait.clear();
+        assert_eq!(s.next_deadline(now), None, "nothing due");
+        let at = now + Duration::from_secs(5);
+        s.map_switch = Some((msg::LEVEL_ARENA, at));
+        assert_eq!(s.next_deadline(now), Some(at));
+        s.map_switch = None;
+        s.reloaded_at = Some(now);
+        assert!(s.next_deadline(now).is_some_and(|t| t > now + RELOAD_REPLICATION_WAIT), "after the wait, not on it");
+        s.reloaded_at = None;
+        s.spectators_since = Some(now);
+        assert_eq!(s.next_deadline(now), Some(now + SPECTATORS_ONLY_GRACE));
+        s.close_at = Some(now + Duration::from_secs(20));
+        assert_eq!(s.next_deadline(now), Some(now + Duration::from_secs(20)), "closing: only the end");
+    }
+
+    /// Event drive (phase 2): state from two players inside the hold goes
+    /// to a third in one early packet; the timer is not pushed back by the
+    /// second arrival.
+    #[test]
+    fn held_relays_go_out_together() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_BLUE), (2, TEAM_ORANGE)]);
+        let hold = Duration::from_micros(1250);
+        s.set_relay_hold(Some(hold));
+        s.relay_mailbox(a[0], VOIP, 1, &[1; 32]);
+        let at = s.relay_flush_at.expect("armed");
+        s.relay_mailbox(a[1], VOIP, 2, &[2; 32]);
+        assert_eq!(s.relay_flush_at, Some(at), "one timer for the burst");
+        assert_eq!(s.next_deadline(Instant::now()), Some(at));
+        s.udp_out.clear();
+        s.flush_relays(at - Duration::from_micros(1));
+        assert!(s.udp_out.is_empty(), "not before the hold ends");
+        s.flush_relays(at);
+        let to = |s: &Session, x: SocketAddr| s.udp_out.iter().filter(|(t, _)| *t == x).count();
+        assert_eq!(to(&s, a[2]), 1, "both records in one packet");
+        assert_eq!(to(&s, a[0]), 1, "the other sender's record");
+        assert!(s.relay_flush_at.is_none());
+        assert!(!s.peers[&a[2]].t.relay_waiting());
+        assert_eq!(s.peers[&a[2]].relay_early, 1);
+    }
+
+    /// The pacing cap: a second early packet within a client frame waits for
+    /// the server frame instead.
+    #[test]
+    fn early_relays_are_paced_per_client_frame() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_ORANGE)]);
+        s.set_relay_hold(Some(Duration::from_micros(1250)));
+        s.relay_mailbox(a[0], VOIP, 1, &[1; 32]);
+        let at = s.relay_flush_at.expect("armed");
+        s.flush_relays(at);
+        s.udp_out.clear();
+        s.relay_mailbox(a[0], VOIP, 1, &[3; 32]);
+        let at2 = s.relay_flush_at.expect("armed again");
+        s.flush_relays(at2);
+        assert!(s.udp_out.is_empty(), "paced: the server frame carries it");
+        assert!(s.peers[&a[1]].t.relay_waiting(), "still queued for the frame");
+        assert_eq!(s.peers[&a[1]].relay_paced, 1);
+        // About a client frame later it may go early again.
+        let later = at + RELAY_PACE_DEFAULT - RELAY_PACE_SLACK;
+        s.relay_flush_at = Some(later);
+        s.flush_relays(later);
+        assert_eq!(s.udp_out.len(), 1);
+    }
+
+    /// No early packet when the server frame is about to go out anyway, and
+    /// none at all without a hold (the tick drive).
+    #[test]
+    fn the_frame_carries_relays_when_it_is_close() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_ORANGE)]);
+        s.relay_mailbox(a[0], VOIP, 1, &[1; 32]);
+        assert!(s.relay_flush_at.is_none(), "tick drive: no timer");
+        s.set_relay_hold(Some(Duration::from_micros(1250)));
+        s.relay_mailbox(a[0], VOIP, 1, &[2; 32]);
+        let at = s.relay_flush_at.expect("armed");
+        let period = Duration::from_nanos(1_000_000_000 / frame_hz().max(1));
+        s.last_frame_at = Some(at + RELAY_FRAME_MARGIN / 2 - period);
+        s.udp_out.clear();
+        s.flush_relays(at);
+        assert!(s.udp_out.is_empty(), "the frame is under a margin away");
+        assert!(s.peers[&a[1]].t.relay_waiting());
+    }
+
+    /// The frame clock's wake points: on the wire clock's frame grid, the
+    /// first at or after the time asked for.
+    #[test]
+    fn wire_boundaries_are_on_the_frame_grid() {
+        let tick = wire_tick_us();
+        let (_, t0, _) = wire_state();
+        let now = clock_now_us();
+        for t in [now, now + 1, now + tick - 1, now + tick, now + 7 * tick + 3, t0, t0.saturating_sub(tick + 5)] {
+            let b = wire_boundary_at_or_after(t);
+            assert!(b >= t && b < t + tick, "{t} -> {b}");
+            assert_eq!(b.abs_diff(t0) % tick, 0, "on the grid");
+            assert_eq!(wire_boundary_at_or_after(b), b, "a boundary is its own");
+        }
+    }
+
+    /// A frame after a pause (event drive: nobody was connected) starts at
+    /// the current wire frame; a late one within play catches up what the
+    /// players missed.
+    #[test]
+    fn frames_resume_without_catch_up() {
+        let (mut s, a) = arena_with(&[(0, TEAM_BLUE)]);
+        let (now_frame, _) = wire_clock();
+        s.wire_frame = now_frame - 50;
+        s.last_frame_at = Some(Instant::now() - Duration::from_secs(5));
+        s.server_frame();
+        assert_eq!(s.frame_bursts, 0, "a resume is not a burst");
+        assert!(s.wire_frame >= now_frame);
+        assert!(s.frame_gaps.is_empty(), "the pause is not a frame gap");
+        // Late within play: the missed frames go out (a burst).
+        let (f, _) = wire_clock();
+        s.wire_frame = f - 3;
+        s.last_frame_at = Some(Instant::now() - Duration::from_millis(30));
+        s.server_frame();
+        assert_eq!(s.frame_bursts, 1);
+        assert_eq!(s.frame_gaps.len(), 1);
+        assert!(s.peers.contains_key(&a[0]));
     }
 
     fn hex_bytes(h: &str) -> Vec<u8> {

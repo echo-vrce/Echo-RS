@@ -24,12 +24,10 @@ mod wire;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use dashmap::DashMap;
 use tracing::{info, warn};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -122,6 +120,23 @@ struct Args {
     #[arg(long, env = "ERS_REGION", default_value = "default")]
     region: String,
 
+    /// Shared secret game servers on other machines must give to register at
+    /// `/fleet` (`?token=` or `Authorization: Bearer`). Without it only game
+    /// servers on this machine can register.
+    #[arg(long, env = "ERS_FLEET_TOKEN", hide_env_values = true)]
+    fleet_token: Option<String>,
+
+    /// Refuse logins without a real password (`auth=` other than CHANGE_ME
+    /// in the client's loginservice_host). Without it an account with no
+    /// password yet belongs to whoever logs in with its id first.
+    #[arg(long, env = "ERS_REQUIRE_PASSWORD")]
+    require_password: bool,
+
+    /// Accounts allowed the moderator team, and `-moderateuser` into private
+    /// or locked lobbies (comma-separated, e.g. OVR_ORG-123,DSC-456).
+    #[arg(long, env = "ERS_MODERATORS", value_delimiter = ',')]
+    moderators: Vec<String>,
+
     /// Give every account only the default cosmetics instead of all of them.
     #[arg(long, env = "ERS_NO_UNLOCK_ALL")]
     no_unlock_all: bool,
@@ -130,6 +145,19 @@ struct Args {
     /// 240. The client's own 120 Hz frame clock is separate and unchanged.
     #[arg(long, env = "ERS_FRAME_HZ", default_value_t = 120, value_parser = clap::value_parser!(u64).range(10..=240))]
     frame_hz: u64,
+
+    /// What runs a game server's timed work. `tick`: a 10 ms service pass.
+    /// `event`: no service tick; state checks ride on the server frames and
+    /// resends, gear timers and the like wake at their own deadlines.
+    #[arg(long, env = "ERS_DRIVE", value_enum, default_value_t = engine::Drive::Tick)]
+    drive: engine::Drive,
+
+    /// With `--drive event`: microseconds relayed player state is held to
+    /// gather what else arrives before it goes out ahead of the next server
+    /// frame (at most one such packet per client frame). 0 keeps it for the
+    /// frame.
+    #[arg(long, env = "ERS_RELAY_HOLD_US", default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=20_000))]
+    relay_hold_us: u64,
 
     /// Host only these game modes (comma-separated game-type names, e.g.
     /// echo_arena,echo_arena_private). Empty: every mode.
@@ -179,6 +207,24 @@ struct Args {
     /// Probe: keep the clients connected this many seconds after joining.
     #[arg(long, default_value_t = 0)]
     probe_hold_secs: u64,
+
+    /// Probe: also join the game server over UDP (as the game does) and send
+    /// player state 72 times a second while holding, then report what came
+    /// back.
+    #[arg(long)]
+    probe_udp: bool,
+
+    /// Probe UDP: percent of packets lost each way.
+    #[arg(long, default_value_t = 0.0)]
+    probe_loss_pct: f64,
+
+    /// Probe UDP: delay (ms) on what the clients send, for the round trip.
+    #[arg(long, default_value_t = 0)]
+    probe_delay_ms: u64,
+
+    /// Probe UDP: random extra delay (ms) on top, 0 to this.
+    #[arg(long, default_value_t = 0)]
+    probe_jitter_ms: u64,
 
     /// Log filter (tracing EnvFilter syntax).
     #[arg(long, env = "ERS_LOG", default_value = "info")]
@@ -347,6 +393,12 @@ async fn main() -> Result<()> {
             mode: args.probe_mode.clone(),
             auth: args.probe_auth.clone(),
             hold: Duration::from_secs(args.probe_hold_secs),
+            udp: args.probe_udp,
+            net: probe::NetSim {
+                loss_pct: args.probe_loss_pct.clamp(0.0, 100.0),
+                delay: Duration::from_millis(args.probe_delay_ms),
+                jitter: Duration::from_millis(args.probe_jitter_ms),
+            },
         })
         .await;
     }
@@ -361,11 +413,20 @@ async fn main() -> Result<()> {
     let lan_ip = args.lan_ip.or_else(detect_lan_ip).unwrap_or(Ipv4Addr::LOCALHOST);
     let public_ip = args.public_ip.unwrap_or(lan_ip);
 
-    let store = store::Store::open(&args.data_dir, !args.no_unlock_all).context("opening data directory")?;
-    let hub = lobby::Hub::new(store, lobby::Advertise { lan_ip, public_ip });
+    let mut moderators = std::collections::HashSet::new();
+    for m in args.moderators.iter().map(|m| m.trim()).filter(|m| !m.is_empty()) {
+        match sns::XpId::parse(m) {
+            Some(x) => {
+                moderators.insert(x);
+            }
+            None => bail!("--moderators: {m:?} is not a player id like OVR_ORG-123"),
+        }
+    }
+    let store = store::Store::open(&args.data_dir, !args.no_unlock_all, args.require_password).context("opening data directory")?;
+    let hub = lobby::Hub::new(store, lobby::Advertise { lan_ip, public_ip }, moderators);
     let upstreams = upstream::Upstreams::new(backend.clone(), lan_ip, &args.region, args.login_url.clone());
     let login_url = upstreams.login_url.clone();
-    let app = services::App { hub: hub.clone(), sessions: Arc::new(DashMap::new()), upstreams: upstreams.clone() };
+    let app = services::App::new(hub.clone(), upstreams.clone(), args.fleet_token.clone());
 
     let listener = bind_tcp(args.bind).with_context(|| format!("binding {}", args.bind))?;
     let hub_port = listener.local_addr()?.port();
@@ -420,7 +481,7 @@ async fn main() -> Result<()> {
             min_idle: args.min_idle,
             max_instances: args.max_instances.max(args.min_idle),
             idle_retire: Duration::from_secs(args.idle_retire_secs),
-            engine: engine::EngineConfig { arena_min_per_team: args.arena_min_per_team, veilnet: !args.no_veilnet, medigun: engine::veilnet::medigun_from_file() },
+            engine: engine::EngineConfig { arena_min_per_team: args.arena_min_per_team, veilnet: !args.no_veilnet, medigun: engine::veilnet::medigun_from_file(), drive: args.drive, relay_hold: Duration::from_micros(args.relay_hold_us) },
             hub_port,
         },
         hub.clone(),
@@ -448,7 +509,7 @@ async fn main() -> Result<()> {
     }
     info!(
         bind = %args.bind, lan_ip = %lan_ip, public_ip = %public_ip, udp_ports = %format!("{}+", args.udp_port),
-        backend = ?args.backend, frame_hz = engine::session::frame_hz(),
+        backend = ?args.backend, frame_hz = engine::session::frame_hz(), drive = ?args.drive, relay_hold_us = args.relay_hold_us,
         only_modes = ?args.only_modes, exclude_modes = ?args.exclude_modes, exclude_maps = ?args.exclude_maps,
         "echo-rust-server running"
     );

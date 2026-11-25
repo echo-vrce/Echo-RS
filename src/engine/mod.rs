@@ -49,7 +49,40 @@ pub struct EngineConfig {
     pub veilnet: bool,
     /// EchoCombat's MEDIGUN is allowed (only from `echocombat.ini`).
     pub medigun: bool,
+    /// What wakes the game server between packets and frames.
+    pub drive: Drive,
+    /// Event drive: how long relayed player state is held to gather more
+    /// before it goes out ahead of the next server frame (0: it waits for
+    /// the frame).
+    pub relay_hold: Duration,
 }
+
+impl EngineConfig {
+    /// The session's relay hold: only in event drive.
+    fn session_relay_hold(&self) -> Option<Duration> {
+        (self.drive == Drive::Event && !self.relay_hold.is_zero()).then_some(self.relay_hold)
+    }
+}
+
+/// What runs a game server's timed work (resends, gear timers, late
+/// balance tables, map switches, the end of a match).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Drive {
+    /// A 10 ms service pass, whether or not anything is due.
+    #[default]
+    Tick,
+    /// No service tick: state checks run with each server frame and the
+    /// timed work wakes at its own deadline.
+    Event,
+}
+
+/// How long after a wire frame boundary the frame clock ticks: enough that
+/// the frame has begun when the sessions read the clock.
+const FRAME_WAKE_MARGIN_US: u64 = 100;
+
+/// Wakes in event drive come at least this far apart, so a deadline that
+/// stays in the past cannot spin the loop.
+const EVENT_MIN_SLEEP: Duration = Duration::from_millis(1);
 
 pub struct Instance {
     pub port: u16,
@@ -151,6 +184,13 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 /// frames came 8, 8 and 9 ms apart, and each client saw everyone's states
 /// arrive that unevenly. The thread's sleep is a high-resolution timer on
 /// Windows and Linux alike; a late frame is skipped, not caught up.
+///
+/// Each tick lands just after a wire frame boundary (`FRAME_WAKE_MARGIN_US`),
+/// so it always finds exactly the next wire frame. Ticking on its own
+/// schedule, the thread drifted against the wire clock (8333 µs frames
+/// against 8333.3 µs sleeps); around each crossing, for half a minute at a
+/// time, ticks fell on both sides of a boundary: one found no new frame and
+/// the next sent two, 16.7 ms apart (11% of frames in one 30 s window).
 fn frame_ticks() -> watch::Receiver<u64> {
     static TICKS: std::sync::OnceLock<watch::Sender<u64>> = std::sync::OnceLock::new();
     TICKS
@@ -158,14 +198,22 @@ fn frame_ticks() -> watch::Receiver<u64> {
             let (tx, _) = watch::channel(0u64);
             let ticker = tx.clone();
             let run = move || {
-                let mut next = Instant::now();
+                // When this tick is due, before snapping to a wire boundary
+                // (below 120 Hz a tick spans several wire frames, unevenly).
+                let mut ideal = session::wire_boundary_at_or_after(session::clock_now_us());
                 loop {
-                    next += Duration::from_nanos(1_000_000_000 / session::frame_hz().max(1));
-                    let now = Instant::now();
-                    if next > now {
-                        std::thread::sleep(next - now);
-                    } else {
-                        next = now;
+                    ideal += 1_000_000 / session::frame_hz().max(1);
+                    let tick = session::wire_tick_us();
+                    let now = session::clock_now_us();
+                    let mut boundary = session::wire_boundary_at_or_after(ideal.saturating_sub(tick / 4));
+                    if boundary + FRAME_WAKE_MARGIN_US <= now {
+                        // Late (the thread was not scheduled): on to the next.
+                        boundary = session::wire_boundary_at_or_after(now);
+                        ideal = boundary;
+                    }
+                    let wake = boundary + FRAME_WAKE_MARGIN_US;
+                    if wake > now {
+                        std::thread::sleep(Duration::from_micros(wake - now));
                     }
                     ticker.send_modify(|n| *n = n.wrapping_add(1));
                 }
@@ -197,13 +245,36 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
     let mut early_keys: Vec<pb::SnsLobbySessionSuccessV5Message> = Vec::new();
     let mut veil = veilnet::VeilNet::new(cfg.veilnet, cfg.medigun);
     let mut buf = vec![0u8; 2048];
-    // Service (flush) every 10 ms; game frames at `--frame-hz`.
+    // Tick drive: service (flush) every 10 ms. Game frames at `--frame-hz`.
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut frames = frame_ticks();
     let mut outbox: Vec<pb::Envelope> = Vec::new();
 
+    let event = cfg.drive == Drive::Event;
+    let mut wakes: u64 = 0;
+    let mut wakes_logged = Instant::now();
     let result = loop {
+        // Event drive: no server frames while nobody is connected (the
+        // session's deadlines still wake it: an empty session's end, a
+        // finished match's close). A connecting player's first packet makes
+        // a peer, and the frames resume.
+        let frames_on = session.as_ref().is_some_and(|s| !event || s.peer_count() > 0);
+        // Event drive: sleep to the earliest timed work (or the idle end).
+        let now = Instant::now();
+        let wake = if event {
+            if now.duration_since(wakes_logged) >= Duration::from_secs(30) {
+                if wakes > 0 {
+                    debug!(instance = idx, wakes_per_s = wakes as f64 / now.duration_since(wakes_logged).as_secs_f64(), "event drive deadline wakes");
+                }
+                wakes = 0;
+                wakes_logged = now;
+            }
+            let due = session.as_ref().and_then(|s| [s.next_deadline(now), veil.next_due(), idle_end_at(s)].into_iter().flatten().min());
+            due.unwrap_or(now + Duration::from_secs(3600)).max(now + EVENT_MIN_SLEEP)
+        } else {
+            now + Duration::from_secs(3600)
+        };
         tokio::select! {
             _ = stop.changed() => {
                 if let Some(mut s) = session.take() {
@@ -244,39 +315,37 @@ async fn serve(idx: u32, port: u16, socket: &UdpSocket, ws: Ws, stop: &mut watch
                     outbox.append(&mut s.fleet_out);
                 }
             }
-            _ = frames.changed(), if session.is_some() => {
+            _ = frames.changed(), if frames_on => {
                 let s = session.as_mut().expect("guarded");
                 s.server_frame();
+                if event {
+                    // No service tick: the state checks ride on the frame.
+                    veil_pass(socket, s, &mut veil).await;
+                    s.poll();
+                    s.flush_reliable();
+                }
                 send_udp(socket, s).await;
                 outbox.append(&mut s.fleet_out);
+                if event {
+                    end_if_done(idx, socket, &mut session, &mut outbox).await;
+                }
             }
-            _ = tick.tick(), if session.is_some() => {
+            _ = tick.tick(), if session.is_some() && !event => {
                 let s = session.as_mut().expect("guarded");
-                let mut veil_out = veilnet::Out::new();
-                veil.sync_session(Some((s.info.lobby, s.info.mode, s.info.level)));
-                veil.tick(Instant::now(), &mut veil_out);
-                veil_sync(s, &mut veil, &mut veil_out);
-                send_veil(socket, veil_out).await;
+                veil_pass(socket, s, &mut veil).await;
                 s.service();
                 send_udp(socket, s).await;
                 outbox.append(&mut s.fleet_out);
-                // Release the server once nobody is left.
-                let idle_for = s.last_activity.elapsed();
-                let limit = if s.ever_joined { Duration::from_secs(3) } else { Duration::from_secs(90) };
-                if s.peer_count() == 0 && idle_for > limit {
-                    info!(instance = idx, lobby = %s.info.lobby, "session empty; ending");
-                    outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
-                    session = None;
-                } else if s.finished() {
-                    // A public match is over and everyone went back to the
-                    // lobby, or only spectators are left: idle now, so nobody
-                    // rejoins the finished game.
-                    info!(instance = idx, lobby = %s.info.lobby, players = s.peer_count(), "match over; ending the session");
-                    s.close();
-                    send_udp(socket, s).await;
-                    outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
-                    session = None;
-                }
+                end_if_done(idx, socket, &mut session, &mut outbox).await;
+            }
+            _ = tokio::time::sleep_until(wake.into()), if session.is_some() && event => {
+                let s = session.as_mut().expect("guarded");
+                wakes += 1;
+                veil_pass(socket, s, &mut veil).await;
+                s.timed();
+                send_udp(socket, s).await;
+                outbox.append(&mut s.fleet_out);
+                end_if_done(idx, socket, &mut session, &mut outbox).await;
             }
         }
         for e in outbox.drain(..) {
@@ -331,6 +400,18 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil
     let from = canonical(from);
     // EchoCombat's own packets, on the game's socket (never game traffic).
     if let Some((kind, id)) = veilnet::parse(d) {
+        // VeilNet packets carry no MAC. Only a player in this match (an
+        // address that proved its session keys) changes rules, relays events
+        // or is remembered as a client; anyone else's hello gets one answer
+        // back, no more, so the port can't be used to multiply traffic.
+        if !session.as_ref().is_some_and(|s| s.has_peer(from)) {
+            if kind == b'H'
+                && let Some(p) = veil.stranger_answer()
+            {
+                let _ = send_to(socket, is_v6(socket), &p, from).await;
+            }
+            return;
+        }
         veil.sync_session(session.as_ref().map(|s| (s.info.lobby, s.info.mode, s.info.level)));
         let mut out = veilnet::Out::new();
         let fresh = veil.handle(from, kind, id, Instant::now(), &mut out);
@@ -371,6 +452,47 @@ async fn handle_datagram(socket: &UdpSocket, session: &mut Option<Session>, veil
 
 /// EchoCombat's rules both ways: the match's state to VeilNet (may a PAUSE
 /// begin, RULES page 1), then VeilNet's rules to the match.
+/// VeilNet's share of a service pass: its view of the session, the end of
+/// an UNPAUSE countdown, the match state, and what it has to send.
+async fn veil_pass(socket: &UdpSocket, s: &mut Session, veil: &mut veilnet::VeilNet) {
+    let mut veil_out = veilnet::Out::new();
+    veil.sync_session(Some((s.info.lobby, s.info.mode, s.info.level)));
+    veil.tick(Instant::now(), &mut veil_out);
+    veil_sync(s, veil, &mut veil_out);
+    send_veil(socket, veil_out).await;
+}
+
+/// How long an empty session waits before it ends: briefly once someone had
+/// joined, longer for the first player to arrive.
+fn idle_limit(s: &Session) -> Duration {
+    if s.ever_joined { Duration::from_secs(3) } else { Duration::from_secs(90) }
+}
+
+/// When an empty session is due to end (event drive's wake for it).
+fn idle_end_at(s: &Session) -> Option<Instant> {
+    (s.peer_count() == 0).then(|| s.last_activity + idle_limit(s) + Duration::from_millis(1))
+}
+
+/// Ends the session once nobody is left, or once a finished match is due to
+/// close.
+async fn end_if_done(idx: u32, socket: &UdpSocket, session: &mut Option<Session>, outbox: &mut Vec<pb::Envelope>) {
+    let Some(s) = session.as_mut() else { return };
+    if s.peer_count() == 0 && s.last_activity.elapsed() > idle_limit(s) {
+        info!(instance = idx, lobby = %s.info.lobby, frames = s.frames_run(), "session empty; ending");
+        outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
+        *session = None;
+    } else if s.finished() {
+        // A public match is over and everyone went back to the lobby, or
+        // only spectators are left: idle now, so nobody rejoins the
+        // finished game.
+        info!(instance = idx, lobby = %s.info.lobby, players = s.peer_count(), frames = s.frames_run(), "match over; ending the session");
+        s.close();
+        send_udp(socket, s).await;
+        outbox.push(session_event(s.info.lobby, pb::lobby_session_event_message::Code::Ended));
+        *session = None;
+    }
+}
+
 fn veil_sync(s: &mut Session, veil: &mut veilnet::VeilNet, out: &mut veilnet::Out) {
     let now = Instant::now();
     for a in s.peer_addrs() {
@@ -481,6 +603,7 @@ fn on_fleet(
             );
             let lobby = info.lobby;
             let mut sess = Session::new(info, cfg.arena_min_per_team);
+            sess.set_relay_hold(cfg.session_relay_hold());
             for k in early_keys.drain(..) {
                 if k.lobby_id.parse::<Uuid>().map_or(true, |l| l == lobby || l.is_nil()) {
                     sess.add_keys(&k);
@@ -519,7 +642,7 @@ fn on_fleet(
         }
         Em::LobbySessionEvent(ev) if ev.code == pb::lobby_session_event_message::Code::Ended as i32 => {
             if let Some(mut s) = session.take() {
-                info!(instance = idx, lobby = %s.info.lobby, "backend ended the session");
+                info!(instance = idx, lobby = %s.info.lobby, frames = s.frames_run(), "backend ended the session");
                 s.close();
                 // Datagrams left in s.udp_out are best effort; the peers time out anyway.
             }
@@ -534,6 +657,16 @@ mod tests {
 
     fn info(settings: &str) -> SessionInfo {
         session_info(&pb::LobbySessionCreateMessage { settings_json: settings.into(), ..Default::default() })
+    }
+
+    /// Event drive wakes for an empty session's end: 90 s before anyone
+    /// joined, nothing while someone is connected.
+    #[test]
+    fn idle_end_waits_for_an_empty_session() {
+        let s = Session::new(SessionInfo { lobby: Uuid::nil(), mode: 0, level: msg::LEVEL_SOCIAL }, 1);
+        let at = idle_end_at(&s).expect("empty");
+        assert!(at > s.last_activity + Duration::from_secs(90));
+        assert!(at < s.last_activity + Duration::from_secs(91));
     }
 
     #[test]

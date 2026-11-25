@@ -74,7 +74,7 @@ fn find_keys(dir: &Path) -> Result<Vec<crate::wire::pb::SnsLobbySessionSuccessV5
 }
 
 /// (client -> server, server -> client) transports for one key set.
-fn transports(s: &crate::wire::pb::SnsLobbySessionSuccessV5Message) -> (Transport, Transport) {
+pub(crate) fn transports(s: &crate::wire::pb::SnsLobbySessionSuccessV5Message) -> (Transport, Transport) {
     let server = SessionCrypto {
         out_flags: s.server_encoder_flags,
         out_aes: key32(&s.server_enc_key),
