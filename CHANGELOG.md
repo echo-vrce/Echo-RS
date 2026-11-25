@@ -3,6 +3,13 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.3 (2026-11-25)
+
+### Changes
+- Launcher no longer uses CPU while hidden to the tray
+- Launcher: no CPU use while hidden to the tray
+  - Hidden to the tray, the launcher kept one CPU core busy until shown again (worst on PCs using Windows' software renderer): the redraw that hiding asks for never reached the hidden window, so the window's event loop kept polling for it. While hidden, the launcher now delivers that redraw itself and goes idle
+
 ## 0.3.2 (2026-11-25)
 
 ### Changes
