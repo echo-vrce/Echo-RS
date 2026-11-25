@@ -1289,6 +1289,8 @@ pub struct Session {
     combat_at: Option<Instant>,
     /// The combat vars last sent (only changes go out, plus all twice a second).
     combat_sent: HashMap<u64, u64>,
+    /// The gun heat vars last sent (the lobby sends them again on a change).
+    heat_sent: Vec<(u64, u64)>,
     /// Games VeilNet showed have EchoCombat.
     ec_clients: HashSet<SocketAddr>,
     /// Games given the stock gear tables (no EchoCombat seen yet): they get
@@ -1661,6 +1663,7 @@ impl Session {
             combat,
             combat_at: None,
             combat_sent: HashMap::new(),
+            heat_sent: Vec::new(),
             ec_clients: HashSet::new(),
             stock_balance: HashSet::new(),
             balance_wait: HashMap::new(),
@@ -5135,6 +5138,22 @@ impl Session {
         };
         combat_holds.sort_unstable();
         let mut fulls: Vec<Vec<u8>> = base.iter().enumerate().map(|(i, b)| fresh(b, i)).collect();
+        // Every joined player's gun heat, 0 until they shoot (native: from the
+        // moment they join, in matches and in the lobby, snapshot included).
+        let heat: Vec<(u64, u64)> = if arena {
+            Vec::new()
+        } else {
+            let joined: Vec<(SocketAddr, u32)> = self
+                .peers
+                .iter()
+                .filter(|(_, p)| p.stage == Stage::Joined)
+                .filter_map(|(a, p)| Some((*a, u32::try_from(p.slot?).ok()?)))
+                .collect();
+            self.gear.heat_vars(&joined)
+        };
+        // The lobby's: only the heat vars that changed since the last frame.
+        let heat_changed: Vec<(u64, u64)> = heat.iter().copied().filter(|x| !self.heat_sent.contains(x)).collect();
+        self.heat_sent = heat.clone();
         // The lobby's cease fire (`VAR_HOLD`), per player: lifted (0) only in
         // the brawler room, where the client then lets them stun and block.
         // Native's version in the high word (`LOBBY_HOLD_VERSION`), baseline included.
@@ -5149,6 +5168,9 @@ impl Session {
                 for &(var, v) in &holds {
                     *f = msg::with_var_added(f, var, v);
                 }
+                for &(var, v) in &heat {
+                    *f = msg::with_var_added(f, var, v);
+                }
             } else if arena {
                 // The goal hold, for every entrant (`tracked` has them).
                 for &(var, _) in &entrants {
@@ -5157,7 +5179,7 @@ impl Session {
                     }
                 }
             } else {
-                for &(var, v) in &combat_holds {
+                for &(var, v) in combat_holds.iter().chain(&heat) {
                     *f = msg::with_var_added(f, var, v);
                 }
             }
@@ -5168,7 +5190,7 @@ impl Session {
         let combat_vars = self.combat.as_ref().map(|c| {
             let mut all: Vec<(u64, u64)> = c.vars().into_iter().map(|(h, v)| (h, v.resolve(var_raw(&base[0], h).unwrap_or(0)))).collect();
             // Each player's gun heat (native sends it with the mode's vars).
-            all.extend(gear.heat_vars());
+            all.extend_from_slice(&heat);
             let every = server_frame % (frame_hz() / 2).max(1) == 0;
             let changed: Vec<(u64, u64)> = all.iter().copied().filter(|(h, v)| every || self.combat_sent.get(h) != Some(v)).collect();
             (all, changed)
@@ -5221,9 +5243,12 @@ impl Session {
                     info!(%addr, fight, slot = ?p.slot, genidx = p.genidx, pos = ?gear.body_pos(*addr), "lobby cease fire {}", if fight { "lifted" } else { "on" });
                 }
                 let changed = p.holds_sent.as_ref() != Some(&holds);
-                if lobby_due || changed || second {
-                    let mut vars = lobby_vars.clone();
-                    vars.extend_from_slice(&holds);
+                if lobby_due || changed || second || !heat_changed.is_empty() {
+                    let mut vars = if lobby_due || changed || second { lobby_vars.clone() } else { Vec::new() };
+                    if lobby_due || changed || second {
+                        vars.extend_from_slice(&holds);
+                    }
+                    vars.extend_from_slice(if second { &heat } else { &heat_changed });
                     let mut body = delta(&base[0], &vars);
                     stamp(&mut body, server_frame);
                     p.t.queue_mailbox(REPLICATED_VARS, key_replicated(0, frame, slot), &body);

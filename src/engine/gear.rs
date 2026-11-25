@@ -791,6 +791,8 @@ pub struct Gear {
     checks: super::checks::Checks,
     /// Where each player's thrown ordnance is.
     thrown_at: HashMap<SocketAddr, [f32; 3]>,
+    /// When each player's thrown ordnance last reported where it is.
+    thrown_seen: HashMap<SocketAddr, Instant>,
     /// When each player last took a new ordnance: from then on their thrown
     /// position is that one's, not an older STUN FIELD's grenade.
     spawned_at: HashMap<SocketAddr, Instant>,
@@ -806,8 +808,14 @@ pub struct Gear {
     /// (stuck to a surface): a DETONATOR's blast does not go through that surface.
     thrown_from: HashMap<SocketAddr, ([f32; 3], bool)>,
     fields: Vec<Field>,
-    /// Heal bubble parameters by bubble, and each player's bubble owner id.
-    bubbles: Vec<([u8; 8], Vec<u8>)>,
+    /// Each player's own heal bubble parameters (`HealBubbleParamUpdate`,
+    /// one per bubble: REPAIR MATRIX, OVERCHARGE, a third), and each player's
+    /// bubble owner id. Bytes 0..8 of the params are the same for everyone
+    /// (the player space; the owner is at 16..24), so they were stored by
+    /// bubble only: on entering the combat area a player got whoever sent
+    /// last's instead of their own (native sends their own), and in a full
+    /// lobby OVERCHARGE never started and its tac mod stayed stuck.
+    bubbles: HashMap<SocketAddr, Vec<Vec<u8>>>,
     bubble_owner: HashMap<SocketAddr, [u8; 8]>,
     /// The bullet direction for the next `hurt` (a shot's).
     shot_dir: Option<[f32; 3]>,
@@ -919,13 +927,14 @@ impl Gear {
             gens: HashMap::new(),
             checks: super::checks::Checks::default(),
             thrown_at: HashMap::new(),
+            thrown_seen: HashMap::new(),
             spawned_at: HashMap::new(),
             owed_refund: HashMap::new(),
             tac_running: HashMap::new(),
             heat: HashMap::new(),
             thrown_from: HashMap::new(),
             fields: Vec::new(),
-            bubbles: Vec::new(),
+            bubbles: HashMap::new(),
             bubble_owner: HashMap::new(),
             shot_dir: None,
             lives: HashMap::new(),
@@ -1297,6 +1306,7 @@ impl Gear {
             }
             self.bodies.insert(from, (u16::from_le_bytes([d[0], d[1]]), pos));
         } else if d[4..8] == self.space[..4] {
+            self.thrown_seen.insert(from, now);
             if let Some(last) = self.thrown_at.insert(from, pos) {
                 if dist(last, pos) > STILL {
                     self.thrown_from.insert(from, (last, false));
@@ -1311,6 +1321,7 @@ impl Gear {
     pub fn forget(&mut self, who: SocketAddr) -> Vec<Out> {
         self.checks.forget(who);
         self.heat.remove(&who);
+        self.bubbles.remove(&who);
         let outs = match self.station_slot(&who) {
             // Native (Dyson server recording): a player leaving a match gets
             // the same, from the server, at once.
@@ -1322,6 +1333,7 @@ impl Gear {
         self.history.remove(&who);
         self.pings.remove(&who);
         self.thrown_at.remove(&who);
+        self.thrown_seen.remove(&who);
         self.spawned_at.remove(&who);
         self.owed_refund.remove(&who);
         self.tac_running.remove(&who);
@@ -1496,17 +1508,24 @@ impl Gear {
         }
     }
 
-    /// The gun heat vars: `(key, value)` for every player with a slot that
-    /// has a known key, value `[heat f32][0 u16][slot u16]` (native).
-    pub fn heat_vars(&self) -> Vec<(u64, u64)> {
-        self.heat
+    /// The gun heat vars of `players` (each with their slot): `(key, value)`
+    /// for every slot that has a known key, value `[heat f32][0 u16][slot u16]`.
+    /// Native sends one for every player from the moment they join, 0 until
+    /// they shoot, in matches and in the lobby (every recording). Ours went
+    /// only to players who had shot, never in the lobby: everyone else's gun
+    /// stayed hidden or stuck on PULSAR, and no overheat showed.
+    pub fn heat_vars(&self, players: &[(SocketAddr, u32)]) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = players
             .iter()
-            .filter_map(|(who, h)| {
-                let slot = self.station_slot(who)?;
-                let key = *HEAT_KEYS.get(slot as usize)?;
-                Some((key, u64::from(h.level.to_bits()) | (u64::from(slot as u16) << 48)))
+            .filter_map(|(who, slot)| {
+                let key = *HEAT_KEYS.get(*slot as usize)?;
+                let level = self.heat.get(who).map_or(0.0, |h| h.level);
+                Some((key, u64::from(level.to_bits()) | (u64::from(*slot as u16) << 48)))
             })
-            .collect()
+            .collect();
+        v.sort_unstable();
+        v.dedup_by_key(|x| x.0);
+        v
     }
 
     pub fn slot_of(&self, who: &SocketAddr) -> u32 {
@@ -1990,7 +2009,7 @@ impl Gear {
         let slot = self.slot_of(&from);
         if let Some(owner) = self.bubble_owner.get(&from) {
             v.push(out(To::Sender, HEALTH_BROADCAST, &health_body(*owner, slot, &life, true)));
-            for (_, p) in self.bubbles.iter().filter(|(_, p)| p[..8] == owner[..]) {
+            for p in self.bubbles.get(&from).into_iter().flatten() {
                 v.push(out(To::Sender, HEAL_BUBBLE_PARAMS, p));
             }
         }
@@ -2153,7 +2172,10 @@ impl Gear {
                 info!(%from, secs, "REPAIR MATRIX on");
                 vec![out(To::Others, ty, d)]
             }
-            HEAL_BUBBLE_ACTIVATE => vec![out(To::Others, ty, d)],
+            HEAL_BUBBLE_ACTIVATE => {
+                info!(%from, bubble = %d.get(8..16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>()).unwrap_or_default(), "heal bubble on (not OVERCHARGE or REPAIR MATRIX)");
+                vec![out(To::Others, ty, d)]
+            }
             PLAYER_RESPAWN if d.len() >= 8 && self.in_match && !self.lives.get(&from).is_some_and(|l| l.dead) => {
                 // In a match the server respawns everyone (`MATCH_RESPAWN`
                 // after the kill). A lagging client's own ask came in after
@@ -2185,10 +2207,10 @@ impl Gear {
             // Native answers each cooldown with two.
             ABILITY_COOLDOWN => vec![out(To::All, ty, d), out(To::Sender, ty, d)],
             HEAL_BUBBLE_PARAMS if d.len() == 56 => {
-                let key = arr8(d, 8);
-                match self.bubbles.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, p)) => *p = d.to_vec(),
-                    None => self.bubbles.push((key, d.to_vec())),
+                let mine = self.bubbles.entry(from).or_default();
+                match mine.iter_mut().find(|p| p[8..16] == d[8..16]) {
+                    Some(p) => *p = d.to_vec(),
+                    None => mine.push(d.to_vec()),
                 }
                 self.bubble_owner.insert(from, arr8(d, 0));
                 vec![out(To::All, ty, d)]
@@ -2390,6 +2412,19 @@ impl Gear {
                         // drew several blasts.
                         let radius = weapons().pointer("/grenade_properties/det/radius").and_then(Value::as_f64).unwrap_or(DET_RADIUS) as f32;
                         let (mut o, mut hits) = self.explode(EX_DET, id, at, radius, thrower);
+                        // Where the blast went off, as the server knows it:
+                        // the DET's last position report, how old it is, and
+                        // whether it came after the DET was spawned (else the
+                        // position is an earlier throw's).
+                        let nearest = DUMMIES.iter().filter(|_| !self.in_match).map(|(p, _)| dist(at, *p)).fold(f32::INFINITY, f32::min);
+                        info!(
+                            %thrower,
+                            age_ms = self.thrown_seen.get(&thrower).map(|t| now.saturating_duration_since(*t).as_millis()),
+                            since_spawn = self.mags.get(&id).is_none_or(|m| m.at_spawn != Some(at)),
+                            nearest_dummy_m = nearest,
+                            hits = hits.len(),
+                            "DETONATOR went off"
+                        );
                         // Stuck to a wall, it does not hurt the far side.
                         if let Some(&(from_pos, true)) = self.thrown_from.get(&thrower) {
                             let before = hits.len();
@@ -3439,6 +3474,29 @@ mod tests {
         assert_eq!(h.body, unhex("8ec21d00d315993f000000000000e0420000e0400000000000000000ffffffff000000000000000000000000000000000000000000000000ffffffffffffffff"));
     }
 
+    /// Entering the combat area sends the player their own heal bubble
+    /// params, not whoever sent last's (every player's start with the same
+    /// 8 bytes; the owner is at 16..24).
+    #[test]
+    fn entry_sends_each_player_their_own_bubble_params() {
+        let mut g = Gear::new();
+        let me = addr();
+        let them: SocketAddr = "10.0.0.9:6794".parse().unwrap();
+        let mine = unhex("8ec21d00d315993f41e35b49673283b9f234d5099974113f00000000000080bf0000803f0000404000004040000020418401404100000000");
+        let theirs = unhex("8ec21d00d315993f41e35b49673283b9f334d5099974113f00000000000080bf0000803f0000404000004040000020418401404100000000");
+        let repair = unhex("8ec21d00d315993fd1eb3d3fa8a2fdb1f234d5099974113f00000000000080bf0000803f000080bf00004040000020418401404100000000");
+        let t0 = Instant::now();
+        g.on_message(me, HEAL_BUBBLE_PARAMS, &mine, t0);
+        g.on_message(me, HEAL_BUBBLE_PARAMS, &repair, t0);
+        g.on_message(them, HEAL_BUBBLE_PARAMS, &theirs, t0);
+        let outs = g.area_event(me, AREA_ENTER_EVENT, t0);
+        let params: Vec<_> = outs.iter().filter(|o| o.ty == HEAL_BUBBLE_PARAMS).map(|o| o.body.clone()).collect();
+        assert_eq!(params, vec![mine, repair]);
+        let outs = g.area_event(them, AREA_ENTER_EVENT, t0);
+        let params: Vec<_> = outs.iter().filter(|o| o.ty == HEAL_BUBBLE_PARAMS).map(|o| o.body.clone()).collect();
+        assert_eq!(params, vec![theirs]);
+    }
+
     #[test]
     fn dummy_hit_markers_match_native() {
         // Native lobby recording 2026-11-16: BulletCollision -> LocallyTrackedDamage (part 4, part 5).
@@ -3856,9 +3914,15 @@ mod tests {
         let mut g = Gear::new();
         let t0 = Instant::now();
         let me = addr();
-        g.slots.insert(me, 3);
+        let them: SocketAddr = "10.0.0.9:6794".parse().unwrap();
+        let players = [(me, 3), (them, 4)];
+        // Before anyone shoots: every player's heat, 0, with their slot (native).
+        let v = g.heat_vars(&players);
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().all(|&(_, raw)| f32::from_bits(raw as u32) == 0.0));
+        assert!(v.contains(&(0xa5b0_8065_11d7_72d4, 4 << 48)), "slot 4's heat, 0");
         g.heat_shot(me, 60.0, t0);
-        let v = g.heat_vars();
+        let v: Vec<_> = g.heat_vars(&players).into_iter().filter(|(k, _)| *k == 0x71d2_85d5_24e9_a696).collect();
         assert_eq!(v.len(), 1);
         let (k, raw) = v[0];
         assert_eq!(k, 0x71d2_85d5_24e9_a696, "slot 3's key");
@@ -3869,18 +3933,18 @@ mod tests {
         for i in 1..40 {
             g.heat_shot(me, 60.0, t0 + Duration::from_millis(i));
         }
-        assert_eq!(f32::from_bits(g.heat_vars()[0].1 as u32), 1.0);
+        assert_eq!(f32::from_bits(g.heat_vars(&players[..1])[0].1 as u32), 1.0);
         g.cool_guns(t0 + Duration::from_secs(1));
-        assert_eq!(f32::from_bits(g.heat_vars()[0].1 as u32), 0.0);
+        assert_eq!(f32::from_bits(g.heat_vars(&players[..1])[0].1 as u32), 0.0);
         // One shot drains back to 0 after its delay.
         let t1 = t0 + Duration::from_secs(2);
         g.heat_shot(me, 60.0, t1);
         g.cool_guns(t1 + Duration::from_millis(50));
-        assert!(f32::from_bits(g.heat_vars()[0].1 as u32) > 0.0, "held during the delay");
+        assert!(f32::from_bits(g.heat_vars(&players[..1])[0].1 as u32) > 0.0, "held during the delay");
         for i in 1..=100 {
             g.cool_guns(t1 + Duration::from_millis(100 * i));
         }
-        assert_eq!(f32::from_bits(g.heat_vars()[0].1 as u32), 0.0);
+        assert_eq!(f32::from_bits(g.heat_vars(&players[..1])[0].1 as u32), 0.0);
     }
 
     /// The second native recording: METEOR on yourself (half of 40), then a
