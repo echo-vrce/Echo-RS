@@ -3,6 +3,13 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.4 (2026-11-26)
+
+### Changes
+- Respawn fix and native combat announcer lines
+- Respawn: no capturing or damage before the body reaches the spawn
+- Combat announcer: native's payload lines play, extra lines removed
+
 ## 0.3.3 (2026-11-25)
 
 ### Changes
