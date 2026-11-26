@@ -2634,6 +2634,16 @@ impl Session {
             p.xpid = Some(x);
             crate::upstream::note_entrant(p.entrant_id, x);
             first_id = true;
+            // The join line only had the address: this ties it to a name.
+            let name = p.entrant_header.as_deref().and_then(|h| h.get(60..96)).map(|n| n.split(|&b| b == 0).next().unwrap_or(&[])).unwrap_or(&[]);
+            info!(
+                addr = %from,
+                slot = ?p.slot,
+                name = %String::from_utf8_lossy(name),
+                id = %crate::sns::XpId { platform: x[0], account: x[1] }.token(),
+                entrant = %p.entrant_id,
+                "player identified"
+            );
         }
         p.entrant_latest = Some(d);
         p.entrant_states += 1;
