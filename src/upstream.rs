@@ -42,8 +42,9 @@ use crate::sns::{self, Reader, Writer, sym};
 /// contract with nakama and must not change.
 const PROTOBUF_FRAME: u64 = 0x9ee5_107d_9e29_fd63;
 /// nakama's own ServerDB message for a loadout a player saved
-/// (`ERGameServerSaveLoadoutRequest`). EchoRelay uses this symbol for
-/// something else, so it only goes to nakama.
+/// (`ERGameServerSaveLoadoutRequest`). Not sent: nakama cannot decode it (see
+/// [`nakama_save_loadout`]). Kept so frames carrying it are recognised.
+#[cfg_attr(not(test), allow(dead_code))]
 const NAKAMA_SAVE_LOADOUT: u64 = 0x7777_7777_7777_0B00;
 /// atlas's `ERGameServerMuteEntrants`: null-terminated JSON
 /// `{"entrant_ids":[..],"muted":bool}`. It goes to the engine as a text frame.
@@ -885,31 +886,26 @@ fn login_from_serverdb(url: &str) -> String {
     format!("{}/login", base.strip_suffix("/serverdb").unwrap_or(base))
 }
 
-fn sym_hex(v: u64) -> String {
-    format!("0x{v:016X}")
-}
-
-/// nakama: its `ERGameServerSaveLoadoutRequest` on the ServerDB socket.
+/// nakama: the save as its protobuf envelope, in a [`PROTOBUF_FRAME`].
+///
+/// Not as its `ERGameServerSaveLoadoutRequest` ([`NAKAMA_SAVE_LOADOUT`]):
+/// nakama's packet decoder has no entry for that symbol (only its message
+/// factory does), so it dropped every one as an "unknown symbol", and only the
+/// client's slot-less `item_equipped` log reached the profile (through
+/// v3.27.2-evr.347, 2026-11-26). The protobuf save has been handled since
+/// evr.301, the release that added the legacy one, and needs no platform id.
 fn nakama_save_loadout(m: &pb::GameServerSaveLoadoutMessage) -> Option<Vec<u8>> {
     let entrant: Uuid = m.entrant_id.parse().ok()?;
-    let Some(xpid) = ENTRANTS.get(&entrant).map(|x| *x) else {
-        warn!(%entrant, "loadout changed for a player with no platform id yet; not saved");
-        return None;
-    };
-    let instances: Vec<serde_json::Value> = m
-        .loadout_instances
-        .iter()
-        .map(|i| {
-            let items: serde_json::Map<String, serde_json::Value> =
-                i.items.iter().map(|it| (sym_hex(it.slot_type), serde_json::Value::String(sym_hex(it.equipped_item)))).collect();
-            serde_json::json!({ "instance_name": sym_hex(i.instance_name), "items": items })
-        })
-        .collect();
-    let json = serde_json::json!({ "slot": m.loadout_slot, "number": m.jersey_number, "loadout_instances": instances });
-    let mut w = Writer::new();
-    w.guid(entrant).u64(xpid[0]).u64(xpid[1]).u32(m.loadout_slot as u32).json_nt(json.to_string().as_bytes());
+    let mut m = m.clone();
+    // nakama refuses a save whose lobby is not the sender's match; with none
+    // it checks only that the entrant is in that match.
+    if m.lobby_session_id.parse::<Uuid>().map_or(true, |u| u.is_nil()) {
+        m.lobby_session_id.clear();
+    }
     info!(%entrant, items = m.loadout_instances.iter().map(|i| i.items.len()).sum::<usize>(), "saving loadout to nakama");
-    Some(er_message(NAKAMA_SAVE_LOADOUT, w))
+    let mut out = Vec::new();
+    sns::frame(&mut out, PROTOBUF_FRAME, &env_msg(Em::GameServerSaveLoadout(m)).encode_to_vec());
+    Some(out)
 }
 
 /// `SNSUserServerProfileUpdateRequest`: `[platform u64][account u64][payload json]`.
@@ -1025,6 +1021,40 @@ mod tests {
         sns::frame(&mut frame, NAKAMA_MUTE_ENTRANTS, &payload);
         sns::frame(&mut frame, NAKAMA_SAVE_LOADOUT, b"{} ");
         assert_eq!(mute_texts(&frame).len(), 1);
+    }
+
+    #[test]
+    fn loadout_saves_reach_nakama_as_its_protobuf_save() {
+        let entrant = Uuid::new_v4();
+        let lobby = Uuid::new_v4();
+        let save = pb::GameServerSaveLoadoutMessage {
+            lobby_session_id: lobby.to_string(),
+            entrant_id: entrant.to_string(),
+            loadout_slot: 1,
+            jersey_number: -1,
+            loadout_instances: vec![pb::LoadoutInstance {
+                instance_name: 7,
+                items: vec![pb::LoadoutItem { slot_type: 0x1111, equipped_item: 0x2222 }],
+            }],
+            loadout_entry: None,
+        };
+        // No platform id is needed (the legacy save was dropped without one).
+        let frame = nakama_save_loadout(&save).expect("a frame");
+        let msgs = sns::split(&frame).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, PROTOBUF_FRAME);
+        let env = pb::Envelope::decode(msgs[0].1).unwrap();
+        let Some(Em::GameServerSaveLoadout(got)) = env.message else { panic!("not a save: {env:?}") };
+        assert_eq!(got, save);
+
+        // A nil lobby is left out: nakama would refuse it as not the sender's match.
+        let nil = pb::GameServerSaveLoadoutMessage { lobby_session_id: Uuid::nil().to_string(), ..save.clone() };
+        let msgs_nil = nakama_save_loadout(&nil).unwrap();
+        let env = pb::Envelope::decode(sns::split(&msgs_nil).unwrap()[0].1).unwrap();
+        let Some(Em::GameServerSaveLoadout(got)) = env.message else { panic!() };
+        assert_eq!(got.lobby_session_id, "");
+
+        assert!(nakama_save_loadout(&pb::GameServerSaveLoadoutMessage { entrant_id: "x".into(), ..save }).is_none());
     }
 
     #[test]
