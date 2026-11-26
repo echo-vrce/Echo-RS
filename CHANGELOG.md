@@ -3,6 +3,17 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.5 (2026-11-26)
+
+### Changes
+- Capture point announcer lines
+- Capture point: "point unlocking in", "contested", "captured" and "stolen" play
+  - "point unlocking in" with 7 s of lock left, then five .. one;
+  - "point contested" once both teams have been on the unlocked point for
+    0.25 s, once per contention and at most every 5 s;
+  - on a change of hands, "point captured" to the new holder's team and
+    spectators, "point stolen" to the other team.
+
 ## 0.3.4 (2026-11-26)
 
 ### Changes
