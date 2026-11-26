@@ -3877,7 +3877,7 @@ impl Session {
             .map(|(a, p)| {
                 let slot = self.gear.slot_of(a) as u8;
                 // PHASE SHIFT's user can't take or hold the objective.
-                let present = self.gear.alive(*a) && !self.gear.immune(a, "disable_objectives");
+                let present = self.gear.present(*a) && !self.gear.immune(a, "disable_objectives");
                 (u8::from(p.team == TEAM_ORANGE), present, self.gear.body_pos(*a), slot)
             })
             .collect();
@@ -4494,7 +4494,7 @@ impl Session {
         self.cap_owner = owner_now;
         if playing {
             for (a, o) in &objective {
-                let alive = self.gear.alive(*a);
+                let alive = self.gear.present(*a);
                 if let Some(p) = self.peers.get_mut(a) {
                     p.cstats.played += dt;
                     if *o && alive {

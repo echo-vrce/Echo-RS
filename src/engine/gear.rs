@@ -427,6 +427,13 @@ const DAMAGEABLE: [u8; 8] = [0x8e, 0xc2, 0x1d, 0x00, 0xd3, 0x15, 0x99, 0x3f];
 const RESPAWN_AFTER: Duration = Duration::from_secs(10);
 /// A match: native respawns the dead 6.65 s after the kill (Gauss recording).
 const MATCH_RESPAWN: Duration = Duration::from_millis(6650);
+/// Just respawned: until the player's body is seen this far from where it
+/// died (their game moved it to a spawn), or `SPAWN_SETTLE` at most, they
+/// neither claim objectives nor take damage. The server's own body position
+/// is the death spot until the client's next update: players killed on a
+/// capture point claimed it, and could be hit, for that moment.
+const SPAWN_MOVED: f32 = 1.0;
+const SPAWN_SETTLE: Duration = Duration::from_secs(2);
 /// Gear stations: eight sets of fifteen bits, one bit per player slot.
 const STATIONS: u32 = 8;
 const STATION_SLOTS: u32 = 15;
@@ -496,6 +503,8 @@ struct Life {
     /// When health last went down, and when regeneration last sent.
     lost_at: Option<Instant>,
     regen_at: Option<Instant>,
+    /// Respawned at, and where the body was then (see `SPAWN_MOVED`).
+    respawned: Option<(Instant, Option<[f32; 3]>)>,
 }
 
 impl Life {
@@ -506,7 +515,7 @@ impl Life {
 
 impl Default for Life {
     fn default() -> Self {
-        Self { health: FULL_HEALTH, core: FULL_CORE, hurt: None, dead: false, died_at: None, lost_at: None, regen_at: None }
+        Self { health: FULL_HEALTH, core: FULL_CORE, hurt: None, dead: false, died_at: None, lost_at: None, regen_at: None, respawned: None }
     }
 }
 
@@ -1249,6 +1258,24 @@ impl Gear {
         !self.lives.get(&who).is_some_and(|l| l.dead)
     }
 
+    /// Alive and not still on their way out of a respawn (`SPAWN_MOVED`):
+    /// what claims objectives and can be hurt.
+    pub fn present(&self, who: SocketAddr) -> bool {
+        self.alive(who) && !self.spawning(who, Instant::now())
+    }
+
+    fn spawning(&self, who: SocketAddr, now: Instant) -> bool {
+        self.lives.get(&who).and_then(|l| l.respawned).is_some_and(|(t, _)| now.saturating_duration_since(t) < SPAWN_SETTLE)
+    }
+
+    /// A respawn: the spawning window from the body's last known place.
+    fn mark_respawned(&mut self, who: SocketAddr, now: Instant) {
+        let at = self.bodies.get(&who).map(|b| b.1);
+        if let Some(l) = self.lives.get_mut(&who) {
+            l.respawned = Some((now, at));
+        }
+    }
+
     /// A punch stuns only when the puncher is in the combat area.
     pub fn stun_allowed(&self, from: SocketAddr, _d: &[u8]) -> bool {
         self.inside.contains(&from)
@@ -1305,6 +1332,12 @@ impl Gear {
                 }
             }
             self.bodies.insert(from, (u16::from_le_bytes([d[0], d[1]]), pos));
+            if let Some(l) = self.lives.get_mut(&from)
+                && let Some((_, at)) = l.respawned
+                && at.is_none_or(|a| dist(a, pos) > SPAWN_MOVED)
+            {
+                l.respawned = None;
+            }
         } else if d[4..8] == self.space[..4] {
             self.thrown_seen.insert(from, now);
             if let Some(last) = self.thrown_at.insert(from, pos) {
@@ -1943,6 +1976,9 @@ impl Gear {
             return Vec::new();
         }
         let now = Instant::now();
+        if self.spawning(who, now) {
+            return Vec::new();
+        }
         let amount = self.after_overcharge(who, amount, now);
         let cheat = self.cheats_death(who, now);
         let life = self.lives.entry(who).or_default();
@@ -2193,6 +2229,7 @@ impl Gear {
                 life.died_at = None;
                 life.hurt = None;
                 let life = *life;
+                self.mark_respawned(from, Instant::now());
                 info!(%from, "player respawned");
                 let slot = d.get(8..12).map_or(self.slot_of(&from), |b| u32::from_le_bytes(b.try_into().expect("4")));
                 vec![out(To::All, ty, d), out(To::All, HEALTH_BROADCAST, &health_body(arr8(d, 0), slot, &life, false))]
@@ -2649,7 +2686,7 @@ impl Gear {
             let hits: Vec<Hit> = self
                 .victims(at, (radius - BODY_RADIUS).max(0.0), Some(n.thrower))
                 .into_iter()
-                .filter(|h| h.3.is_some_and(|a| a != n.thrower && self.alive(a) && !self.immune(&a, "stun_imm")))
+                .filter(|h| h.3.is_some_and(|a| a != n.thrower && self.present(a) && !self.immune(&a, "stun_imm")))
                 .collect();
             info!(thrower = %n.thrower, ?at, stunned = hits.len(), "NEUTRON went off around its user");
             if hits.is_empty() {
@@ -2687,7 +2724,7 @@ impl Gear {
         }
         let enemy_near = |g: &Gear, m: &Mine, r: f32| -> Vec<Hit> {
             let Some(at) = m.at else { return Vec::new() };
-            g.victims(at, r, Some(m.thrower)).into_iter().filter(|h| h.3.is_some_and(|a| a != m.thrower && g.alive(a) && !g.immune(&a, "stun_imm"))).collect()
+            g.victims(at, r, Some(m.thrower)).into_iter().filter(|h| h.3.is_some_and(|a| a != m.thrower && g.present(a) && !g.immune(&a, "stun_imm"))).collect()
         };
         for i in 0..self.mines.len() {
             let m = &self.mines[i];
@@ -2998,8 +3035,9 @@ impl Gear {
         for who in stuck {
             let slot = self.slot_of(&who);
             let owner = self.bubble_owner.get(&who).copied().unwrap_or(DAMAGEABLE);
+            let at = self.bodies.get(&who).map(|b| b.1);
             if let Some(life) = self.lives.get_mut(&who) {
-                *life = Life::default();
+                *life = Life { respawned: Some((now, at)), ..Life::default() };
                 info!(%who, "dead player brought back by the server");
                 if self.in_match {
                     let b = [DAMAGEABLE.as_slice(), &slot.to_le_bytes(), &[0; 4]].concat();
@@ -3987,6 +4025,18 @@ mod tests {
         let v = g.on_message(me, PLAYER_RESPAWN, &unhex("8ec21d00d315993f0000000000000000"), t0);
         assert_eq!(v[0].ty, PLAYER_RESPAWN);
         assert_eq!(&v[1].body[12..16], &112f32.to_le_bytes());
+        // Respawned, body still where it died: not on objectives, not hurt.
+        assert!(g.alive(me) && !g.present(me));
+        let v = g.on_message(me, ACTIVATE_EXPLOSION, &explosion([45.64, 1.8, -68.59]), t0);
+        assert!(v.iter().all(|o| o.ty != HEALTH_BROADCAST), "no damage while spawning");
+        // A body update this close to the death spot keeps it so.
+        g.observe_physics(me, &body(0, [45_900, 2_000, -68_590]));
+        assert!(!g.present(me));
+        // At the spawn: back in play, and hurt again.
+        g.observe_physics(me, &body(0, [10_000, 2_000, -20_000]));
+        assert!(g.present(me));
+        let v = g.on_message(me, ACTIVATE_EXPLOSION, &explosion([10.0, 1.8, -20.0]), t0);
+        assert!(v.iter().any(|o| o.ty == HEALTH_BROADCAST), "hurt after spawning");
     }
 
     #[test]
