@@ -3941,6 +3941,15 @@ impl Session {
                         self.send_gear(from, o);
                     }
                 }
+                super::combat::Out::TeamLines { team, own, other } => {
+                    let own = component_event(own, u64::MAX, 0x0fff, FILTER_ALL);
+                    let other = component_event(other, u64::MAX, 0x0fff, FILTER_ALL);
+                    let to = [TEAM_BLUE, TEAM_ORANGE][usize::from(team.min(1))];
+                    for a in self.joined() {
+                        let theirs = self.peers.get(&a).is_some_and(|p| matches!(p.team, TEAM_BLUE | TEAM_ORANGE) && p.team != to);
+                        self.reliable_to(a, COMPONENT_EVENT, if theirs { &other } else { &own });
+                    }
+                }
                 super::combat::Out::SwapTeams => self.swap_teams(),
                 super::combat::Out::ResetStats => {
                     // Native: R15NetResetPlayerStatsNode, then the stats to clients.

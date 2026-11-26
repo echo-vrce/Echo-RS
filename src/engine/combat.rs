@@ -482,12 +482,12 @@ const MAX_CAPTURE: u32 = 59;
 /// 75 points win: a team can start one short of it.
 const MAX_START_SCORE: u32 = 74;
 /// "Five" .. "One" (index 0 is "one"): the capture maps' countdown into the
-/// round, the only combat announcer lines native's matches play that this
-/// server has to send (the level script that raises them in native did not
-/// say them here, 2026-11-23). Native's server sends no other announcer line,
-/// and neither does this one (removed 2026-11-25: "round N", "match
-/// starting/started", "round starting", "time extended", "match complete"
-/// and six to ten, which native never plays).
+/// round and into the point's unlock. Native's own clients say these and the
+/// point's lines below (their level scripts, not the server); on this server
+/// those scripts stay quiet (2026-11-23, 2026-11-26), so the server sends
+/// them. Native has no other announcer line, and neither does this server
+/// (removed 2026-11-25: "round N", "match starting/started", "round
+/// starting", "time extended", "match complete" and six to ten).
 const VO_COUNTDOWN: [u64; 5] = [
     crate::wire::symbol::symbol("evt_vo_anc_countdown_01"),
     crate::wire::symbol::symbol("evt_vo_anc_countdown_02"),
@@ -495,6 +495,23 @@ const VO_COUNTDOWN: [u64; 5] = [
     crate::wire::symbol::symbol("evt_vo_anc_countdown_04"),
     crate::wire::symbol::symbol("evt_vo_anc_countdown_05"),
 ];
+/// The capture point's lines. `mp_combat_gamemode_capturepoint` says
+/// "point unlocking in" and five .. one as the lock runs out (its
+/// `lock_countdown_feedback_7` .. `_1`); `mp_combat_capturable_point` says
+/// "contested" once both teams have been on the unlocked point for 0.25 s,
+/// and on a change of hands "captured" to the new holder's team (and
+/// spectators), "stolen" to the other.
+const VO_POINT_UNLOCKING_IN: u64 = crate::wire::symbol::symbol("evt_vo_anc_point_unlocking_in");
+const VO_POINT_CONTESTED: u64 = crate::wire::symbol::symbol("evt_vo_anc_point_contested");
+const VO_POINT_CAPTURED: u64 = crate::wire::symbol::symbol("evt_vo_anc_point_captured");
+const VO_POINT_STOLEN: u64 = crate::wire::symbol::symbol("evt_vo_anc_point_stolen");
+/// Seconds of lock left when "point unlocking in" is said.
+const UNLOCKING_IN_AT: f32 = 7.0;
+/// Both teams on the point this long before "contested" (the script's delay).
+const CONTESTED_LINE_AFTER: f32 = 0.25;
+/// At most one "contested" this often (the script checks every 0.25 s while
+/// contested; here the line is said once per contention).
+const CONTESTED_LINE_GAP: f32 = 5.0;
 
 /// Players needed before the pre-match count starts (public: one is enough to
 /// test; native waits for its matchmaker's teams).
@@ -538,6 +555,9 @@ pub enum Out {
     SwapTeams,
     /// A private match restarts: every player's stats back to 0, and sent.
     ResetStats,
+    /// Announcer lines by team: `own` to `team` (0 blue, 1 orange) and to
+    /// spectators, `other` to the other team.
+    TeamLines { team: u8, own: u64, other: u64 },
 }
 
 /// What native's level scripts do that the server repeats: a client's
@@ -751,6 +771,11 @@ struct Capture {
     since_send: f32,
     /// Unlocked this round (native: the owner symbol stays "locked" until then).
     unlocked_once: bool,
+    /// Both teams on it this long (0 when not contested).
+    contested_for: f32,
+    /// "Contested" said for this contention, and how long since the last one.
+    contest_said: bool,
+    since_contest_line: f32,
 }
 
 impl Capture {
@@ -789,6 +814,9 @@ impl Capture {
             sent: None,
             since_send: 0.0,
             unlocked_once: false,
+            contested_for: 0.0,
+            contest_said: false,
+            since_contest_line: f32::MAX,
         })
     }
 
@@ -804,6 +832,9 @@ impl Capture {
         self.sent = None;
         self.since_send = 0.0;
         self.unlocked_once = false;
+        self.contested_for = 0.0;
+        self.contest_said = false;
+        self.since_contest_line = f32::MAX;
     }
 
     fn inside(&self, p: [f32; 3]) -> bool {
@@ -2155,8 +2186,15 @@ impl Combat {
         c.counts = counts;
         c.contested = counts[0] > 0 && counts[1] > 0;
         let alone = |t: usize| counts[t] > 0 && counts[1 - t] == 0;
+        let mut lines = Vec::new();
+        let held = c.possession;
         if c.locked {
+            let before = c.lock_left;
             c.lock_left -= dt;
+            if before > UNLOCKING_IN_AT && c.lock_left <= UNLOCKING_IN_AT {
+                lines.push(Self::announcer(VO_POINT_UNLOCKING_IN));
+            }
+            lines.extend(Self::announce_count(before, c.lock_left));
             if c.lock_left <= 0.0 {
                 c.locked = false;
                 c.unlocked_once = true;
@@ -2184,6 +2222,20 @@ impl Combat {
                     tracing::info!(team = t, "capture point taken");
                 }
             }
+            if c.possession != held && c.possession < NEUTRAL {
+                lines.push(Out::TeamLines { team: c.possession as u8, own: VO_POINT_CAPTURED, other: VO_POINT_STOLEN });
+            }
+            c.since_contest_line += dt;
+            c.contested_for = if c.contested { c.contested_for + dt } else { 0.0 };
+            if !c.contested {
+                c.contest_said = false;
+            } else if !c.contest_said && c.contested_for >= CONTESTED_LINE_AFTER {
+                c.contest_said = true;
+                if c.since_contest_line >= CONTESTED_LINE_GAP {
+                    c.since_contest_line = 0.0;
+                    lines.push(Self::announcer(VO_POINT_CONTESTED));
+                }
+            }
             // Native Dyson (both rounds, to the frame): the holder earns
             // nothing while the other team is on the point at all.
             if c.possession < NEUTRAL && counts[1 - usize::from(c.possession)] == 0 {
@@ -2199,7 +2251,7 @@ impl Combat {
                 self.points_shown = true;
             }
         }
-        let mut out = Vec::new();
+        let mut out = lines;
         if !self.early_lock && (0..2).any(|t| deciding[t] && c.points[t] >= LOCK_AT_POINTS * to_win) {
             self.early_lock = true;
             tracing::info!(points = ?c.points, "capture match nearly decided: entrants locked");
@@ -2811,6 +2863,48 @@ mod tests {
         assert_eq!(c.winner, Some(Winner::Orange));
         assert_eq!(c.phase, Phase::Over);
         assert!(c.vars().contains(&(VAR_RED_SCORE, Val::Lo32(1))));
+    }
+
+    /// The capture point's lines: "unlocking in" and five .. one as the lock
+    /// runs out, "captured" / "stolen" by team on a change of hands,
+    /// "contested" once per contention.
+    #[test]
+    fn capture_point_lines() {
+        fn lines(v: &[Out]) -> Vec<Out> {
+            v.iter()
+                .filter(|o| matches!(o, Out::TeamLines { .. } | Out::Event(_, u64::MAX, 0x0fff, FILTER_ALL)))
+                .filter(|o| !matches!(o, Out::Event(EV_TEAM_ROOM_CUE, ..)))
+                .cloned()
+                .collect()
+        }
+        let mut c = capture_map(LEVEL_DYSON);
+        let orange = (1u8, true, Some([0.0, 0.0, 0.0]), 3);
+        let blue = (0u8, true, Some([1.0, 0.0, 0.0]), 4);
+        let away = (0u8, true, Some([50.0, 0.0, 0.0]), 4);
+        run(&mut c, 45.5, &[orange]);
+        assert_eq!(c.phase, Phase::Playing);
+        assert!(lines(&run(&mut c, 37.0, &[orange])).is_empty(), "nothing while the lock is long");
+        let mut want = vec![Combat::announcer(VO_POINT_UNLOCKING_IN)];
+        want.extend(VO_COUNTDOWN.iter().rev().map(|&s| Combat::announcer(s)));
+        assert_eq!(lines(&run(&mut c, 8.5, &[orange])), want);
+        assert!(!c.capture.as_ref().expect("c").locked);
+        // Orange takes it from neutral.
+        let v = run(&mut c, 4.5, &[orange, away]);
+        assert_eq!(lines(&v), vec![Out::TeamLines { team: 1, own: VO_POINT_CAPTURED, other: VO_POINT_STOLEN }]);
+        // Both on it: "contested" once, not again for a quick second contention.
+        let v = run(&mut c, 3.0, &[orange, blue]);
+        assert_eq!(lines(&v), vec![Combat::announcer(VO_POINT_CONTESTED)]);
+        run(&mut c, 1.0, &[orange, away]);
+        assert!(lines(&run(&mut c, 1.0, &[orange, blue])).is_empty());
+        run(&mut c, 6.0, &[orange, away]);
+        assert_eq!(lines(&run(&mut c, 1.0, &[orange, blue])), vec![Combat::announcer(VO_POINT_CONTESTED)]);
+        // Blue takes it: blue hears "captured", orange "stolen".
+        let v = run(&mut c, 9.0, &[(1, true, Some([50.0, 0.0, 0.0]), 3), blue]);
+        assert_eq!(lines(&v), vec![Out::TeamLines { team: 0, own: VO_POINT_CAPTURED, other: VO_POINT_STOLEN }]);
+        assert_eq!(VO_POINT_UNLOCKING_IN, 0xd49b_0f7e_717d_ab9a);
+        assert_eq!(VO_POINT_CONTESTED, 0xfcdd_83b0_624a_3706);
+        assert_eq!(VO_POINT_CAPTURED, 0x15c1_6c59_8bd0_ebde);
+        assert_eq!(VO_POINT_STOLEN, 0x56d1_af29_fb21_ce84);
     }
 
     fn var(c: &Combat, h: u64) -> Option<Val> {
