@@ -3,6 +3,13 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.6 (2026-11-26)
+
+### Changes
+- Loadout saves reach nakama, player names in the log
+- Log: a player's name and id when they are identified
+- Loadout saves reach nakama as its protobuf save
+
 ## 0.3.5 (2026-11-26)
 
 ### Changes
