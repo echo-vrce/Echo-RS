@@ -3,6 +3,12 @@
 All notable changes to echo-rust-server and its launcher. The server and the
 launcher share one version number.
 
+## 0.3.7 (2026-11-27)
+
+### Changes
+- Quest players' cosmetics are saved
+- Loadouts of any length are kept, shown and saved
+
 ## 0.3.6 (2026-11-26)
 
 ### Changes
