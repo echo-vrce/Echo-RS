@@ -679,7 +679,8 @@ pub fn write_disc_transform(p: &mut [u8; 64], x: i32, y: i32, depth: i32) {
     write_field(p, DISC_BIT + 2 * DISC_WIDTH, depth);
 }
 
-/// A `SR15NetCurrentLoadoutResponse` (452 bytes) as the instance it carries:
+/// A `SR15NetCurrentLoadoutResponse` (452 bytes from PC, 20 slots; its length
+/// follows the client's slot count) as the instance it carries:
 /// its name (`unified`) at 0x44, the item count at 0x74 and (slot, item)
 /// symbol pairs from 0x84.
 pub fn parse_loadout(d: &[u8]) -> Option<crate::wire::pb::LoadoutInstance> {

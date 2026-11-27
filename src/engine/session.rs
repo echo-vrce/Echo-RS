@@ -155,6 +155,8 @@ struct Peer {
     relay_paced: u32,
     /// The player changed their loadout here: it is saved once more as they leave.
     loadout_changed: bool,
+    /// A loadout we could not read was logged (once per player).
+    loadout_unreadable_logged: bool,
     /// When the player last changed team (the team orbs in the lobby's combat
     /// area): the client sends a new loadout number for it.
     team_changed_at: Option<Instant>,
@@ -244,6 +246,7 @@ impl Peer {
             relay_early: 0,
             relay_paced: 0,
             loadout_changed: false,
+            loadout_unreadable_logged: false,
             team_changed_at: None,
             generation: None,
             deferred: Vec::new(),
@@ -2038,26 +2041,7 @@ impl Session {
                     }
                 }
             }
-            LOADOUT_RESPONSE if d.len() == 452 => {
-                let slot = self.peers.get(&from).and_then(|p| p.slot);
-                if let Some(p) = self.peers.get_mut(&from) {
-                    // A change after the first one is the player editing their cosmetics.
-                    if p.loadout.as_deref().is_some_and(|old| old != d) {
-                        p.loadout_save_at = Some(Instant::now() + LOADOUT_SAVE_DELAY);
-                        p.loadout_changed = true;
-                    }
-                    p.loadout = Some(d.to_vec());
-                }
-                if let Some(slot) = slot {
-                    let waiting: Vec<SocketAddr> = self.parked_loadouts.iter().filter(|(_, s)| *s == slot).map(|(a, _)| *a).collect();
-                    self.parked_loadouts.retain(|(_, s)| *s != slot);
-                    for a in waiting {
-                        self.reliable_to(a, LOADOUT_RESPONSE, d);
-                    }
-                    // Everyone else gets the change too.
-                    self.relay_reliable(from, LOADOUT_RESPONSE, d, false);
-                }
-            }
+            LOADOUT_RESPONSE => self.on_loadout(from, d),
             TOUCH_XFER_RELIABLE | TOUCH_XFER_MAILBOX => self.on_touch(from, d),
             COMPONENT_EVENT => self.on_client_event(from, d),
             UI_INC_SETTING | UI_DEC_SETTING if reliable => self.on_rules_press(from, d, ty == UI_INC_SETTING),
@@ -2552,6 +2536,40 @@ impl Session {
         {
             self.reliable_to(addr, COMPONENT_EVENT, &ev);
             info!(%addr, "match over: sent back to the lobby");
+        }
+    }
+
+    /// A client's `SR15NetCurrentLoadoutResponse`: kept (for saves and for
+    /// players who ask later), and given to everyone else.
+    ///
+    /// Any length: the client writes it as a stream whose item table is as
+    /// long as its own slot list. PC's is 452 bytes (20 slots); only that was
+    /// taken before, so a client with another slot count (the Quest build)
+    /// had its loadout dropped: never saved, never shown to anyone.
+    fn on_loadout(&mut self, from: SocketAddr, d: &[u8]) {
+        let slot = self.peers.get(&from).and_then(|p| p.slot);
+        if let Some(p) = self.peers.get_mut(&from) {
+            if !p.loadout_unreadable_logged && msg::parse_loadout(d).is_none() {
+                p.loadout_unreadable_logged = true;
+                warn!(%from, len = d.len(), body = %hex_str(&d[..d.len().min(160)]), "loadout not in the known layout: shown to others but not saved");
+            } else if d.len() != 452 && p.loadout.is_none() {
+                info!(%from, len = d.len(), "loadout of a non-PC length");
+            }
+            // A change after the first one is the player editing their cosmetics.
+            if p.loadout.as_deref().is_some_and(|old| old != d) {
+                p.loadout_save_at = Some(Instant::now() + LOADOUT_SAVE_DELAY);
+                p.loadout_changed = true;
+            }
+            p.loadout = Some(d.to_vec());
+        }
+        if let Some(slot) = slot {
+            let waiting: Vec<SocketAddr> = self.parked_loadouts.iter().filter(|(_, s)| *s == slot).map(|(a, _)| *a).collect();
+            self.parked_loadouts.retain(|(_, s)| *s != slot);
+            for a in waiting {
+                self.reliable_to(a, LOADOUT_RESPONSE, d);
+            }
+            // Everyone else gets the change too.
+            self.relay_reliable(from, LOADOUT_RESPONSE, d, false);
         }
     }
 
@@ -5815,6 +5833,42 @@ mod server_mute_tests {
         s.arena.private = true;
         s.on_assign_team(a[2], &ask(u16::from(TEAM_BLUE)));
         assert_eq!(s.peers[&a[2]].team, TEAM_BLUE);
+    }
+
+    /// A loadout of `n` slots, as a client with that many writes it.
+    fn loadout_of(n: usize, item: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 0x84 + n * 16];
+        d[0x44..0x4c].copy_from_slice(&0x2fc2_8196_587d_528e_u64.to_le_bytes());
+        d[0x74..0x78].copy_from_slice(&(n as u32).to_le_bytes());
+        for i in 0..n {
+            let o = 0x84 + i * 16;
+            d[o..o + 8].copy_from_slice(&(1000 + i as u64).to_le_bytes());
+            d[o + 8..o + 16].copy_from_slice(&(item + i as u64).to_le_bytes());
+        }
+        d
+    }
+
+    /// A loadout that is not PC's 452 bytes (another slot count, as the
+    /// Quest build may send) is kept, shown to the others and saved.
+    #[test]
+    fn loadouts_of_any_slot_count_are_kept_relayed_and_saved() {
+        for n in [18, 20, 22] {
+            let (mut s, a) = arena_with(&[(0, TEAM_BLUE), (1, TEAM_ORANGE)]);
+            let relayed = |s: &Session| s.peers[&a[1]].t.queued_reliable.iter().filter(|(ty, _)| *ty == LOADOUT_RESPONSE).count();
+            let first = loadout_of(n, 50);
+            s.on_loadout(a[0], &first);
+            assert_eq!(s.peers[&a[0]].loadout.as_deref(), Some(&first[..]), "{n} slots: kept");
+            assert_eq!(relayed(&s), 1, "{n} slots: shown to the other player");
+            assert!(s.peers[&a[0]].loadout_save_at.is_none(), "the first one is not a change");
+            let edited = loadout_of(n, 70);
+            s.on_loadout(a[0], &edited);
+            assert!(s.peers[&a[0]].loadout_save_at.is_some(), "{n} slots: the edit is saved");
+            let Some(Em::GameServerSaveLoadout(m)) = loadout_save("lobby", &s.peers[&a[0]]).and_then(|e| e.message) else {
+                panic!("{n} slots: no save");
+            };
+            assert_eq!(m.loadout_instances[0].items.len(), n);
+            assert_eq!(m.loadout_instances[0].items[n - 1].equipped_item, 70 + n as u64 - 1);
+        }
     }
 
     /// A game asking for its gear tables before VeilNet showed EchoCombat
